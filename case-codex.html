@@ -1,0 +1,417 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Codex CLI 研读 · AI Agent 工程</title>
+<meta name="description" content="对照源码研读 OpenAI Codex CLI：agent loop、审批策略与沙箱的组合、execpolicy 规则、AGENTS.md 加载、自动压缩、exec 无交互模式与会话记录。">
+<link rel="stylesheet" href="assets/css/course.css">
+<script src="assets/js/manifest.js"></script>
+<script defer src="assets/js/course.js"></script>
+<style>
+  .sim-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px 18px; }
+  .sim-grid fieldset { border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; margin: 0; }
+  .sim-grid legend { font-size: 13px; color: var(--muted); padding: 0 4px; }
+  .sim-grid label { display: block; font-size: 14px; margin: 3px 0; cursor: pointer; }
+  .verdict { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-top: 12px; }
+  .verdict .big { font-size: 18px; font-weight: 700; padding: 4px 14px; border-radius: 8px; }
+  .verdict .allow { background: var(--ok-soft); color: var(--ok); }
+  .verdict .prompt { background: var(--warn-soft); color: var(--warn); }
+  .verdict .deny { background: var(--danger-soft); color: var(--danger); }
+  .trace { list-style: none; padding: 0; margin: 10px 0 0; font-size: 14px; }
+  .trace li { padding: 6px 10px; border-left: 3px solid var(--border); margin: 4px 0; background: var(--surface-2); border-radius: 0 6px 6px 0; }
+  .trace li code { font-size: 12.5px; }
+</style>
+</head>
+<body data-page="case-codex">
+<article id="content">
+<div class="eyebrow">第六部分 · 名作研读</div>
+<h1>OpenAI Codex CLI：审批、沙箱与 agent loop</h1>
+<p class="lead">Codex CLI 是 OpenAI 开源的本地编码 agent。它最值得读的地方，是把"模型能不能执行这条命令"拆成了两个互相独立、可以组合的维度：<strong>审批策略</strong>决定什么时候问人，<strong>沙箱</strong>决定就算不问人，命令最多能碰到什么。把这两件事分开，是本课第 8、9 章最好的工程范本。</p>
+<div class="meta"><span>约 45 分钟</span><span>前置：第 4、8、9、12 章</span><span>研读版本：9f3cb25（2026-11-25）</span></div>
+
+<div class="goals"><b>学完你能</b>
+<ul>
+  <li>在 Codex 源码里找到 agent loop、审批判定、沙箱执行、压缩、会话记录各自的位置</li>
+  <li>说清 4 种审批策略 × 4 种沙箱策略组合起来，一条命令会被直接执行、请求批准还是拒绝</li>
+  <li>理解"规则文件里的白名单""危险命令启发式""沙箱兜底"三层防线各自负责什么</li>
+  <li>把这些设计迁移到你自己的 agent：审批与权限分离、无交互模式下拒绝而不是放行、规则可审计可沉淀</li>
+</ul></div>
+
+<h2>1 · 速览</h2>
+<div class="cards">
+  <div class="card"><span class="tag">仓库</span><b>openai/codex</b><small><a href="https://github.com/openai/codex/tree/9f3cb259535c72de6960cc837ac705a780c62995" target="_blank" rel="noopener">github.com/openai/codex</a></small></div>
+  <div class="card"><span class="tag">语言与许可证</span><b>Rust（主体）· Apache-2.0</b><small>codex-cli/ 只是 npm 分发外壳，实现都在 codex-rs/</small></div>
+  <div class="card"><span class="tag">研读版本</span><b>9f3cb25 · 2026-11-25</b><small>本页所有源码链接都固定在这个提交</small></div>
+  <div class="card"><span class="tag">规模</span><b>141 个 crate · 约 48 万行 Rust</b><small>约 6200 个 .rs 文件；别想通读，按问题读</small></div>
+</div>
+<p><strong>一句话定位</strong>：一个在你本机终端里运行的编码 agent，同时提供交互式界面（TUI）、无交互的 <code>codex exec</code>、供编辑器和桌面应用调用的 app-server，以及 MCP 的客户端与服务端。</p>
+
+<h2>2 · 为什么读它</h2>
+<p>多数 agent 框架教你"怎么让模型调用工具"，很少认真回答另一个问题：<strong>模型调用的工具，凭什么可以被执行？</strong>Codex 不得不认真回答，因为它让模型在你的机器上跑任意 shell 命令。读它能学到三件在别处很少系统讲的事：</p>
+<ul>
+  <li><strong>权限的分层</strong>：静态规则（execpolicy）、启发式（危险命令识别）、操作系统级强制（沙箱）、人（审批）以及可选的模型审查者（guardian），各自守哪一段。</li>
+  <li><strong>无人值守时的默认值</strong>：无交互模式下，"需要人批准"一律变成"拒绝"，而不是"那就放行吧"。</li>
+  <li><strong>大型 agent 的工程化</strong>：会话以 JSONL 落盘可回放、JSON 事件流给程序消费、自动压缩、Stop hook，都和本课第 10、12、14 章一一对应。</li>
+</ul>
+
+<div class="callout note"><b>怎么读一个 48 万行的仓库</b>
+<p>不要从 <code>main.rs</code> 往下读。先定一个问题（比如"一条 shell 命令什么时候需要批准"），找到描述它的类型定义（<code>AskForApproval</code>），再沿着"谁用了这个类型"往外扩。类型定义上的文档注释往往就是最好的设计说明，本页引用的大部分结论都来自这些注释。</p></div>
+
+<h2>3 · 架构总览</h2>
+<figure>
+<div class="diagram">
+<svg viewBox="0 0 760 400" width="760" role="img" aria-label="Codex CLI 架构总览">
+  <rect class="box m" x="20" y="20" width="720" height="62" rx="10"/>
+  <text class="tb" x="40" y="45">前端（同一个核心，多种入口）</text>
+  <rect class="box" x="40" y="52" width="120" height="24" rx="6"/><text class="ts" x="100" y="68" text-anchor="middle">TUI（交互界面）</text>
+  <rect class="box" x="170" y="52" width="140" height="24" rx="6"/><text class="ts" x="240" y="68" text-anchor="middle">codex exec（无交互）</text>
+  <rect class="box" x="320" y="52" width="170" height="24" rx="6"/><text class="ts" x="405" y="68" text-anchor="middle">app-server（编辑器/桌面）</text>
+  <rect class="box" x="500" y="52" width="110" height="24" rx="6"/><text class="ts" x="555" y="68" text-anchor="middle">MCP server</text>
+  <rect class="box a" x="20" y="110" width="440" height="170" rx="12"/>
+  <text class="tb" x="40" y="135">core：会话与回合</text>
+  <rect class="box" x="40" y="148" width="190" height="52" rx="8"/><text class="t" x="135" y="170" text-anchor="middle">run_turn 主循环</text><text class="ts" x="135" y="189" text-anchor="middle">session/turn.rs</text>
+  <rect class="box" x="250" y="148" width="190" height="52" rx="8"/><text class="t" x="345" y="170" text-anchor="middle">上下文与压缩</text><text class="ts" x="345" y="189" text-anchor="middle">compact.rs · agents_md.rs</text>
+  <rect class="box b" x="40" y="212" width="190" height="56" rx="8"/><text class="t" x="135" y="234" text-anchor="middle">工具编排器</text><text class="ts" x="135" y="254" text-anchor="middle">tools/orchestrator.rs</text>
+  <rect class="box r" x="250" y="212" width="190" height="56" rx="8"/><text class="t" x="345" y="234" text-anchor="middle">审批判定</text><text class="ts" x="345" y="254" text-anchor="middle">exec_policy.rs · guardian/</text>
+  <rect class="box" x="490" y="110" width="250" height="52" rx="10"/><text class="t" x="615" y="132" text-anchor="middle">模型客户端</text><text class="ts" x="615" y="151" text-anchor="middle">codex-api（流式事件）</text>
+  <rect class="box g" x="490" y="172" width="250" height="52" rx="10"/><text class="t" x="615" y="194" text-anchor="middle">沙箱</text><text class="ts" x="615" y="213" text-anchor="middle">Seatbelt · bwrap+seccomp · Windows</text>
+  <rect class="box v" x="490" y="234" width="250" height="46" rx="10"/><text class="t" x="615" y="254" text-anchor="middle">MCP 客户端</text><text class="ts" x="615" y="271" text-anchor="middle">rmcp-client · codex-mcp</text>
+  <rect class="box w" x="20" y="310" width="225" height="60" rx="10"/><text class="t" x="132" y="334" text-anchor="middle">execpolicy 规则</text><text class="ts" x="132" y="354" text-anchor="middle">Starlark prefix_rule</text>
+  <rect class="box" x="265" y="310" width="225" height="60" rx="10"/><text class="t" x="377" y="334" text-anchor="middle">会话记录 rollout</text><text class="ts" x="377" y="354" text-anchor="middle">~/.codex/sessions/*.jsonl</text>
+  <rect class="box" x="510" y="310" width="230" height="60" rx="10"/><text class="t" x="625" y="334" text-anchor="middle">hooks</text><text class="ts" x="625" y="354" text-anchor="middle">Stop · Pre/PostCompact 等</text>
+  <path class="line" d="M240 82 V110" marker-end="url(#arr)"/>
+  <path class="line" d="M460 136 H490" marker-end="url(#arr)"/>
+  <path class="line" d="M460 198 H490" marker-end="url(#arr)"/>
+  <path class="line" d="M460 257 H490" marker-end="url(#arr)"/>
+  <path class="line" d="M132 280 V310" marker-end="url(#arr)"/>
+  <path class="line" d="M377 280 V310" marker-end="url(#arr)"/>
+</svg>
+</div>
+<figcaption>图 C1-1 Codex 的主要模块。四种前端共用同一个核心；审批判定和沙箱是两个独立模块，由工具编排器把它们组合起来。</figcaption>
+</figure>
+
+<h2>4 · 一次请求的旅程</h2>
+<p>用户在终端里输入"给月报导出加一个按部门筛选的参数，并跑一下测试"。点"下一步"看这条请求在源码里经过哪些地方。</p>
+
+<figure class="anim" data-dim>
+<div class="diagram">
+<svg viewBox="0 0 760 300" width="760" role="img" aria-label="一次请求在 Codex 中的流转">
+  <g data-k="u"><rect class="box" x="20" y="120" width="100" height="56" rx="8"/><text class="t" x="70" y="145" text-anchor="middle">用户输入</text><text class="ts" x="70" y="164" text-anchor="middle">TUI / exec</text></g>
+  <g data-k="ctx"><rect class="box m" x="150" y="20" width="160" height="56" rx="8"/><text class="t" x="230" y="44" text-anchor="middle">组装上下文</text><text class="ts" x="230" y="64" text-anchor="middle">AGENTS.md · 历史</text></g>
+  <g data-k="turn"><rect class="box a" x="150" y="120" width="160" height="56" rx="8"/><text class="t" x="230" y="145" text-anchor="middle">run_turn</text><text class="ts" x="230" y="164" text-anchor="middle">采样 → 工具 → 再采样</text></g>
+  <g data-k="model"><rect class="box" x="340" y="20" width="140" height="56" rx="8"/><text class="t" x="410" y="44" text-anchor="middle">模型</text><text class="ts" x="410" y="64" text-anchor="middle">流式返回 tool call</text></g>
+  <g data-k="appr"><rect class="box r" x="340" y="120" width="140" height="56" rx="8"/><text class="t" x="410" y="145" text-anchor="middle">审批判定</text><text class="ts" x="410" y="164" text-anchor="middle">规则 → 启发式 → 策略</text></g>
+  <g data-k="sbx"><rect class="box g" x="510" y="120" width="120" height="56" rx="8"/><text class="t" x="570" y="145" text-anchor="middle">沙箱执行</text><text class="ts" x="570" y="164" text-anchor="middle">失败可申请提权</text></g>
+  <g data-k="cmp"><rect class="box w" x="340" y="220" width="140" height="56" rx="8"/><text class="t" x="410" y="244" text-anchor="middle">自动压缩</text><text class="ts" x="410" y="263" text-anchor="middle">到 90% 窗口时</text></g>
+  <g data-k="stop"><rect class="box v" x="150" y="220" width="160" height="56" rx="8"/><text class="t" x="230" y="244" text-anchor="middle">Stop hooks</text><text class="ts" x="230" y="263" text-anchor="middle">可要求继续</text></g>
+  <g data-k="out"><rect class="box" x="650" y="120" width="94" height="56" rx="8"/><text class="t" x="697" y="145" text-anchor="middle">记录</text><text class="ts" x="697" y="164" text-anchor="middle">JSONL</text></g>
+  <g data-k="e1"><path class="line" d="M120 148 H150" marker-end="url(#arr)"/></g>
+  <g data-k="e2"><path class="line a" d="M230 76 V120" marker-end="url(#arr-a)"/></g>
+  <g data-k="e3"><path class="line a" d="M310 135 C325 110 335 80 360 76" marker-end="url(#arr-a)"/></g>
+  <g data-k="e4"><path class="line b" d="M410 76 V120" marker-end="url(#arr-b)"/></g>
+  <g data-k="e5"><path class="line g" d="M480 148 H510" marker-end="url(#arr-g)"/></g>
+  <g data-k="e6"><path class="line g" d="M570 176 C570 205 330 205 310 168" marker-end="url(#arr-g)"/></g>
+  <g data-k="e7"><path class="line" d="M310 168 C330 200 350 215 360 220" marker-end="url(#arr)"/></g>
+  <g data-k="e8"><path class="line" d="M230 176 V220" marker-end="url(#arr)"/></g>
+  <g data-k="e9"><path class="line" d="M630 148 H650" marker-end="url(#arr)"/></g>
+</svg>
+</div>
+<ol class="anim-steps">
+  <li data-show="u e1 turn" data-hl="u e1 turn">输入进入 <a href="https://github.com/openai/codex/blob/9f3cb259535c72de6960cc837ac705a780c62995/codex-rs/core/src/session/turn.rs#L227" target="_blank" rel="noopener"><code>run_turn</code></a>。它的文档注释写得很直白：每次采样，模型要么请求函数调用，要么给出一条助手消息；请求了函数就执行、把输出送回下一次采样；只给消息就认为这一回合结束。这就是第 4 章的 agent loop。</li>
+  <li data-show="ctx e2" data-hl="ctx e2">上下文里会拼进项目说明。<a href="https://github.com/openai/codex/blob/9f3cb259535c72de6960cc837ac705a780c62995/codex-rs/core/src/agents_md.rs#L1" target="_blank" rel="noopener"><code>agents_md.rs</code></a> 从项目根（默认以 <code>.git</code> 为标记）一路走到当前目录，把沿途的 AGENTS.md 按从根到叶的顺序拼接，默认上限 32 KiB。</li>
+  <li data-show="model e3" data-hl="turn e3 model">发起采样请求，模型以流式事件返回。这次它决定调用 shell 工具，跑 <code>npm test</code>。</li>
+  <li data-show="appr e4" data-hl="model e4 appr">工具调用交给编排器。<a href="https://github.com/openai/codex/blob/9f3cb259535c72de6960cc837ac705a780c62995/codex-rs/core/src/tools/orchestrator.rs#L1" target="_blank" rel="noopener"><code>orchestrator.rs</code></a> 开头一句话概括了它的职责：协调工具审批、选择沙箱、沙箱拒绝后的重试。先查 execpolicy 规则，没命中再看危险命令启发式，最后按审批策略和沙箱类型得出"放行 / 询问 / 禁止"。</li>
+  <li data-show="sbx e5" data-hl="appr e5 sbx">放行后在沙箱里执行：macOS 用 <code>/usr/bin/sandbox-exec</code> 加 Seatbelt 策略文件，Linux 用 bubblewrap 做文件系统隔离、外加 <code>no_new_privs</code> 和 seccomp。如果被沙箱拒绝（比如要联网装依赖），是否允许"申请到沙箱外重跑"取决于审批策略。</li>
+  <li data-show="e6" data-hl="sbx e6 turn">命令输出作为工具结果回到历史，<code>run_turn</code> 进入下一次采样。模型看到测试失败，改代码，再跑测试……循环继续。</li>
+  <li data-show="cmp e7" data-hl="turn e7 cmp">每次采样后检查 token 用量。到达自动压缩阈值（默认是模型上下文窗口的 90%，配置了更小值时取更小者）就压缩历史，然后继续。</li>
+  <li data-show="stop e8" data-hl="turn e8 stop">模型不再请求工具时，回合准备结束，先跑 Stop hooks。hook 可以阻止结束并给出继续的提示，这时 <code>stop_hook_active</code> 置为 true 再进循环，用来防止无限续跑。</li>
+  <li data-show="out e9" data-hl="out">整个过程的每个条目都写进 <code>~/.codex/sessions/</code> 下的 JSONL 会话记录，之后可以 <code>resume</code> 或回放；<code>codex exec --json</code> 则把过程以 <code>thread.started</code>、<code>item.completed</code> 这类事件流输出给调用它的程序。</li>
+</ol>
+<figcaption>图 C1-2 一次请求在 Codex 里的流转，每一步都给了源码位置。</figcaption>
+</figure>
+
+<h2>5 · 关键设计一：审批策略与沙箱是两件事</h2>
+<p>先看两个类型定义，它们在 <a href="https://github.com/openai/codex/blob/9f3cb259535c72de6960cc837ac705a780c62995/codex-rs/protocol/src/protocol.rs#L1171" target="_blank" rel="noopener"><code>protocol/src/protocol.rs</code></a> 里紧挨着：</p>
+<pre data-title="codex-rs/protocol/src/protocol.rs（节选并简化，中文注释为本课所加；Apache-2.0）"><code class="lang-ts">
+pub enum AskForApproval {
+    /// Internal policy for projects marked untrusted. Commands require
+    /// approval unless an explicit exec policy rule allows them.
+    UnlessTrusted,          // 配置里写作 "untrusted"
+    /// The model decides when to ask the user for approval.
+    OnRequest,              // 默认值；"on-failure" 现在只是它的别名
+    Granular(GranularApprovalConfig),  // 按类别分别开关
+    /// Never ask the user to approve commands. ...
+    Never,
+}
+pub enum SandboxPolicy {
+    DangerFullAccess,
+    ReadOnly { network_access: bool },
+    ExternalSandbox { network_access: NetworkAccess },
+    WorkspaceWrite { writable_roots, network_access, .. },
+}
+</code></pre>
+<p>注意它们回答的是不同的问题：</p>
+<table>
+<tr><th></th><th>审批策略 <code>AskForApproval</code></th><th>沙箱策略 <code>SandboxPolicy</code></th></tr>
+<tr><td>回答的问题</td><td>什么时候停下来问人</td><td>就算不问人，命令最多能碰到什么</td></tr>
+<tr><td>谁来执行</td><td>Codex 自己的代码（编排器）</td><td>操作系统（Seatbelt、bubblewrap、seccomp）</td></tr>
+<tr><td>被模型绕过的可能</td><td>取决于判定逻辑写得好不好</td><td>模型生成的命令在内核层被拦，提示词注入也绕不过</td></tr>
+</table>
+<p>内置的三档预设（<a href="https://github.com/openai/codex/blob/9f3cb259535c72de6960cc837ac705a780c62995/codex-rs/utils/approval-presets/src/lib.rs#L28" target="_blank" rel="noopener"><code>approval-presets</code></a>）就是把两个维度配成对：</p>
+<ul>
+  <li><strong>Read Only</strong>：<code>on-request</code> + 只读。能读工作区，改文件、联网都要批准。</li>
+  <li><strong>Default</strong>（id 为 <code>auto</code>）：<code>on-request</code> + 工作区可写。能读写工作区、跑命令，联网和改工作区外的文件要批准。</li>
+  <li><strong>Full Access</strong>：<code>never</code> + 不设沙箱。描述里直接写着"Exercise caution"。</li>
+</ul>
+
+<div class="callout deep"><b>一个细节：可写目录里的只读子目录</b>
+<p><code>WritableRoot</code> 结构（<a href="https://github.com/openai/codex/blob/9f3cb259535c72de6960cc837ac705a780c62995/codex-rs/protocol/src/protocol.rs#L1314" target="_blank" rel="noopener">protocol.rs:1314</a>）带了一组 <code>read_only_subpaths</code>。注释说明了原因：可写根目录下的 <code>.git</code>（尤其 <code>.git/hooks</code>）、<code>.codex</code> 这类文件夹，被改了就能让 agent 给自己提权，所以即使整个工作区可写，它们也保持只读。这就是第 9 章"最小权限"在文件系统上的落点：<strong>能改变规则本身的东西，不能交给被规则约束的一方去改</strong>。</p></div>
+
+<h3>动手：审批策略 × 沙箱模拟器</h3>
+<p>下面的模拟器复刻了 <a href="https://github.com/openai/codex/blob/9f3cb259535c72de6960cc837ac705a780c62995/codex-rs/core/src/exec_policy.rs#L868" target="_blank" rel="noopener"><code>render_decision_for_unmatched_command_for_platform</code></a>（没有命中任何 execpolicy 规则时的判定）和编排器里"沙箱拒绝后要不要申请提权"（<a href="https://github.com/openai/codex/blob/9f3cb259535c72de6960cc837ac705a780c62995/codex-rs/core/src/tools/sandboxing.rs#L366" target="_blank" rel="noopener"><code>wants_no_sandbox_approval</code></a>）的主干逻辑。为了看清主干，它省略了网络代理审批、guardian 自动审查和 Windows 的特殊分支。</p>
+
+<div class="widget" id="sim">
+  <div class="w-title">一条命令会怎样被处理</div>
+  <div class="sim-grid">
+    <fieldset><legend>审批策略</legend>
+      <label><input type="radio" name="ap" value="untrusted"> untrusted</label>
+      <label><input type="radio" name="ap" value="on-request" checked> on-request（默认）</label>
+      <label><input type="radio" name="ap" value="granular-on"> granular（允许沙箱审批）</label>
+      <label><input type="radio" name="ap" value="granular-off"> granular（禁止沙箱审批）</label>
+      <label><input type="radio" name="ap" value="never"> never</label>
+    </fieldset>
+    <fieldset><legend>沙箱策略</legend>
+      <label><input type="radio" name="sb" value="read-only"> read-only</label>
+      <label><input type="radio" name="sb" value="workspace-write" checked> workspace-write</label>
+      <label><input type="radio" name="sb" value="external-sandbox"> external-sandbox</label>
+      <label><input type="radio" name="sb" value="danger-full-access"> danger-full-access</label>
+    </fieldset>
+    <fieldset><legend>模型想执行的命令</legend>
+      <label><input type="radio" name="cmd" value="plain" checked> <code>npm test</code>（沙箱内能完成）</label>
+      <label><input type="radio" name="cmd" value="write"> <code>sed -i … src/export.ts</code>（写工作区）</label>
+      <label><input type="radio" name="cmd" value="net"> <code>npm install</code>（需要联网）</label>
+      <label><input type="radio" name="cmd" value="danger"> <code>rm -rf build/</code>（危险命令）</label>
+      <label><input type="radio" name="cmd" value="escalate"> 模型主动申请沙箱外运行</label>
+    </fieldset>
+    <fieldset><legend>运行方式</legend>
+      <label><input type="checkbox" id="exec"> 在 <code>codex exec</code> 里无人值守运行</label>
+    </fieldset>
+  </div>
+  <div class="verdict"><span class="big" id="v"></span><span id="vs" style="color:var(--muted);font-size:14px"></span></div>
+  <ol class="trace" id="trace"></ol>
+</div>
+
+<div class="quiz" data-answer="3">
+<p class="q">在 <code>never</code> + <code>workspace-write</code> 下，模型执行 <code>npm install</code>（需要联网）会怎样？</p>
+<ol>
+  <li>直接执行并联网成功，因为 never 表示不拦</li>
+  <li>弹出审批请求，问用户是否允许联网</li>
+  <li>在沙箱里执行，联网被沙箱拒绝，失败结果直接返回给模型，不会升级去问人</li>
+  <li>命令被禁止，根本不会执行</li>
+</ol>
+<div class="explain"><code>never</code> 的注释写的是"永远不问人批准命令，失败立即返回给模型，绝不升级给用户审批"。它不等于"什么都放行"：没有被判定为危险的命令会被放行，但仍然跑在沙箱里，沙箱照样拦。这正是"审批"和"沙箱"分开的意义：关掉审批，不等于关掉沙箱。</div>
+</div>
+
+<h2>6 · 关键设计二：三层防线，各守一段</h2>
+<p>一条命令在执行前会依次经过三层检查，每一层的强度和用途都不一样：</p>
+<ol class="steps">
+  <li><strong>execpolicy 规则（显式、可审计）</strong>：用 Starlark 写的 <code>prefix_rule</code>，按命令前缀匹配，决定 <code>allow</code>、<code>prompt</code> 或 <code>forbidden</code>，多条命中时取最严格的那个。规则可以带 <code>justification</code>（为什么有这条规则，会显示在审批提示里），还可以带 <code>match</code> / <code>not_match</code> 示例，<strong>加载时就当单元测试跑一遍</strong>。说明见 <a href="https://github.com/openai/codex/blob/9f3cb259535c72de6960cc837ac705a780c62995/codex-rs/execpolicy/README.md" target="_blank" rel="noopener">execpolicy/README.md</a>。</li>
+  <li><strong>危险命令启发式（窄而保守）</strong>：<a href="https://github.com/openai/codex/blob/9f3cb259535c72de6960cc837ac705a780c62995/codex-rs/shell-command/src/command_safety/is_dangerous_command.rs#L132" target="_blank" rel="noopener"><code>dangerous_command_match_for_exec</code></a> 识别的其实很少：主要是带强制参数的 <code>rm</code>，外面套了 <code>sudo</code>、<code>env</code>、<code>trap</code> 也能拆开识别。命中后除非策略是 <code>never</code>（那就直接禁止），否则一律询问。</li>
+  <li><strong>沙箱（兜底、强制）</strong>：前两层都是"判断"，只有沙箱是"强制"。启发式漏掉的命令，仍然只能在允许的目录里写、默认不能联网。</li>
+</ol>
+<pre data-title="execpolicy 规则示例（Starlark；按 execpolicy/README.md 的格式为本课编写）"><code class="lang-py">
+prefix_rule(
+    pattern = ["git", ["push", "reset"]],   # 列表元素表示"任选其一"
+    decision = "prompt",                    # allow | prompt | forbidden
+    justification = "推送和重置会影响远端或丢失工作，需要人确认",
+    match = [["git", "push"], "git reset --hard"],   # 加载时验证：这些必须命中
+    not_match = ["git status"],                      # 加载时验证：这些不能命中
+)
+</code></pre>
+
+<div class="callout tip"><b>可迁移的经验：规则要能自证</b>
+<p><code>match</code> / <code>not_match</code> 是一个小而强的设计：规则文件里自带正反例，加载时就校验。你给自己的 agent 写白名单、敏感词表、路由规则时，也应该让每条规则带上它该拦和不该拦的例子，这样规则改坏了会在加载时就报错，而不是在线上漏拦。</p></div>
+
+<p>还有一个容易被忽略的闭环：审批通过时，Codex 可以附带一条<strong>建议的规则修订</strong>（<code>proposed_execpolicy_amendment</code>，定义在 <a href="https://github.com/openai/codex/blob/9f3cb259535c72de6960cc837ac705a780c62995/codex-rs/core/src/tools/sandboxing.rs#L160" target="_blank" rel="noopener">tools/sandboxing.rs</a> 的 <code>ExecApprovalRequirement</code> 里），用户接受后，以后同类命令就不用再问。这是第 8 章"按采纳记录逐步放权"的工程化版本：<strong>放权的结果落在一份人能读、能审、能回滚的规则文件里</strong>，而不是藏在某个模型的记忆里。</p>
+
+<h2>7 · 关键设计三：无人值守时，"该问人"就等于"不许做"</h2>
+<p><code>codex exec</code> 是给脚本和 CI 用的无交互模式。没有人可以点"批准"，那遇到需要批准的请求怎么办？<a href="https://github.com/openai/codex/blob/9f3cb259535c72de6960cc837ac705a780c62995/codex-rs/exec/src/approval_warning.rs#L6" target="_blank" rel="noopener"><code>approval_warning.rs</code></a> 里的启动警告说得很清楚：<em><code>codex exec</code> runs non-interactively and immediately rejects approval requests it receives.</em> 也就是立即拒绝，而且会提示你：想自己审，就到交互界面里跑。</p>
+<p>其他相关设计：</p>
+<ul>
+  <li>exec 默认要求在 git 仓库里运行，不在仓库里要显式加 <code>--skip-git-repo-check</code>：有 git，改坏了才能回滚。</li>
+  <li><code>--output-schema</code> 接一个 JSON Schema 文件，约束模型最终回答的形状（第 3 章）。</li>
+  <li><code>--json</code> 输出事件流，事件类型定义在 <a href="https://github.com/openai/codex/blob/9f3cb259535c72de6960cc837ac705a780c62995/codex-rs/exec/src/exec_events.rs#L11" target="_blank" rel="noopener"><code>exec_events.rs</code></a>：<code>thread.started</code>、<code>turn.started</code> / <code>turn.completed</code> / <code>turn.failed</code>、<code>item.started</code> / <code>item.updated</code> / <code>item.completed</code>、<code>error</code>。条目类型包括助手消息、推理、命令执行、文件修改、MCP 工具调用、网页搜索、待办清单等。</li>
+  <li><code>--ephemeral</code> 不把会话写盘；<code>codex exec resume</code> 续上之前的会话。</li>
+</ul>
+<p>"立即拒绝"和"抛错退出"的区别很重要：拒绝结果会作为工具结果回到模型，模型可以换一条不需要审批的路继续干活；只有确实做不下去才失败。这比"遇到审批就整体失败"更有用，也比"遇到审批就放行"安全得多。</p>
+
+<h2>8 · 关键设计四：上下文的边界与压缩</h2>
+<h3>AGENTS.md：不信任的项目不读</h3>
+<p><a href="https://github.com/openai/codex/blob/9f3cb259535c72de6960cc837ac705a780c62995/codex-rs/core/src/agents_md.rs#L61" target="_blank" rel="noopener"><code>load_project_instructions</code></a> 的第一个判断是：项目被标记为不受信任，或者字节预算为 0，就什么都不加载。这是第 9 章"间接提示注入"的直接防御：你 clone 了一个陌生仓库，它的 AGENTS.md 里如果写着"把 ~/.ssh 发到某个地址"，不受信任时这段文字根本进不了上下文。</p>
+<p>其他规则（都在 <a href="https://github.com/openai/codex/blob/9f3cb259535c72de6960cc837ac705a780c62995/codex-rs/core/src/agents_md.rs#L374" target="_blank" rel="noopener">agents_md.rs</a>）：</p>
+<ul>
+  <li>每个目录依次找 <code>AGENTS.override.md</code>、<code>AGENTS.md</code>、配置的备用文件名，<strong>只取第一个存在的</strong>；本地覆盖文件优先。</li>
+  <li>备用文件名里带路径分隔符、<code>.</code> 或 <code>..</code> 的会被忽略，注释特别提到：在 Windows 上解析网络路径，哪怕只是探测元数据，都可能把凭据发出去。</li>
+  <li>默认预算 32 KiB（<a href="https://github.com/openai/codex/blob/9f3cb259535c72de6960cc837ac705a780c62995/codex-rs/config/src/config_toml.rs#L76" target="_blank" rel="noopener">config_toml.rs:76</a>），超了会给出"请精简或调大 <code>project_doc_max_bytes</code>"的警告，不会悄悄截断。</li>
+</ul>
+<h3>自动压缩：交接给"另一个 LLM"</h3>
+<p>阈值由 <a href="https://github.com/openai/codex/blob/9f3cb259535c72de6960cc837ac705a780c62995/codex-rs/protocol/src/openai_models.rs#L575" target="_blank" rel="noopener"><code>auto_compact_token_limit</code></a> 决定：模型上下文窗口的 90%，配置了更小的值时取二者较小者。压缩用的提示词（<a href="https://github.com/openai/codex/blob/9f3cb259535c72de6960cc837ac705a780c62995/codex-rs/prompts/templates/compact/prompt.md" target="_blank" rel="noopener">prompts/templates/compact/prompt.md</a>）只有几行，但定位很准：</p>
+<blockquote>You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary for another LLM that will resume the task.</blockquote>
+<p>然后要求写进：当前进展与关键决定、重要上下文与约束和用户偏好、还剩什么要做、继续工作需要的关键数据。把压缩定位成"写交接文档"而不是"做摘要"，模型就会自然地保留"接手的人需要知道的东西"，而不是平均地缩短每一段。这和第 5 章、第 12 章讲的结构化笔记、交接是同一个思路。</p>
+
+<h2>9 · 关键设计五：可选的模型审查者，但边界很清楚</h2>
+<p>审批不一定只能交给人。<code>ApprovalsReviewer</code>（<a href="https://github.com/openai/codex/blob/9f3cb259535c72de6960cc837ac705a780c62995/codex-rs/app-server-protocol/src/protocol/v2/shared.rs#L297" target="_blank" rel="noopener">shared.rs:297</a>）有两个取值：默认的 <code>user</code>，和 <code>auto_review</code>。后者的说明是：用一个提示词经过精心设计的子 agent 收集相关上下文，按基于风险的决策框架来批准或拒绝。</p>
+<p>值得注意的是它的位置。<a href="https://github.com/openai/codex/blob/9f3cb259535c72de6960cc837ac705a780c62995/codex-rs/core/src/guardian/mod.rs#L1" target="_blank" rel="noopener"><code>guardian/mod.rs</code></a> 开头写着："扩展选择策略与证据；核心强制执行权限与必审要求"。也就是说：</p>
+<ul>
+  <li>模型审查者是<strong>显式开启</strong>的，默认还是人；</li>
+  <li>它是一个<strong>隔离</strong>的审查会话，不是正在干活的那个 agent 顺手给自己批；</li>
+  <li>它能决定的只是"批准一次提权申请"，<strong>沙箱和必审规则仍由核心强制执行</strong>；编排器头部注释也说明，提权重试需要重新审查，不能沿用上一次的批准。</li>
+</ul>
+
+<h2>10 · 值得借鉴 / 不宜照搬</h2>
+<table>
+<tr><th>值得借鉴</th><th>不宜照搬</th></tr>
+<tr><td>审批与权限分成两个正交维度，再用少量预设配对给用户选</td><td>完整的操作系统级沙箱：你的 agent 如果不跑任意命令，用进程隔离或只读凭据就够了，不必自己维护 Seatbelt 和 seccomp 策略</td></tr>
+<tr><td>无人值守时"需要审批"直接变成"拒绝"，并把拒绝作为结果回给模型</td><td>141 个 crate 的拆分粒度：这是大团队长期演进的结果，个人项目照搬只会增加摩擦</td></tr>
+<tr><td>规则文件带正反例、加载即校验；放权落在人能审的规则文件里</td><td>危险命令启发式本身：它故意做得很窄，安全靠的是沙箱兜底；如果你没有沙箱，这么窄的启发式就远远不够</td></tr>
+<tr><td>不受信任的项目不加载项目说明；能改变权限的目录强制只读</td><td></td></tr>
+<tr><td>会话 JSONL 落盘、事件流给程序消费、Stop hook 有防死循环标志</td><td></td></tr>
+</table>
+
+<h2>11 · 对照复盘</h2>
+<div class="callout case"><b>和两个真实项目的对照</b>
+<ul>
+  <li><a href="review.html#f-D8">D8 授权只拦一次，权限请求由另一个 LLM 代按</a>：Codex 也允许模型审查，但它是显式开启、隔离的审查会话，提权重试必须重新审查，沙箱与必审规则由核心强制执行。devtask 是正在跑的话题 agent 顺手按键，没有这些边界。</li>
+  <li><a href="review.html#f-D9">D9 三要素集中在同一个 agent</a>：Codex 的默认档（workspace-write）不联网、只能写工作区，<code>.git/hooks</code> 等目录强制只读；devtask 没有给编码 agent 设权限模式，继承了全局配置。</li>
+  <li><a href="review.html#f-D6">D6 驾驭交互式终端，没用程序化协议</a>：Codex 自己就提供了 <code>exec --json</code> 事件流、会话记录与 <code>resume</code>、app-server。驾驭它的程序应该消费这些结构化事件，而不是读终端画面。</li>
+</ul></div>
+
+<h2>12 · 读码练习</h2>
+<details><summary>练习 1：<code>on-request</code> + <code>read-only</code> 下，模型想改一个文件，第一次尝试会发生什么？</summary>
+<p>要点：改文件这类命令不是危险命令；<code>on-request</code> 在受限沙箱里对"没有申请提权"的命令判 Allow，所以会先在只读沙箱里跑，写入被沙箱拒绝。之后能否申请到沙箱外重跑，看 <code>wants_no_sandbox_approval</code>：<code>on-request</code> 返回 false，所以不会自动升级，失败结果回给模型；模型可以主动申请提权（这时才会询问用户）。看 <code>core/src/exec_policy.rs</code> 的 <code>render_decision_for_unmatched_command_for_platform</code> 和 <code>core/src/tools/orchestrator.rs</code> 里处理 <code>SandboxErr::Denied</code> 的分支。</p></details>
+<details><summary>练习 2：为什么 <code>granular</code> 模式下，即使关掉了沙箱审批，危险命令仍然可能弹出审批？</summary>
+<p>要点：<code>GranularApprovalConfig</code> 上 <code>sandbox_approval</code> 字段的注释写明："Dangerous commands can still request approval within existing permissions."。关掉的是"申请到沙箱外"这一类，危险命令在现有权限内的确认仍然保留。对照 <code>render_decision_for_unmatched_command_for_platform</code> 里危险命令分支：只有 <code>Never</code> 判 Forbidden，其余都判 Prompt。</p></details>
+<details><summary>练习 3：AGENTS.md 的查找为什么默认不越过项目根？如果当前目录不在任何 git 仓库里会怎样？</summary>
+<p>要点：看 <code>core/src/agents_md.rs</code> 的模块注释：以 <code>project_root_markers</code>（默认 <code>.git</code>）确定项目根，不越过它；找不到标记时只看当前目录；标记列表为空时不向上找。不越过项目根，是为了不把上层目录里与本项目无关、甚至不可信的说明带进上下文。</p></details>
+<details><summary>练习 4：在 <code>run_turn</code> 里找到 Stop hook 要求继续时的处理，说说它如何避免无限循环。</summary>
+<p>要点：<code>core/src/session/turn.rs</code> 中 <code>if !needs_follow_up</code> 之后的分支：hook 返回 <code>should_block</code> 且带有继续提示时，把提示记录为一条消息、把 <code>stop_hook_active</code> 设为 true 再 <code>continue</code>；没有提示的 block 会被忽略并发出警告。<code>stop_hook_active</code> 会传给 hook，hook 据此决定第二次不再拦截（第 12 章）。另外注意记忆整理这类无人值守会话被 Stop hook 拒绝时直接报错，不把拒绝喂回循环。</p></details>
+
+<div class="quiz" data-answer="2">
+<p class="q">Codex 对不受信任的项目不加载 AGENTS.md。这主要防的是哪类风险？</p>
+<ol>
+  <li>上下文太长导致费用上升</li>
+  <li>陌生仓库里的说明文件携带间接提示注入，诱导 agent 执行有害操作</li>
+  <li>AGENTS.md 格式不规范导致解析失败</li>
+  <li>不同项目的说明互相冲突</li>
+</ol>
+<div class="explain">项目说明会被当作"用户指令"拼进上下文，权重很高。仓库里的文件是外部可控的内容，属于第 9 章说的不可信输入。不受信任时干脆不读，是最便宜也最可靠的防线。</div>
+</div>
+
+<div class="takeaways"><b>本章要点</b>
+<ul>
+  <li>Codex 把"什么时候问人"（审批策略）和"最多能碰什么"（沙箱）分成两个正交维度，再用 Read Only / Default / Full Access 三档预设配对。</li>
+  <li>三层防线各守一段：execpolicy 规则显式可审计，危险命令启发式窄而保守，沙箱在操作系统层兜底。</li>
+  <li>无人值守模式下需要审批的请求被立即拒绝，拒绝作为结果回给模型，而不是放行或整体失败。</li>
+  <li>不受信任的项目不加载 AGENTS.md；可写目录里能改变权限的子目录强制只读。</li>
+  <li>压缩被定位成"给接手的 LLM 写交接摘要"；会话以 JSONL 落盘，exec 输出结构化事件流。</li>
+</ul></div>
+
+<h2>参考资料</h2>
+<ul class="refs">
+  <li><a href="https://github.com/openai/codex/tree/9f3cb259535c72de6960cc837ac705a780c62995" target="_blank" rel="noopener">openai/codex（研读版本 9f3cb25）</a> <span class="src">Apache-2.0 · 本页源码引用均固定于此提交</span></li>
+  <li><a href="https://github.com/openai/codex/blob/9f3cb259535c72de6960cc837ac705a780c62995/codex-rs/execpolicy/README.md" target="_blank" rel="noopener">codex-execpolicy README</a> <span class="src">规则语言、合并语义、正反例校验</span></li>
+  <li><a href="https://github.com/openai/codex/blob/9f3cb259535c72de6960cc837ac705a780c62995/codex-rs/core/src/tools/orchestrator.rs" target="_blank" rel="noopener">core/src/tools/orchestrator.rs</a> <span class="src">审批、沙箱选择与沙箱拒绝后的重试</span></li>
+  <li><a href="https://github.com/openai/codex/blob/9f3cb259535c72de6960cc837ac705a780c62995/codex-rs/core/src/agents_md.rs" target="_blank" rel="noopener">core/src/agents_md.rs</a> <span class="src">AGENTS.md 发现与拼接规则</span></li>
+  <li><a href="https://agents.md/" target="_blank" rel="noopener">AGENTS.md</a> <span class="src">"给 agent 看的 README"开放格式</span></li>
+  <li><a href="ch08-hitl-autonomy.html">第 8 章 · 人在回路与自主度</a> · <a href="ch09-security.html">第 9 章 · Agent 安全</a> · <a href="ch12-long-running.html">第 12 章 · 长任务与编码 Agent</a></li>
+</ul>
+</article>
+
+<script>
+window.addEventListener('DOMContentLoaded', () => {
+  const box = document.getElementById('sim');
+  const v = document.getElementById('v');
+  const vs = document.getElementById('vs');
+  const trace = document.getElementById('trace');
+  const val = (n) => box.querySelector(`input[name="${n}"]:checked`).value;
+  const SRC = 'https://github.com/openai/codex/blob/9f3cb259535c72de6960cc837ac705a780c62995/codex-rs/';
+  const link = (path, line, label) => `<a href="${SRC}${path}#L${line}" target="_blank" rel="noopener"><code>${label}</code></a>`;
+
+  function decide() {
+    const ap = val('ap');
+    const sb = val('sb');
+    const cmd = val('cmd');
+    const exec = document.getElementById('exec').checked;
+    const steps = [];
+    const fsKind = sb === 'danger-full-access' ? 'unrestricted' : sb === 'external-sandbox' ? 'external' : 'restricted';
+    const network = sb === 'danger-full-access' || sb === 'external-sandbox' ? '取决于外部环境' : '默认不允许联网';
+    const policy = ap.startsWith('granular') ? 'granular' : ap;
+    const sandboxApproval = ap === 'granular-on';
+    steps.push(`没有命中任何 execpolicy 规则，进入默认判定 ${link('core/src/exec_policy.rs', 868, 'render_decision_for_unmatched_command_for_platform')}。`);
+
+    // 第一次尝试的判定
+    let first;
+    if (cmd === 'danger') {
+      first = policy === 'never' ? 'forbid' : 'prompt';
+      steps.push(`命中危险命令启发式（带强制参数的 rm）${link('shell-command/src/command_safety/is_dangerous_command.rs', 132, 'dangerous_command_match_for_exec')}：${policy === 'never' ? 'never 下不能问人，只能禁止' : '一律询问'}。`);
+    } else if (policy === 'never') {
+      first = 'allow';
+      steps.push('never：不问人，依赖沙箱兜底，放行。');
+    } else if (policy === 'untrusted') {
+      first = 'prompt';
+      steps.push('untrusted：没有被规则显式允许的命令都要询问。');
+    } else if (fsKind !== 'restricted') {
+      first = 'allow';
+      steps.push(`${policy}：文件系统不受限（${sb}），视为用户选择了"直接跑"，放行。`);
+    } else if (cmd === 'escalate') {
+      first = policy === 'granular' && !sandboxApproval ? 'forbid' : 'prompt';
+      steps.push(`${policy} + 受限沙箱：模型申请了沙箱外运行，需要询问${first === 'forbid' ? '；但 granular 关闭了沙箱审批，询问被直接拒绝' : ''}。`);
+    } else {
+      first = 'allow';
+      steps.push(`${policy} + 受限沙箱：没有申请提权的普通命令不问人，交给沙箱约束，放行。`);
+    }
+
+    // 无人值守：需要询问的直接拒绝
+    if (first === 'prompt' && exec) {
+      steps.push(`在 codex exec 里没有人能批准：审批请求被立即拒绝 ${link('exec/src/approval_warning.rs', 6, 'approval_warning.rs')}，拒绝结果回给模型。`);
+      return finish('deny', '审批请求被立即拒绝', steps);
+    }
+    if (first === 'forbid') return finish('deny', '禁止执行，结果回给模型', steps);
+    if (first === 'prompt') return finish('prompt', '弹出审批，等用户决定', steps);
+
+    // 放行后在沙箱中执行
+    if (fsKind !== 'restricted') {
+      steps.push(`不设 Codex 沙箱（${sb}），命令直接执行；联网：${network}。`);
+      return finish('allow', '直接执行', steps);
+    }
+    const blocked = (cmd === 'net') || (cmd === 'write' && sb === 'read-only');
+    steps.push(`在沙箱中执行（macOS：Seatbelt；Linux：bubblewrap + seccomp）。${sb === 'read-only' ? '只读' : '只能写工作区'}，${network}。`);
+    if (!blocked) return finish('allow', '在沙箱内执行成功', steps);
+
+    steps.push(`沙箱拒绝了这次执行（${cmd === 'net' ? '联网' : '写文件'}）。是否申请到沙箱外重跑，看 ${link('core/src/tools/sandboxing.rs', 366, 'wants_no_sandbox_approval')}。`);
+    const wants = policy === 'untrusted' || (policy === 'granular' && sandboxApproval);
+    if (!wants) {
+      steps.push(`${policy}${policy === 'granular' ? '（禁止沙箱审批）' : ''}：不自动申请提权，沙箱拒绝的结果直接回给模型。模型可以改用别的办法，或主动申请提权。`);
+      return finish('deny', '被沙箱拦下，失败回给模型', steps);
+    }
+    if (exec) {
+      steps.push('需要询问是否到沙箱外重跑，但在 codex exec 里审批请求会被立即拒绝。');
+      return finish('deny', '提权申请被立即拒绝', steps);
+    }
+    steps.push('询问用户：是否允许在沙箱外重跑这条命令（编排器要求为这次重试重新审查）。');
+    return finish('prompt', '沙箱拒绝后请求提权批准', steps);
+  }
+
+  function finish(kind, text, steps) {
+    v.className = 'big ' + kind;
+    v.textContent = { allow: '执行', prompt: '询问用户', deny: '不执行' }[kind];
+    vs.textContent = text;
+    trace.innerHTML = steps.map((s) => `<li>${s}</li>`).join('');
+  }
+  box.addEventListener('change', decide);
+  decide();
+});
+</script>
+</body>
+</html>

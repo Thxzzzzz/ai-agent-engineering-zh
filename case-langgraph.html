@@ -1,0 +1,494 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LangGraph 研读 · AI Agent 工程</title>
+<meta name="description" content="读 LangGraph 源码：Pregel 超步、channel 与 reducer、检查点、interrupt 与恢复时节点重跑、durability 三种模式。">
+<link rel="stylesheet" href="assets/css/course.css">
+<script src="assets/js/manifest.js"></script>
+<script defer src="assets/js/course.js"></script>
+<style>
+  .sim-grid { display: grid; grid-template-columns: 1.2fr 1fr; gap: 14px; }
+  .sim-log { font: 13px/1.6 var(--mono); background: var(--surface-2); border-radius: 8px; padding: 10px 12px; min-height: 230px; max-height: 320px; overflow-y: auto; }
+  .sim-log div { padding: 2px 0; border-bottom: 1px dashed var(--border); }
+  .sim-log .ck { color: var(--ok); }
+  .sim-log .int { color: var(--warn); }
+  .sim-log .fx { color: var(--danger); font-weight: 600; }
+  .sim-log .re { color: var(--accent); }
+  .sim-side { font-size: 14px; }
+  .sim-side .stat b { font-size: 26px; }
+  .modes { display: flex; flex-wrap: wrap; gap: 6px 14px; margin: 6px 0 10px; font-size: 14px; }
+  @media (max-width: 720px) { .sim-grid { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body data-page="case-langgraph">
+<article id="content">
+<div class="eyebrow">第六部分 · 名作研读</div>
+<h1>LangGraph：检查点、中断与持久执行</h1>
+<p class="lead">"人在回路"喊起来容易，难的是：agent 跑到一半停下来等人，等了三天，进程早就重启过好几次，人点了"同意"之后它要从哪里接着跑、哪些事不能再做一遍？LangGraph 把这个问题做成了运行时的核心。读它的源码，是理解持久执行（durable execution）最直接的路径。</p>
+<div class="meta"><span>约 40 分钟</span><span>前置：第 8、10 章</span><span>研读版本：f961053（2026-11-24）</span></div>
+
+<div class="goals"><b>学完你能</b>
+<ul>
+  <li>说清 Pregel 式"超步"（superstep）执行模型：节点并行、写入在步与步之间才生效</li>
+  <li>解释 channel、reducer 和检查点的关系，知道一个检查点里存了什么</li>
+  <li>从源码层面解释 <code>interrupt()</code> 为什么在恢复时让整个节点重跑，并据此安排副作用的位置</li>
+  <li>在 sync / async / exit 三种持久化模式之间按场景取舍</li>
+</ul></div>
+
+<h2>1 · 速览</h2>
+<div class="cards">
+  <div class="card"><span class="tag">仓库</span><b>langchain-ai/langgraph</b><small>monorepo：<code>libs/langgraph</code>（运行时）、<code>libs/checkpoint*</code>（检查点）、<code>libs/prebuilt</code>、SDK 与 CLI</small></div>
+  <div class="card"><span class="tag">语言 / 许可证</span><b>Python · MIT</b><small>另有 TypeScript 版 LangGraph.js（独立仓库 langchain-ai/langgraphjs），本页以 Python 版为准</small></div>
+  <div class="card"><span class="tag">研读版本</span><b>f961053 · 2026-11-24</b><small><code>libs/langgraph</code> 版本号 1.2.24</small></div>
+  <div class="card"><span class="tag">规模</span><b>约 2.9 万行</b><small>运行时包 <code>libs/langgraph/langgraph</code>；三个检查点库（基础、SQLite、Postgres）另约 1.6 万行</small></div>
+</div>
+<p><strong>一句话定位</strong>：仓库自己的 <a href="https://github.com/langchain-ai/langgraph/blob/f96105368f9e9385d4c9e38bffaa457aba17f095/AGENTS.md" target="_blank" rel="noopener">AGENTS.md</a> 写得很直白——LangGraph 正在收敛为 agent 与工作流的<strong>底层运行时</strong>：图执行、检查点、流式输出、中断与恢复；"写 agent"这件事属于再上一层的 harness。README 说明它的设计受 Google 的 Pregel 与 Apache Beam 启发。</p>
+
+<h2>2 · 为什么读它</h2>
+<p>第 10 章讲过持久执行的几个基本要素：状态外置、步骤可重放、副作用幂等、可以暂停等待外部事件。大多数团队是在业务代码里零散地实现这些要素的。LangGraph 把它们收拢成一个运行时，并且在源码里把每一个边界情况都写清楚了：</p>
+<ul>
+  <li><strong>状态怎么存</strong>：不是存"变量"，而是存每个 channel 的值和版本号，外加"每个节点看过哪个版本"。</li>
+  <li><strong>停在哪里</strong>：只在超步之间落检查点；一个超步里已经完成的节点，它的写入会作为待定写入（pending writes）单独保存。</li>
+  <li><strong>恢复时做什么</strong>：已经有写入的任务不再执行，没有写入的任务（比如被中断的那个）从头再跑。</li>
+</ul>
+<p>理解了这三点，你就能回答第 8 章留下的问题：等人审批这几天里，什么会被重做、什么不会。</p>
+
+<h2>3 · 架构总览</h2>
+<figure>
+<div class="diagram">
+<svg viewBox="0 0 760 330" width="760" role="img" aria-label="LangGraph 架构总览">
+  <rect class="box a" x="20" y="20" width="200" height="70" rx="10"/>
+  <text class="tb" x="120" y="47" text-anchor="middle">StateGraph</text>
+  <text class="ts" x="120" y="68" text-anchor="middle">graph/state.py · 声明节点与边</text>
+  <rect class="box a" x="280" y="20" width="200" height="70" rx="10"/>
+  <text class="tb" x="380" y="47" text-anchor="middle">Pregel</text>
+  <text class="ts" x="380" y="68" text-anchor="middle">pregel/main.py · invoke / stream</text>
+  <path class="line a" d="M220 55 H280" marker-end="url(#arr-a)"/>
+  <text class="ts" x="250" y="46" text-anchor="middle">compile</text>
+  <rect class="box b" x="200" y="130" width="170" height="70" rx="10"/>
+  <text class="tb" x="285" y="157" text-anchor="middle">PregelLoop</text>
+  <text class="ts" x="285" y="178" text-anchor="middle">_loop.py · tick / after_tick</text>
+  <rect class="box b" x="390" y="130" width="170" height="70" rx="10"/>
+  <text class="tb" x="475" y="157" text-anchor="middle">PregelRunner</text>
+  <text class="ts" x="475" y="178" text-anchor="middle">_runner.py · 并行执行任务</text>
+  <rect class="box b" x="20" y="130" width="160" height="70" rx="10"/>
+  <text class="tb" x="100" y="157" text-anchor="middle">_algo.py</text>
+  <text class="ts" x="100" y="178" text-anchor="middle">选任务 · 应用写入</text>
+  <path class="line" d="M380 90 L300 130" marker-end="url(#arr)"/>
+  <path class="line" d="M380 90 L460 130" marker-end="url(#arr)"/>
+  <path class="line" d="M200 165 H180" marker-end="url(#arr)"/>
+  <rect class="box g" x="20" y="240" width="250" height="70" rx="10"/>
+  <text class="tb" x="145" y="267" text-anchor="middle">Channels</text>
+  <text class="ts" x="145" y="288" text-anchor="middle">LastValue · BinaryOperatorAggregate …</text>
+  <rect class="box v" x="300" y="240" width="270" height="70" rx="10"/>
+  <text class="tb" x="435" y="267" text-anchor="middle">Checkpointer</text>
+  <text class="ts" x="435" y="288" text-anchor="middle">InMemorySaver · SqliteSaver · PostgresSaver</text>
+  <path class="line g" d="M100 200 L120 240" marker-end="url(#arr-g)"/>
+  <path class="line" d="M285 200 L400 240" marker-end="url(#arr)"/>
+  <rect class="box m" x="600" y="130" width="140" height="70" rx="10"/>
+  <text class="tb" x="670" y="157" text-anchor="middle">interrupt()</text>
+  <text class="ts" x="670" y="178" text-anchor="middle">types.py</text>
+  <path class="line dash" d="M600 165 H560" marker-end="url(#arr)"/>
+  <rect class="box m" x="600" y="240" width="140" height="70" rx="10"/>
+  <text class="tb" x="670" y="267" text-anchor="middle">Command</text>
+  <text class="ts" x="670" y="288" text-anchor="middle">resume · goto · update</text>
+  <path class="line dash" d="M600 275 H570" marker-end="url(#arr)"/>
+</svg>
+</div>
+<figcaption>图 1 编译后的图是一个 Pregel 对象；每次调用由 PregelLoop 一个超步一个超步地推进，状态保存在 channel 里，检查点由可替换的 checkpointer 持久化。</figcaption>
+</figure>
+
+<table>
+<tr><th>概念</th><th>源码位置</th><th>一句话</th></tr>
+<tr><td>StateGraph</td><td><a href="https://github.com/langchain-ai/langgraph/blob/f96105368f9e9385d4c9e38bffaa457aba17f095/libs/langgraph/langgraph/graph/state.py#L132" target="_blank" rel="noopener">graph/state.py#L132</a></td><td>用户写图的 API；<code>compile()</code>（L1178）产出 Pregel</td></tr>
+<tr><td>字段 → channel</td><td><a href="https://github.com/langchain-ai/langgraph/blob/f96105368f9e9385d4c9e38bffaa457aba17f095/libs/langgraph/langgraph/graph/state.py#L1855" target="_blank" rel="noopener">state.py#L1855 <code>_get_channel</code></a></td><td>普通字段是 <code>LastValue</code>；用 <code>Annotated[类型, reducer]</code> 标注的字段是 <code>BinaryOperatorAggregate</code>（L1909）</td></tr>
+<tr><td>超步循环</td><td><a href="https://github.com/langchain-ai/langgraph/blob/f96105368f9e9385d4c9e38bffaa457aba17f095/libs/langgraph/langgraph/pregel/main.py#L3083" target="_blank" rel="noopener">pregel/main.py#L3083</a></td><td><code>while loop.tick(): runner.tick(...); loop.after_tick()</code></td></tr>
+<tr><td>检查点接口</td><td><a href="https://github.com/langchain-ai/langgraph/blob/f96105368f9e9385d4c9e38bffaa457aba17f095/libs/checkpoint/langgraph/checkpoint/base/__init__.py#L199" target="_blank" rel="noopener">checkpoint/base/__init__.py#L199</a></td><td><code>BaseCheckpointSaver</code>：<code>get_tuple</code> / <code>list</code> / <code>put</code> / <code>put_writes</code> / <code>delete_thread</code></td></tr>
+<tr><td>中断</td><td><a href="https://github.com/langchain-ai/langgraph/blob/f96105368f9e9385d4c9e38bffaa457aba17f095/libs/langgraph/langgraph/types.py#L983" target="_blank" rel="noopener">types.py#L983 <code>interrupt</code></a></td><td>第一次调用抛 <code>GraphInterrupt</code>；恢复后按调用顺序取回答复</td></tr>
+</table>
+
+<h2>4 · 一次调用的旅程</h2>
+<p>以"起草邮件 → 等人审批 → 发送"的三节点图为例，看一次 <code>graph.stream(input, {"configurable": {"thread_id": "t1"}})</code> 在源码里经过了哪些地方。</p>
+
+<figure class="anim" data-dim>
+<div class="diagram">
+<svg viewBox="0 0 760 300" width="760" role="img" aria-label="一次调用的旅程">
+  <g data-k="call"><rect class="box" x="20" y="20" width="150" height="56" rx="8"/><text class="tb" x="95" y="44" text-anchor="middle">stream(input)</text><text class="ts" x="95" y="63" text-anchor="middle">main.py</text></g>
+  <g data-k="load"><rect class="box v" x="200" y="20" width="160" height="56" rx="8"/><text class="tb" x="280" y="44" text-anchor="middle">读最新检查点</text><text class="ts" x="280" y="63" text-anchor="middle">get_tuple(thread_id)</text></g>
+  <g data-k="tick"><rect class="box b" x="390" y="20" width="160" height="56" rx="8"/><text class="tb" x="470" y="44" text-anchor="middle">tick()</text><text class="ts" x="470" y="63" text-anchor="middle">prepare_next_tasks</text></g>
+  <g data-k="run"><rect class="box a" x="580" y="20" width="160" height="56" rx="8"/><text class="tb" x="660" y="44" text-anchor="middle">runner.tick</text><text class="ts" x="660" y="63" text-anchor="middle">并行执行本步任务</text></g>
+  <g data-k="pw"><rect class="box w" x="580" y="120" width="160" height="56" rx="8"/><text class="tb" x="660" y="144" text-anchor="middle">put_writes</text><text class="ts" x="660" y="163" text-anchor="middle">每个任务完成即保存</text></g>
+  <g data-k="after"><rect class="box b" x="390" y="120" width="160" height="56" rx="8"/><text class="tb" x="470" y="144" text-anchor="middle">after_tick()</text><text class="ts" x="470" y="163" text-anchor="middle">apply_writes → reducer</text></g>
+  <g data-k="ck"><rect class="box g" x="200" y="120" width="160" height="56" rx="8"/><text class="tb" x="280" y="144" text-anchor="middle">_put_checkpoint</text><text class="ts" x="280" y="163" text-anchor="middle">source: "loop"</text></g>
+  <g data-k="int"><rect class="box r" x="390" y="220" width="160" height="56" rx="8"/><text class="tb" x="470" y="244" text-anchor="middle">interrupt()</text><text class="ts" x="470" y="263" text-anchor="middle">抛 GraphInterrupt</text></g>
+  <g data-k="res"><rect class="box a" x="20" y="220" width="200" height="56" rx="8"/><text class="tb" x="120" y="244" text-anchor="middle">stream(Command(resume))</text><text class="ts" x="120" y="263" text-anchor="middle">同一个 thread_id</text></g>
+  <g data-k="e1"><path class="line" d="M170 48 H200" marker-end="url(#arr)"/></g>
+  <g data-k="e2"><path class="line" d="M360 48 H390" marker-end="url(#arr)"/></g>
+  <g data-k="e3"><path class="line" d="M550 48 H580" marker-end="url(#arr)"/></g>
+  <g data-k="e4"><path class="line" d="M660 76 V120" marker-end="url(#arr)"/></g>
+  <g data-k="e5"><path class="line" d="M580 148 H550" marker-end="url(#arr)"/></g>
+  <g data-k="e6"><path class="line" d="M390 148 H360" marker-end="url(#arr)"/></g>
+  <g data-k="e7"><path class="line b dash" d="M280 120 C280 95 430 95 450 76" marker-end="url(#arr-b)"/></g>
+  <g data-k="e8"><path class="line r" d="M660 176 C660 230 600 248 550 248" marker-end="url(#arr-r)"/></g>
+  <g data-k="e9"><path class="line a" d="M120 220 V98 H240 V80" marker-end="url(#arr-a)"/></g>
+</svg>
+</div>
+<ol class="anim-steps">
+  <li data-show="call e1 load" data-hl="call e1 load">调用进入 <code>Pregel.stream</code>（pregel/main.py）。进入 <code>SyncPregelLoop.__enter__</code> 时，用 <code>thread_id</code> 调 <code>checkpointer.get_tuple()</code> 读出这条线程最新的检查点（_loop.py#L1868）。没有就从空状态开始。</li>
+  <li data-show="e2 tick" data-hl="e2 tick"><code>tick()</code>（_loop.py#L670）调用 <code>prepare_next_tasks</code>（_algo.py#L350）：对比每个 channel 的版本号和检查点里的 <code>versions_seen</code>，找出"有新输入、还没看过"的节点，作为本超步的任务。超过步数上限就以 <code>out_of_steps</code> 结束。</li>
+  <li data-show="e3 run" data-hl="e3 run"><code>runner.tick</code> 只执行<strong>还没有写入</strong>的任务（main.py#L3086：<code>[t for t in loop.tasks.values() if not t.writes]</code>）。同一超步的多个节点并行执行，彼此看不到对方本步的写入。</li>
+  <li data-show="e4 pw" data-hl="e4 pw">每个任务一完成，它的写入就通过 <code>put_writes</code>（_loop.py#L483）存成待定写入。只要持久化模式不是 <code>exit</code>，这些写入会立刻交给 checkpointer 保存（L535）。这一步是"恢复时不重做已完成节点"的基础。</li>
+  <li data-show="e5 after" data-hl="e5 after">全部任务结束后，<code>after_tick()</code>（L720）调用 <code>apply_writes</code>（_algo.py#L235）把写入交给各 channel：<code>LastValue</code> 一步只接受一个值，多于一个直接报错；带 reducer 的 channel 用二元操作符合并。channel 的更新<strong>只在步与步之间</strong>生效。</li>
+  <li data-show="e6 ck e7" data-hl="e6 ck e7">接着 <code>_put_checkpoint({"source": "loop"})</code> 生成新检查点：channel 的值与版本、每个节点看过的版本。然后回到 <code>tick()</code> 开始下一个超步。<code>sync</code> 模式下，主循环会等检查点写完才进入下一步（main.py#L3106）。</li>
+  <li data-show="int e8" data-hl="int e8">审批节点里调用 <code>interrupt("要发送吗？")</code>：第一次调用找不到答复，抛出 <code>GraphInterrupt</code>（types.py#L1118）。这个节点本超步没有任何普通写入，调用以中断状态返回给客户端。</li>
+  <li data-show="res e9" data-hl="res e9 load">几天后人点了同意，客户端用同一个 <code>thread_id</code> 调 <code>stream(Command(resume="同意"))</code>。运行时再次用 <code>get_tuple</code> 读出检查点和待定写入：已经有写入的任务直接复用；审批节点没有写入，于是<strong>从头再执行一遍</strong>，这一次 <code>interrupt()</code> 返回"同意"。</li>
+</ol>
+<figcaption>图 2 一次调用的旅程。每一步都对应真实的源码位置（研读版本 f961053）。</figcaption>
+</figure>
+
+<h2>5 · 关键设计逐个拆</h2>
+
+<h3>5.1 超步：写入只在步与步之间生效</h3>
+<p><strong>它怎么做</strong>：主循环非常短，源码里有一段注释说清了规则——第 N 步的 channel 更新只在第 N+1 步可见，一个超步内 channel 是不可变的。</p>
+<pre data-title="libs/langgraph/langgraph/pregel/main.py（节选，MIT）"><code class="lang-py">
+# Channel updates from step N are only visible in step N+1
+# channels are guaranteed to be immutable for the duration of the step,
+# with channel updates applied only at the transition between steps.
+while loop.tick():
+    for task in loop.match_cached_writes():
+        loop.put_writes(task.id, task.writes, cached=True)
+    for _ in runner.tick(
+        [t for t in loop.tasks.values() if not t.writes],
+        timeout=self.step_timeout,
+        get_waiter=get_waiter,
+        schedule_task=loop.accept_push,
+    ):
+        ...
+    loop.after_tick()
+</code></pre>
+<p><strong>为什么这样设计</strong>：这是 Pregel 的批量同步并行（BSP）模型。好处有三个：并行节点之间不会出现读写竞态；每个超步边界都是一个天然的、一致的检查点位置；同一个超步里谁先跑完都不影响结果，执行是确定的。代价是：并行节点想基于彼此的结果做事，必须等到下一个超步。</p>
+<p><strong>对应课程</strong>：<a href="ch10-durable-execution.html">第 10 章</a>"确定性外壳"——把不确定的模型调用关进节点里，节点之间的推进完全由运行时确定。</p>
+
+<h3>5.2 channel 与 reducer：并发写入的规则写在类型上</h3>
+<p><strong>它怎么做</strong>：<code>StateGraph</code> 把状态类型的每个字段变成一个 channel（state.py#L1855）。普通字段是 <code>LastValue</code>，一个超步里收到两个值会直接报错：</p>
+<pre data-title="libs/langgraph/langgraph/channels/last_value.py（节选，MIT）"><code class="lang-py">
+def update(self, values: Sequence[Value]) -&gt; bool:
+    if len(values) == 0:
+        return False
+    if len(values) != 1:
+        msg = create_error_message(
+            message=f"At key '{self.key}': Can receive only one value per step. Use an Annotated key to handle multiple values.",
+            error_code=ErrorCode.INVALID_CONCURRENT_GRAPH_UPDATE,
+        )
+        raise InvalidUpdateError(msg)
+    self.value = values[-1]
+    return True
+</code></pre>
+<p>写成 <code>Annotated[list, operator.add]</code> 的字段则被识别为 <code>BinaryOperatorAggregate</code>（state.py#L1909），多个并行节点的写入用这个操作符合并。想绕过 reducer 直接覆盖，要显式写 <code>Overwrite(...)</code>（types.py#L1132）。</p>
+<p><strong>为什么这样设计</strong>：并发写同一个字段时"谁赢"是个必须回答的问题。LangGraph 的选择是：默认不允许，要合并就在类型上声明怎么合并。错误在第一次并发写时就暴露出来，而不是变成一个偶发的"消息丢了一条"。</p>
+<p><strong>对应课程</strong>：<a href="ch10-durable-execution.html">第 10 章</a>的状态机设计；<a href="ch03-structured-tools.html">第 3 章</a>"把约束写进类型和 schema，而不是写进说明"。</p>
+
+<h3>5.3 检查点里存了什么</h3>
+<p><code>Checkpoint</code> 是一个 TypedDict（checkpoint/base/__init__.py#L93），关键字段只有几个：</p>
+<table>
+<tr><th>字段</th><th>含义</th></tr>
+<tr><td><code>id</code></td><td>唯一且单调递增，可以直接用来排序</td></tr>
+<tr><td><code>channel_values</code></td><td>各 channel 的值</td></tr>
+<tr><td><code>channel_versions</code></td><td>各 channel 的版本号，单调递增</td></tr>
+<tr><td><code>versions_seen</code></td><td>每个节点看过每个 channel 的哪个版本——下一步该跑谁，就靠它和 <code>channel_versions</code> 比较</td></tr>
+<tr><td><code>updated_channels</code></td><td>这一步更新了哪些 channel</td></tr>
+</table>
+<p>元数据 <code>CheckpointMetadata</code>（L39）里的 <code>source</code> 取值有四种：<code>input</code>（调用的输入）、<code>loop</code>（循环内部）、<code>update</code>（手动改状态）、<code>fork</code>（从别的检查点复制）。<code>step</code> 在第一个 input 检查点是 -1，第一个 loop 检查点是 0。</p>
+<p>本仓库内置的 checkpointer 有：<code>InMemorySaver</code>（libs/checkpoint）、<code>SqliteSaver</code> / <code>AsyncSqliteSaver</code>（libs/checkpoint-sqlite）、<code>PostgresSaver</code> / <code>AsyncPostgresSaver</code>，以及只保留最新检查点的 <code>ShallowPostgresSaver</code>（libs/checkpoint-postgres）。接口只有五个方法，换存储不动业务代码。</p>
+<p><strong>时间旅行</strong>：<code>get_state_history</code>（main.py#L1529）列出一条线程的历史检查点；<code>update_state</code>（L2636）在某个检查点上手动改状态，会生成 <code>source</code> 为 <code>update</code> 或 <code>fork</code> 的新检查点。这让"从第 3 步换个答复重来一次"成为一等操作，评测和调试都用得上（<a href="ch13-evals.html">第 13 章</a>的回放）。</p>
+
+<h3>5.4 interrupt：为什么恢复时整个节点重跑</h3>
+<p><strong>它怎么做</strong>：<code>interrupt()</code> 本身不保存"执行到哪一行"。Python 没法把一个函数执行到一半的栈帧可靠地持久化下来，所以 LangGraph 选择了另一种做法：给每次 <code>interrupt()</code> 调用编号，答复按编号存下来；恢复时<strong>重新执行整个节点</strong>，执行到第 N 次 <code>interrupt()</code> 时直接返回第 N 个答复。</p>
+<pre data-title="libs/langgraph/langgraph/types.py interrupt()（节选，MIT）"><code class="lang-py">
+scratchpad = conf[CONFIG_KEY_SCRATCHPAD]
+idx = scratchpad.interrupt_counter()
+# find previous resume values
+if scratchpad.resume:
+    if idx &lt; len(scratchpad.resume):
+        v = scratchpad.resume[idx]
+        ...
+        return validated
+# find current resume value
+v = scratchpad.get_null_resume(True)
+if v is not None:
+    ...
+    return validated
+# no resume value found
+raise GraphInterrupt((Interrupt(value=value, id=..., response_schema=...),))
+</code></pre>
+<p>函数的文档字符串也写得很明确：恢复后"从节点开头执行，<strong>重新执行</strong>所有逻辑"；一个节点里有多个 <code>interrupt</code> 时，按它们在节点里的<strong>顺序</strong>匹配答复；而且必须配 checkpointer 才能用。</p>
+<p><strong>由此推出三条工程规则</strong>：</p>
+<ol>
+  <li><strong>中断之前的副作用会被重做</strong>。在 <code>interrupt()</code> 之前发邮件、扣款、建工单，恢复时都会再来一次。</li>
+  <li><strong><code>interrupt()</code> 的调用顺序必须稳定</strong>。不要把它放在依赖外部可变数据的条件分支里，否则答复会对不上号。</li>
+  <li><strong>不要用宽泛的 try/except 吞掉 <code>GraphInterrupt</code></strong>，否则中断不会发生。</li>
+</ol>
+<p>最稳妥的做法是把副作用放进<strong>独立的节点</strong>：审批节点只负责 <code>interrupt()</code>，发送节点在下一个超步执行。已经完成的超步落进了检查点，恢复时不会再执行；即便发送节点本身失败重试，也只需在这一个节点里用幂等键防重（<a href="ch10-durable-execution.html">第 10 章</a>）。下面的模拟器让你亲手看到区别。</p>
+
+<div class="widget" id="sim">
+<div class="w-title">超步与检查点模拟器</div>
+<p style="font-size:14px;margin:0 0 6px">图：<code>draft</code>（起草）→ <code>approve</code>（<code>interrupt</code> 等人批准）→ <code>finish</code>。选一种副作用位置，然后一步步执行，在中断处点"人批准，恢复"。</p>
+<div class="modes">
+  <label><input type="radio" name="mode" value="before" checked> 发送写在 approve 里、interrupt <b>之前</b></label>
+  <label><input type="radio" name="mode" value="after"> 发送写在 approve 里、interrupt <b>之后</b></label>
+  <label><input type="radio" name="mode" value="node"> 发送放在<b>独立节点</b> send</label>
+</div>
+<div class="sim-grid">
+  <div class="sim-log" data-log aria-live="polite"></div>
+  <div class="sim-side">
+    <div class="stat"><b data-sends>0</b><small>外部邮件实际发出次数</small></div>
+    <div class="stat" style="margin-left:18px"><b data-cks>0</b><small>已保存的检查点</small></div>
+    <p data-hint style="margin:10px 0"></p>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      <button class="btn small primary" type="button" data-step>执行下一步</button>
+      <button class="btn small" type="button" data-resume disabled>人批准，恢复</button>
+      <button class="btn small" type="button" data-crash>注入：发送后进程崩溃</button>
+      <button class="btn small" type="button" data-reset>重来</button>
+    </div>
+  </div>
+</div>
+</div>
+
+<h3>5.5 durability：什么时候真正写盘</h3>
+<p><strong>它怎么做</strong>：<code>Durability = Literal["sync", "async", "exit"]</code>（types.py#L101），调用时用 <code>durability=</code> 参数指定，<strong>默认是 <code>"async"</code></strong>（main.py#L2715）。</p>
+<table>
+<tr><th>模式</th><th>源码里的行为</th><th>适合</th></tr>
+<tr><td><code>sync</code></td><td>每个超步结束后，主循环等检查点写完才进下一步（main.py#L3106）</td><td>步骤之间有昂贵或不可逆的副作用，崩溃后绝不能丢一步</td></tr>
+<tr><td><code>async</code>（默认）</td><td>检查点在下一步执行的同时异步写入；任务写入照常即时保存</td><td>大多数场景：几乎不损失性能，崩溃时最多丢正在写的那个检查点</td></tr>
+<tr><td><code>exit</code></td><td>只在图退出时保存；循环内不保存任务写入（_loop.py#L535 的条件）</td><td>短小、可整体重跑的图；追求吞吐</td></tr>
+</table>
+<p>没有 checkpointer 却传了 <code>durability</code>，会收到"不起作用"的警告（main.py#L2930 附近）。</p>
+<p><strong>对应课程</strong>：<a href="ch10-durable-execution.html">第 10 章</a>"持久化的粒度是一种取舍"；<a href="ch14-observability.html">第 14 章</a>的延迟与成本。</p>
+
+<div class="callout note"><b>一个容易记错的默认值</b>
+<p>研读版本里，默认的递归上限（超步数上限）<code>DEFAULT_RECURSION_LIMIT</code> 是 10007，可以用环境变量 <code>LANGGRAPH_DEFAULT_RECURSION_LIMIT</code> 改（_internal/_config.py#L42）。很多旧教程里写的是更小的数字。这类默认值以你用的版本的源码为准——这本身就是读源码的价值。</p></div>
+
+<h2>6 · 值得借鉴 / 不宜照搬</h2>
+<table>
+<tr><th>值得借鉴</th><th>不宜照搬</th></tr>
+<tr><td>只在明确的边界（超步之间）落检查点，边界内的部分结果作为待定写入单独存——恢复语义清晰</td><td>如果你的流程只有三五个固定步骤，一张状态表加幂等键（第 10 章）就够了，不必引入图运行时</td></tr>
+<tr><td>并发写入的合并规则写在类型上，冲突第一时间报错</td><td>"整个节点重跑"对写节点的人要求很高，团队里每个人都得懂这条规则，否则副作用会被悄悄重做</td></tr>
+<tr><td>checkpointer 接口只有五个方法，存储可替换</td><td>它是运行时，不是 agent 框架；仓库自己也说写 agent 属于更上层的 harness</td></tr>
+<tr><td>检查点带来时间旅行与分叉，调试和评测都能复用</td><td>检查点会保存完整状态，包括消息原文；隐私数据要考虑存在哪、保留多久</td></tr>
+</table>
+
+<h2>7 · 对照复盘</h2>
+<div class="callout case"><b>两个真实项目里的对应问题</b>
+<ul>
+  <li><a href="review.html#f-D12">D12</a> · devtask 用轮询和内存状态感知变化，话题的"忙碌"只存在内存里，丢一个结束信号最长 1 小时才失效；启动前崩溃的任务没有对账。LangGraph 的做法正好相反：状态全部外置在检查点里，进程随时可以死，用同一个 <code>thread_id</code> 就能接着跑。</li>
+  <li><a href="review.html#f-N15">N15</a> · niuma 遇到对方拒收，一天重试了三千多次。LangGraph 的节点有 <code>RetryPolicy</code>，但"哪些错误该重试"仍需你自己定义——运行时给了重试的位置，没给重试的判断。</li>
+</ul></div>
+
+<h2>8 · 读码练习</h2>
+<details><summary>练习 1：同一个超步里有两个并行节点 A、B，A 成功、B 调用了 interrupt。恢复时 A 会再执行吗？</summary>
+<p><strong>不会</strong>。A 完成时写入已经通过 <code>put_writes</code> 存为待定写入；恢复后 <code>tick()</code> 把待定写入重新应用到成功的任务上（_loop.py 的 <code>_reapply_writes_to_succeeded_nodes</code>），主循环只执行 <code>not t.writes</code> 的任务，所以只有 B 重跑。看 _loop.py#L483、#L692，main.py#L3086。</p></details>
+<details><summary>练习 2：两个并行节点同时往一个普通字段 <code>status: str</code> 写值，会发生什么？怎么改？</summary>
+<p>报 <code>InvalidUpdateError</code>，错误码 <code>INVALID_CONCURRENT_GRAPH_UPDATE</code>（channels/last_value.py#L56）。要么让两个节点写不同字段，要么把字段标注成 <code>Annotated[类型, reducer]</code> 声明合并方式。</p></details>
+<details><summary>练习 3：为什么 <code>interrupt()</code> 必须配 checkpointer？</summary>
+<p>答复要按调用编号存起来，恢复时要读回中断前的状态和其他任务的待定写入，这些都存在 checkpointer 里。没有它，"恢复"就无处可读。看 types.py#L983 的文档字符串和 #L1099 之后的实现。</p></details>
+<details><summary>练习 4：把 durability 设成 exit，进程在第 5 个超步崩溃，重启后会从哪里继续？</summary>
+<p>exit 模式下循环内不保存检查点和任务写入（_loop.py#L535、#L1338 的条件），只在图退出时保存。崩溃前的进度都没落盘，只能从上一次正常退出时的检查点开始。这就是 exit 只适合"可整体重跑"的图的原因。</p></details>
+
+<div class="quiz" data-answer="3">
+<p class="q">审批节点里先调用 <code>send_email()</code> 通知审批人，再调用 <code>interrupt()</code> 等批准。人批准恢复后，审批人会收到几封通知？</p>
+<ol>
+  <li>1 封，LangGraph 会记住已经发过</li>
+  <li>0 封，恢复时跳过中断前的代码</li>
+  <li>2 封，恢复时整个节点从头重跑，中断前的 send_email 又执行了一次</li>
+  <li>取决于 durability 模式</li>
+</ol>
+<div class="explain">文档字符串原文："The graph resumes from the start of the node, re-executing all logic." 运行时不知道你的哪一行是副作用。把通知放进中断之前的独立节点，或者给 send_email 加幂等键。</div>
+</div>
+
+<div class="quiz" data-answer="2">
+<p class="q">下面哪件事是 <code>durability="sync"</code> 相比默认的 <code>"async"</code> 额外保证的？</p>
+<ol>
+  <li>节点不会被重试</li>
+  <li>进入下一个超步之前，上一个超步的检查点一定已经写完</li>
+  <li>副作用只会执行一次</li>
+  <li>interrupt 不需要 checkpointer</li>
+</ol>
+<div class="explain">sync 模式下主循环在 <code>after_tick()</code> 之后等待 <code>_put_checkpoint_fut</code> 完成（main.py#L3106）。它保证的是"检查点先于下一步"，不保证副作用幂等——那仍然是你的责任。</div>
+</div>
+
+<div class="takeaways"><b>本章要点</b>
+<ul>
+  <li>LangGraph 是 Pregel 式运行时：节点在超步里并行执行，写入只在步与步之间生效，检查点落在超步边界。</li>
+  <li>状态是一组带版本号的 channel；并发写入的合并规则写在类型上（LastValue 拒绝并发，reducer 声明合并）。</li>
+  <li>任务一完成就存待定写入，恢复时已完成的任务不重跑；被中断的节点从头重跑，<code>interrupt()</code> 按调用顺序取回答复。</li>
+  <li>副作用要放在独立节点或做成幂等；不要放在 <code>interrupt()</code> 之前，不要吞掉 GraphInterrupt。</li>
+  <li>durability 默认 async；sync 换更强的落盘保证，exit 换吞吐。</li>
+</ul></div>
+
+<h2>参考资料</h2>
+<ul class="refs">
+  <li><a href="https://github.com/langchain-ai/langgraph/tree/f96105368f9e9385d4c9e38bffaa457aba17f095" target="_blank" rel="noopener">langchain-ai/langgraph @ f961053</a> <span class="src">MIT · 研读版本 2026-11-24</span></li>
+  <li><a href="https://github.com/langchain-ai/langgraph/blob/f96105368f9e9385d4c9e38bffaa457aba17f095/libs/langgraph/langgraph/pregel/_loop.py" target="_blank" rel="noopener">pregel/_loop.py</a> <span class="src">PregelLoop：tick、after_tick、put_writes、_put_checkpoint</span></li>
+  <li><a href="https://github.com/langchain-ai/langgraph/blob/f96105368f9e9385d4c9e38bffaa457aba17f095/libs/langgraph/langgraph/types.py" target="_blank" rel="noopener">types.py</a> <span class="src">interrupt、Command、Durability、Overwrite</span></li>
+  <li><a href="https://docs.langchain.com/oss/javascript/langgraph/interrupts" target="_blank" rel="noopener">LangGraph 文档：Interrupts</a> <span class="src">官方文档 · 恢复语义与注意事项</span></li>
+  <li><a href="https://github.com/langchain-ai/langgraphjs" target="_blank" rel="noopener">LangGraph.js</a> <span class="src">TypeScript 版本（独立仓库，本页未研读）</span></li>
+  <li><a href="https://research.google/pubs/pub37252/" target="_blank" rel="noopener">Pregel: A System for Large-Scale Graph Processing</a> <span class="src">Google · LangGraph 执行模型的来源</span></li>
+</ul>
+</article>
+
+<script>
+window.addEventListener('DOMContentLoaded', () => {
+  const box = document.getElementById('sim');
+  const log = box.querySelector('[data-log]');
+  const sendsEl = box.querySelector('[data-sends]');
+  const cksEl = box.querySelector('[data-cks]');
+  const hint = box.querySelector('[data-hint]');
+  const stepBtn = box.querySelector('[data-step]');
+  const resumeBtn = box.querySelector('[data-resume]');
+  const crashBtn = box.querySelector('[data-crash]');
+  let mode, queue, sends, cks, waiting, crashArmed, crashNote;
+
+  // 每种模式的执行脚本：每一项是一步要做的事
+  const scripts = {
+    before: [
+      ['超步 0：执行 draft，写入 channel "draft"', 'run'],
+      ['after_tick：apply_writes → 保存检查点 #1（step 0）', 'ck'],
+      ['超步 1：执行 approve —— send_email(通知审批人)', 'fx'],
+      ['approve 调用 interrupt()：没有答复 → 抛 GraphInterrupt，调用结束', 'int'],
+    ],
+    after: [
+      ['超步 0：执行 draft，写入 channel "draft"', 'run'],
+      ['after_tick：apply_writes → 保存检查点 #1（step 0）', 'ck'],
+      ['超步 1：执行 approve —— 调用 interrupt()：没有答复 → 抛 GraphInterrupt', 'int'],
+    ],
+    node: [
+      ['超步 0：执行 draft，写入 channel "draft"', 'run'],
+      ['after_tick：apply_writes → 保存检查点 #1（step 0）', 'ck'],
+      ['超步 1：执行 approve —— 调用 interrupt()：没有答复 → 抛 GraphInterrupt', 'int'],
+    ],
+  };
+  const resumeScripts = {
+    before: [
+      ['恢复：读检查点 #1，approve 没有写入 → 从头重跑', 're'],
+      ['approve 重跑 —— send_email(通知审批人) 又执行了一次！', 'fx'],
+      ['interrupt() 这次取到答复"同意"，approve 写入 approved=true', 'run'],
+      ['after_tick → 保存检查点 #2（step 1）', 'ck'],
+      ['超步 2：执行 finish', 'run'],
+      ['after_tick → 保存检查点 #3（step 2），图结束', 'ck'],
+    ],
+    after: [
+      ['恢复：读检查点 #1，approve 没有写入 → 从头重跑', 're'],
+      ['interrupt() 取到答复"同意"', 'run'],
+      ['approve 继续执行 —— send_email(正式发出邮件)', 'fx'],
+      ['approve 写入 approved=true；after_tick → 保存检查点 #2（step 1）', 'ck'],
+      ['超步 2：执行 finish', 'run'],
+      ['after_tick → 保存检查点 #3（step 2），图结束', 'ck'],
+    ],
+    node: [
+      ['恢复：读检查点 #1，approve 没有写入 → 从头重跑', 're'],
+      ['interrupt() 取到答复"同意"，approve 写入 approved=true', 'run'],
+      ['after_tick → 保存检查点 #2（step 1）', 'ck'],
+      ['超步 2：执行 send —— send_email(正式发出邮件，带幂等键)', 'fx'],
+      ['after_tick → 保存检查点 #3（step 2）', 'ck'],
+      ['超步 3：执行 finish；保存检查点 #4，图结束', 'ck'],
+    ],
+  };
+  const verdict = {
+    before: '结果：审批人收到 2 封通知。中断之前的副作用在恢复时被重做了。',
+    after: '结果：只发 1 次。但如果发送之后、approve 返回之前进程崩溃，approve 没有写入，下次恢复会整个重跑、再发一次——试试"注入崩溃"。',
+    node: '结果：只发 1 次。发送在独立超步里；即使发送节点崩溃重跑，也只影响这一个节点，用幂等键就能防重（第 10 章）。',
+  };
+
+  const add = (text, cls) => {
+    const d = Course.el('div', { class: cls === 'run' ? '' : cls, text: text });
+    log.append(d);
+    log.scrollTop = log.scrollHeight;
+  };
+  const apply = ([text, kind]) => {
+    add(text, kind);
+    if (kind === 'fx') sends++;
+    if (kind === 'ck') cks++;
+    sendsEl.textContent = sends;
+    cksEl.textContent = cks;
+  };
+  const reset = () => {
+    mode = box.querySelector('input[name=mode]:checked').value;
+    queue = scripts[mode].slice();
+    sends = 0;
+    cks = 0;
+    waiting = false;
+    crashArmed = false;
+    crashNote = '';
+    log.innerHTML = '';
+    add('graph.stream({...}, {"configurable": {"thread_id": "t1"}})', 're');
+    sendsEl.textContent = '0';
+    cksEl.textContent = '0';
+    hint.textContent = '点"执行下一步"。';
+    stepBtn.disabled = false;
+    resumeBtn.disabled = true;
+    crashBtn.disabled = mode === 'before';
+    crashBtn.textContent = '注入：发送后进程崩溃';
+  };
+  const step = () => {
+    if (!queue.length) return;
+    const item = queue.shift();
+    apply(item);
+    // 崩溃注入：在发送之后、写入之前崩溃，恢复时 approve（或 send）没有写入，整个重跑
+    if (crashArmed && item[1] === 'fx') {
+      crashArmed = false;
+      add('💥 进程崩溃：发送已完成，但这个节点还没写入、检查点还没保存', 'int');
+      add('重启 → 用同一个 thread_id 恢复，读到的仍是最近的检查点', 're');
+      if (mode === 'after') {
+        queue = [
+          ['approve 没有写入 → 从头重跑；interrupt() 直接取回已存的答复"同意"', 're'],
+          ['approve 继续执行 —— send_email(正式发出邮件) 又执行了一次！', 'fx'],
+          ['approve 写入 approved=true；保存检查点 #2', 'ck'],
+          ['超步 2：执行 finish；保存检查点 #3，图结束', 'ck'],
+        ];
+        crashNote = '结果：发了 2 次。同一节点里，发送和"写入完成"之间的任何崩溃都会导致重发——这就是要把副作用拆成独立节点并加幂等键的原因。';
+        hint.textContent = '继续执行，看看最后发了几次。';
+      } else {
+        queue = [
+          ['send 没有写入 → 只重跑 send 这一个节点（approve 的结果在检查点 #2 里）', 're'],
+          ['send 重跑 —— 带同一个幂等键调用发送接口：服务端识别为重复，不再发出', 'run'],
+          ['send 写入完成；保存检查点 #3', 'ck'],
+          ['超步 3：执行 finish；保存检查点 #4，图结束', 'ck'],
+        ];
+        crashNote = '结果：只发 1 次。独立节点把重跑范围缩到最小，再加幂等键，崩溃重跑也不会重发。';
+        hint.textContent = '继续执行，看看最后发了几次。';
+      }
+    }
+    if (!queue.length) {
+      if (!waiting && scripts[mode].length && resumeBtn.disabled && !log.textContent.includes('图结束')) {
+        waiting = true;
+        resumeBtn.disabled = false;
+        stepBtn.disabled = true;
+        hint.textContent = '图停在 interrupt 处，状态已在检查点 #1 里。现在可以关掉进程，过几天再来——点"人批准，恢复"。';
+      } else if (log.textContent.includes('图结束')) {
+        stepBtn.disabled = true;
+        hint.textContent = crashNote || verdict[mode];
+      }
+    }
+  };
+  resumeBtn.addEventListener('click', () => {
+    add('stream(Command(resume="同意"), {"configurable": {"thread_id": "t1"}})', 're');
+    queue = resumeScripts[mode].slice();
+    resumeBtn.disabled = true;
+    stepBtn.disabled = false;
+    hint.textContent = '继续点"执行下一步"。';
+  });
+  crashBtn.addEventListener('click', () => {
+    crashArmed = true;
+    crashBtn.disabled = true;
+    crashBtn.textContent = '已注入：下一次发送后崩溃';
+  });
+  stepBtn.addEventListener('click', step);
+  box.querySelector('[data-reset]').addEventListener('click', reset);
+  box.querySelectorAll('input[name=mode]').forEach((r) => r.addEventListener('change', reset));
+  reset();
+});
+</script>
+</body>
+</html>

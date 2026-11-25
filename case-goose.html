@@ -1,0 +1,400 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>goose 研读 · AI Agent 工程</title>
+<meta name="description" content="读 goose 源码：三类扩展共用 MCP 数据模型、工具前缀与纠错、按需加载工具、五个检查器组成的审批链、上下文压缩与超大结果落盘。">
+<link rel="stylesheet" href="assets/css/course.css">
+<script src="assets/js/manifest.js"></script>
+<script defer src="assets/js/course.js"></script>
+<style>
+  .ext-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 6px 14px; font-size: 14px; margin: 8px 0 12px; }
+  .ext-list label { display: flex; gap: 8px; align-items: baseline; }
+  .ext-list small { color: var(--muted); }
+  .ext-out { display: flex; flex-wrap: wrap; gap: 18px; align-items: flex-end; }
+  .ext-bar { flex: 1 1 100%; }
+</style>
+</head>
+<body data-page="case-goose">
+<article id="content">
+<div class="eyebrow">第六部分 · 名作研读</div>
+<h1>goose：以 MCP 为骨架的扩展体系</h1>
+<p class="lead">大多数 agent 都会走到这一步：工具越接越多，内置的、第三方的、跑在别的进程里的混在一起，每一种都有自己的接入方式和权限规则。goose 的回答是"所有扩展都说 MCP 的数据模型"，再在统一的工具面上叠加命名、按需加载和逐层审批。它适合用来学习：一个通用 agent 怎样在工具越来越多的情况下保持可控。</p>
+<div class="meta"><span>约 40 分钟</span><span>前置：第 3、9、11 章</span><span>研读版本：8256b9a（2026-11-25）</span></div>
+
+<div class="goals"><b>学完你能</b>
+<ul>
+  <li>说清 goose 三类扩展（外部、内置、平台）的区别，以及它们为什么共用一套 MCP 数据模型</li>
+  <li>解释工具命名前缀、名称纠错、扩展管理器和工具延迟加载各自解决什么问题</li>
+  <li>画出一次工具调用经过的五个检查器，并说出它们的合并规则与失败策略</li>
+  <li>评估"默认自动批准"这类产品默认值，知道在自己的系统里什么时候不能照抄</li>
+</ul></div>
+
+<h2>1 · 速览</h2>
+<div class="cards">
+  <div class="card"><span class="tag">仓库</span><b>aaif-goose/goose</b><small>原 block/goose，GitHub 上已重定向到新组织</small></div>
+  <div class="card"><span class="tag">语言 / 许可证</span><b>Rust · Apache-2.0</b><small>另有桌面应用与 CLI；本页只研读 <code>crates/</code> 下的 Rust 代码</small></div>
+  <div class="card"><span class="tag">研读版本</span><b>8256b9a · 2026-11-25</b><small>稀疏检出 <code>crates/</code> 与根目录文档</small></div>
+  <div class="card"><span class="tag">规模</span><b>约 28 万行 Rust</b><small><code>crates/</code> 下全部 .rs 文件（含内联测试，不含 tests 目录）</small></div>
+</div>
+<p><strong>一句话定位</strong>：README 写明，仓库里有两样东西——<strong>oi-kit</strong>（Open Intelligence Kit，可复用的 agent 组件：状态机、操作、工具、模型提供方、上下文管理）和 <strong>goose</strong>（用 oi-kit 搭成的完整通用 agent，有桌面应用和 CLI，也能通过 ACP 当别的应用的 agent 后端）。治理文件 <a href="https://github.com/aaif-goose/goose/blob/8256b9ac9ffae7d19ef1db1f57e37f84c44915bd/GOVERNANCE.md#L193" target="_blank" rel="noopener">GOVERNANCE.md</a> 写着：由 Block 创立，现由 Linux 基金会下的 Agentic AI Foundation（AAIF）托管。</p>
+
+<h2>2 · 为什么读它</h2>
+<ul>
+  <li><strong>扩展模型</strong>：第 11 章讲了 MCP 协议本身，goose 展示的是"一个 agent 把 MCP 当成内部的扩展骨架"会是什么样子，包括内置功能也用 MCP 的形状来实现。</li>
+  <li><strong>工具面治理</strong>：工具多了以后，命名冲突、模型写错名字、上下文被工具定义塞满，这些问题在源码里都有对应的机制。</li>
+  <li><strong>审批链</strong>：一次工具调用要经过五个独立的检查器。它把"权限"拆成了可组合的部件，这是第 8、9 章的直接落地。</li>
+  <li><strong>状态机 + 操作</strong>：主循环是一串有序的 Operation，作用在持久化的会话上，可以和 LangGraph 的检查点思路对照着读（<a href="case-langgraph.html">LangGraph 研读</a>）。</li>
+</ul>
+
+<h2>3 · 架构总览</h2>
+<figure>
+<div class="diagram">
+<svg viewBox="0 0 760 360" width="760" role="img" aria-label="goose 架构总览">
+  <rect class="box m" x="20" y="20" width="720" height="58" rx="10"/>
+  <text class="tb" x="380" y="44" text-anchor="middle">入口：goose-cli · 桌面应用 · ACP（goose-acp-types）</text>
+  <text class="ts" x="380" y="64" text-anchor="middle">同一个 agent 内核，三种外壳</text>
+  <rect class="box a" x="20" y="100" width="350" height="110" rx="10"/>
+  <text class="tb" x="195" y="126" text-anchor="middle">goose（crates/goose）</text>
+  <text class="ts" x="195" y="150" text-anchor="middle">agents/：状态机组装、扩展管理、工具执行</text>
+  <text class="ts" x="195" y="170" text-anchor="middle">permission/ · security/：审批链</text>
+  <text class="ts" x="195" y="190" text-anchor="middle">recipe/ · hooks/ · context_mgmt/</text>
+  <rect class="box v" x="390" y="100" width="350" height="110" rx="10"/>
+  <text class="tb" x="565" y="126" text-anchor="middle">oi-kit-*</text>
+  <text class="ts" x="565" y="150" text-anchor="middle">oi-kit-agent：StateMachine、Operation、MCP 客户端</text>
+  <text class="ts" x="565" y="170" text-anchor="middle">oi-kit-providers / provider-types：模型提供方</text>
+  <text class="ts" x="565" y="190" text-anchor="middle">oi-kit-context-management：压缩</text>
+  <path class="line" d="M380 78 V100" marker-end="url(#arr)"/>
+  <path class="line a" d="M370 155 H390" marker-end="url(#arr-a)" marker-start="url(#arr-a)"/>
+  <text class="tb" x="380" y="240" text-anchor="middle">三类扩展，同一套 MCP 数据模型（Tool · CallToolResult）</text>
+  <rect class="box g" x="20" y="256" width="230" height="86" rx="10"/>
+  <text class="tb" x="135" y="280" text-anchor="middle">外部扩展 External</text>
+  <text class="ts" x="135" y="302" text-anchor="middle">任意 MCP server</text>
+  <text class="ts" x="135" y="322" text-anchor="middle">stdio / Streamable HTTP</text>
+  <rect class="box b" x="265" y="256" width="230" height="86" rx="10"/>
+  <text class="tb" x="380" y="280" text-anchor="middle">内置扩展 Builtin</text>
+  <text class="ts" x="380" y="302" text-anchor="middle">goose-mcp 里的真 MCP server</text>
+  <text class="ts" x="380" y="322" text-anchor="middle">进程内 duplex 管道连接</text>
+  <rect class="box w" x="510" y="256" width="230" height="86" rx="10"/>
+  <text class="tb" x="625" y="280" text-anchor="middle">平台扩展 Platform</text>
+  <text class="ts" x="625" y="302" text-anchor="middle">进程内实现，可直接访问 agent</text>
+  <text class="ts" x="625" y="322" text-anchor="middle">developer · 扩展管理器 · Code Mode…</text>
+  <path class="line" d="M135 210 V256" marker-end="url(#arr)"/>
+  <path class="line" d="M380 248 V256" marker-end="url(#arr)"/>
+  <path class="line" d="M625 210 V256" marker-end="url(#arr)"/>
+</svg>
+</div>
+<figcaption>图 1 crates 划分与三类扩展。oi-kit 提供可复用的部件，goose 负责组装和产品策略。</figcaption>
+</figure>
+
+<h2>4 · 一次工具调用的旅程</h2>
+<p>用户说"把月报导出脚本跑一遍，结果整理成表格"。下面跟着一次 <code>developer</code> 扩展的 <code>shell</code> 调用，看它在源码里经过了哪些地方。</p>
+
+<figure class="anim" data-dim>
+<div class="diagram">
+<svg viewBox="0 0 760 320" width="760" role="img" aria-label="一次工具调用的旅程">
+  <g data-k="sm"><rect class="box a" x="20" y="20" width="170" height="60" rx="8"/><text class="tb" x="105" y="45" text-anchor="middle">状态机走一遍</text><text class="ts" x="105" y="65" text-anchor="middle">有序的 Operation</text></g>
+  <g data-k="snap"><rect class="box v" x="215" y="20" width="170" height="60" rx="8"/><text class="tb" x="300" y="45" text-anchor="middle">工具快照</text><text class="ts" x="300" y="65" text-anchor="middle">加前缀 · 可延迟</text></g>
+  <g data-k="infer"><rect class="box a" x="410" y="20" width="150" height="60" rx="8"/><text class="tb" x="485" y="45" text-anchor="middle">推理</text><text class="ts" x="485" y="65" text-anchor="middle">模型发起 tool call</text></g>
+  <g data-k="fix"><rect class="box m" x="585" y="20" width="155" height="60" rx="8"/><text class="tb" x="662" y="45" text-anchor="middle">名称纠错</text><text class="ts" x="662" y="65" text-anchor="middle">developer.shell → shell</text></g>
+  <g data-k="insp"><rect class="box r" x="410" y="125" width="330" height="70" rx="8"/><text class="tb" x="575" y="150" text-anchor="middle">检查器链（最严格者胜）</text><text class="ts" x="575" y="172" text-anchor="middle">Security · Egress · Adversary · Permission · Repetition</text></g>
+  <g data-k="ask"><rect class="box w" x="215" y="125" width="170" height="70" rx="8"/><text class="tb" x="300" y="150" text-anchor="middle">需要时问人</text><text class="ts" x="300" y="172" text-anchor="middle">允许 / 拒绝</text></g>
+  <g data-k="exec"><rect class="box g" x="20" y="125" width="170" height="70" rx="8"/><text class="tb" x="105" y="150" text-anchor="middle">分派执行</text><text class="ts" x="105" y="172" text-anchor="middle">平台 / 内置 / 外部</text></g>
+  <g data-k="big"><rect class="box b" x="20" y="240" width="250" height="60" rx="8"/><text class="tb" x="145" y="265" text-anchor="middle">超大结果落盘</text><text class="ts" x="145" y="285" text-anchor="middle">超过 20 万字符 → 只回文件路径</text></g>
+  <g data-k="cmp"><rect class="box v" x="300" y="240" width="250" height="60" rx="8"/><text class="tb" x="425" y="265" text-anchor="middle">压缩检查</text><text class="ts" x="425" y="285" text-anchor="middle">上下文 80%（封顶 22.5 万 token）</text></g>
+  <g data-k="stop"><rect class="box m" x="580" y="240" width="160" height="60" rx="8"/><text class="tb" x="660" y="265" text-anchor="middle">下一轮 / Stop hook</text><text class="ts" x="660" y="285" text-anchor="middle">最多拦停 8 次</text></g>
+  <g data-k="e1"><path class="line" d="M190 50 H215" marker-end="url(#arr)"/></g>
+  <g data-k="e2"><path class="line" d="M385 50 H410" marker-end="url(#arr)"/></g>
+  <g data-k="e3"><path class="line" d="M560 50 H585" marker-end="url(#arr)"/></g>
+  <g data-k="e4"><path class="line" d="M662 80 V125" marker-end="url(#arr)"/></g>
+  <g data-k="e5"><path class="line r" d="M410 160 H385" marker-end="url(#arr-r)"/></g>
+  <g data-k="e6"><path class="line" d="M215 160 H190" marker-end="url(#arr)"/></g>
+  <g data-k="e7"><path class="line" d="M105 195 V240" marker-end="url(#arr)"/></g>
+  <g data-k="e8"><path class="line" d="M270 270 H300" marker-end="url(#arr)"/></g>
+  <g data-k="e9"><path class="line" d="M550 270 H580" marker-end="url(#arr)"/></g>
+</svg>
+</div>
+<ol class="anim-steps">
+  <li data-show="sm" data-hl="sm">每一轮先把一串有序的 Operation 走一遍（agents/state_machine_builder.rs）：压缩、最终输出、工具审批、recipe、平台扩展、子目录提示、MCP prompts、扩展、工具延迟、子 agent、重试、Stop hook、最大轮数……最后才是推理。状态机的注释说它是"作用在持久化会话上的、有序且可重入的流水线"。</li>
+  <li data-show="e1 snap" data-hl="e1 snap">扩展操作把所有启用的扩展的工具收集成一份快照。外部和内置扩展的工具名加上 <code>扩展名__工具名</code> 前缀（oi-kit-agent/src/mcp/mod.rs#L313）；标了 <code>unprefixed_tools</code> 的平台扩展（如 developer）保持原名。开启延迟加载时，工具只以清单形式出现在提示里。</li>
+  <li data-show="e2 infer" data-hl="e2 infer">推理步骤把消息和工具定义发给模型，模型返回一个 <code>shell</code> 调用。</li>
+  <li data-show="e3 fix" data-hl="e3 fix">模型有时会把 <code>developer__shell</code> 写成 <code>developer.shell</code>，或者带上 <code>functions.</code> 前缀。<code>recover_mangled_tool_name</code>（mod.rs#L425）把这些写法映射回真实的工具名，而不是直接报"工具不存在"。</li>
+  <li data-show="e4 insp" data-hl="e4 insp">工具审批操作把调用交给 <code>ToolInspectionManager</code>。五个检查器依次给出"允许 / 需审批 / 拒绝"，合并时最严格的结论生效；某个检查器自身出错时跳过它继续（tool_inspection.rs）。</li>
+  <li data-show="e5 ask" data-hl="e5 ask">结论是"需审批"时，界面问用户允许还是拒绝。默认的 Auto 模式下，权限检查器直接放行，只有其他检查器（如配置了规则的 Adversary）可能要求审批。</li>
+  <li data-show="e6 exec" data-hl="e6 exec">分派到扩展：平台扩展在进程内直接调用；内置扩展经进程内 duplex 管道走 MCP；外部扩展经 stdio 或 HTTP 走 MCP。三者返回的都是 MCP 的 <code>CallToolResult</code>。</li>
+  <li data-show="e7 big" data-hl="e7 big">结果先经过 <code>process_tool_response</code>（large_response_handler.rs，ops_toolcalling.rs#L127 调用）：单段文本超过 20 万字符就写进临时文件，只把"结果太大，已存到某文件，可用工具查看"这句话和路径交给模型。</li>
+  <li data-show="e8 cmp e9 stop" data-hl="e8 cmp e9 stop">下一轮开始前检查上下文：超过上下文窗口的 80%、且不超过 22.5 万 token 的封顶值时触发压缩。模型不再调用工具时，Stop hook 有机会拦下它继续工作，默认最多拦 8 次（ops_stop_hook.rs#L16）。</li>
+</ol>
+<figcaption>图 2 一次工具调用的旅程（研读版本 8256b9a）。</figcaption>
+</figure>
+
+<h2>5 · 关键设计逐个拆</h2>
+
+<h3>5.1 三类扩展，一套数据模型</h3>
+<p><strong>它怎么做</strong>：<code>ExtensionConfig</code>（<a href="https://github.com/aaif-goose/goose/blob/8256b9ac9ffae7d19ef1db1f57e37f84c44915bd/crates/goose/src/agents/extension_config.rs#L55" target="_blank" rel="noopener">agents/extension_config.rs#L55</a>）只有三个变体：</p>
+<pre data-title="crates/goose/src/agents/extension_config.rs（节选，Apache-2.0）"><code class="lang-rust">
+#[serde(tag = "type")]
+pub enum ExtensionConfig {
+    /// Built-in extension that is part of the bundled goose MCP server
+    #[serde(rename = "builtin")]
+    Builtin { name: String, /* … */ available_tools: Vec&lt;String&gt; },
+    /// Platform extensions that have direct access to the agent etc and run in the agent process
+    #[serde(rename = "platform")]
+    Platform { name: String, /* … */ available_tools: Vec&lt;String&gt; },
+    /// Serialize the oi-kit config directly, preserving the existing tagged JSON.
+    #[serde(untagged)]
+    External(TransportConfig),
+}
+</code></pre>
+<table>
+<tr><th>类别</th><th>怎么运行</th><th>源码</th></tr>
+<tr><td>外部 External</td><td>任意 MCP server，经 stdio 或 Streamable HTTP 连接（oi-kit 的 <code>TransportConfig</code>）</td><td>extension_config.rs</td></tr>
+<tr><td>内置 Builtin</td><td><code>goose-mcp</code> 里用 rmcp 写的<strong>真 MCP server</strong>（autovisualiser、computercontroller、memory、tutorial）。平时用两条 <code>tokio::io::duplex</code> 管道在进程内连接；放进 Docker 容器时改成执行 <code>goose mcp &lt;名字&gt;</code> 走 stdio</td><td><a href="https://github.com/aaif-goose/goose/blob/8256b9ac9ffae7d19ef1db1f57e37f84c44915bd/crates/goose/src/agents/extension_manager/builtin.rs#L38" target="_blank" rel="noopener">extension_manager/builtin.rs#L38</a>、<a href="https://github.com/aaif-goose/goose/blob/8256b9ac9ffae7d19ef1db1f57e37f84c44915bd/crates/goose-mcp/src/lib.rs#L89" target="_blank" rel="noopener">goose-mcp/src/lib.rs#L89</a></td></tr>
+<tr><td>平台 Platform</td><td>进程内实现 <code>PlatformExtension</code> trait，能直接访问会话管理器、模型提供方等。接口的方法和返回类型（<code>list_tools</code> → <code>Tool</code>、<code>call_tool</code> → <code>CallToolResult</code>、<code>get_info</code> → <code>InitializeResult</code>）都是 MCP 的</td><td><a href="https://github.com/aaif-goose/goose/blob/8256b9ac9ffae7d19ef1db1f57e37f84c44915bd/crates/goose/src/agents/platform_extensions/client.rs#L8" target="_blank" rel="noopener">platform_extensions/client.rs#L8</a>、<a href="https://github.com/aaif-goose/goose/blob/8256b9ac9ffae7d19ef1db1f57e37f84c44915bd/crates/goose/src/agents/platform_extensions/mod.rs#L37" target="_blank" rel="noopener">mod.rs#L37</a></td></tr>
+</table>
+<p><strong>为什么这样设计</strong>：三类扩展的运行位置不同，但下游的一切——工具快照、命名、审批、执行结果处理、遥测——只认一种数据模型。新增一个能力时，团队只需要选"放在哪儿运行"，不需要为它设计新的接入协议。内置扩展更进一步：它本身就是一个标准 MCP server，只是省掉了进程开销，所以随时能搬进容器隔离运行。</p>
+<div class="callout note"><b>"一切都是 MCP"要说准确</b>
+<p>严格地说，只有外部和内置扩展走 MCP <strong>协议</strong>；平台扩展是进程内的 Rust trait，只是<strong>数据模型</strong>和 MCP 一致。这样设计是有意的：<code>developer</code>（读写文件、shell）、扩展管理器、Code Mode 这些需要直接访问 agent 内部状态，走协议反而别扭。</p></div>
+<p><strong>对应课程</strong>：<a href="ch11-protocols.html">第 11 章</a>（MCP 架构）、<a href="ch15-reference-architecture.html">第 15 章</a>（四层可替换的接口）。</p>
+
+<h3>5.2 工具命名：前缀、例外与纠错</h3>
+<p><strong>它怎么做</strong>：工具名统一改写为 <code>扩展名__工具名</code>（oi-kit-agent/src/mcp/mod.rs#L313），不同扩展的同名工具就不会冲突。几个高频的平台扩展设了 <code>unprefixed_tools: true</code>，以原名暴露（注释写的是"为了作为一等工具直观使用"）。模型偶尔会把分隔符写错，于是有了 <code>recover_mangled_tool_name</code>：</p>
+<pre data-title="crates/oi-kit-agent/src/mcp/mod.rs（节选，Apache-2.0）"><code class="lang-rust">
+let stripped = trimmed
+    .strip_prefix("functions.")
+    .or_else(|| trimmed.strip_prefix("functions:"))
+    .unwrap_or(trimmed);
+for (name, owner) in tools {
+    // Prefixed tools: the model turns Goose's "__" separator into a dot
+    // ("developer__shell" -&gt; "developer.shell").
+    let separator_mangled = name
+        .split_once("__")
+        .map(|(extension, tool)| format!("{extension}.{tool}"));
+    // …
+}
+</code></pre>
+<p><strong>为什么这样设计</strong>：这是第 3 章"防呆设计"（poka-yoke）的典型。与其在提示词里反复强调"请使用双下划线"，不如在代码里接住模型的常见笔误。注意它只做<strong>确定性的映射</strong>：能唯一对上的才纠正，对不上的照常报错。</p>
+<p><strong>对应课程</strong>：<a href="ch03-structured-tools.html">第 3 章</a>的工具设计原则（命名空间、防呆）。</p>
+
+<h3>5.3 工具面治理：不是所有工具都要每轮出现</h3>
+<p>工具一多，每一轮的上下文都被工具定义塞满，模型选错工具的概率也随之上升。goose 有四种互补的手段：</p>
+<ol>
+  <li><strong>扩展管理器</strong>（platform_extensions/ext_manager.rs，默认启用）：给模型 <code>search_available_extensions</code> 和 <code>manage_extensions</code> 两个工具。模型发现缺能力时先搜索，再申请启用。权限检查器对 <code>manage_extensions</code> 特殊处理：在 Approve / SmartApprove 模式下，除非用户给它单独设过权限，否则一律要人批准（permission_inspector.rs#L177）。</li>
+  <li><strong>工具延迟加载</strong>（ops_toolcalling.rs#L308 的 <code>ToolDeferral</code>）：配置 <code>GOOSE_TOOL_DEFERRAL=lookup</code> 后，MCP 工具只以清单形式列在提示里，模型调用 <code>enable_tools</code>、按工具名（参数 <code>tool_names</code>）启用后，下一轮才真正下发这些工具的定义；<code>GOOSE_TOOL_DEFERRAL_ALWAYS_LOAD</code> 列出始终加载的例外（services.rs#L161-170）。<strong>默认关闭</strong>。</li>
+  <li><strong>Code Mode</strong>（平台扩展 <code>code_execution</code>，默认关闭）：只给模型 <code>list_functions</code>、<code>get_function_details</code>、<code>execute_javascript</code> 三个工具，其他扩展的调用都写成代码执行。描述里写的就是"通过代码执行调用扩展，节省 token"——正是第 11 章提到的 Code execution with MCP 思路。</li>
+  <li><strong>Recipe 绑定扩展</strong>（recipe/mod.rs#L44）：一个 recipe 里写明 <code>instructions</code>、<code>prompt</code>、<code>extensions</code>、<code>parameters</code>、<code>response</code>（JSON Schema 约束的最终输出）、<code>sub_recipes</code>、<code>retry</code>。每类任务只启用它需要的扩展；扩展配置里的 <code>available_tools</code> 还能再筛到具体工具。</li>
+</ol>
+<p>下面的组件用 goose 源码里的真实工具数，加上几个示意性的外部扩展，算一算不同策略下每轮进入上下文的工具定义有多大。</p>
+
+<div class="widget" id="exts">
+<div class="w-title">工具面计算器</div>
+<div class="ext-list" data-list></div>
+<div class="w-row">
+  <label>每个工具定义平均 token（示意，可调）<input type="range" min="50" max="610" step="20" value="250" data-per><span data-per-v></span></label>
+  <label>延迟加载时本轮实际用到的工具数 <input type="range" min="1" max="10" step="1" value="2" data-used><span data-used-v></span></label>
+  <label>策略
+    <select data-mode>
+      <option value="all">全量下发：每轮带上全部工具定义</option>
+      <option value="defer">延迟加载：只列名字，用到时 enable_tools</option>
+      <option value="code">Code Mode：只给 3 个代码执行工具</option>
+    </select>
+  </label>
+</div>
+<div class="ext-out">
+  <div class="stat"><b data-n>0</b><small>工具定义进入上下文</small></div>
+  <div class="stat"><b data-tok>0</b><small>每轮工具部分约 token</small></div>
+  <div class="stat"><b data-list-tok>0</b><small>清单行约 token</small></div>
+  <div class="ext-bar"><div class="bar"><i data-bar style="width:0"></i></div><small data-note style="color:var(--muted)"></small></div>
+</div>
+</div>
+
+<h3>5.4 审批链：五个检查器，最严格者胜</h3>
+<p><strong>它怎么做</strong>：<a href="https://github.com/aaif-goose/goose/blob/8256b9ac9ffae7d19ef1db1f57e37f84c44915bd/crates/goose/src/agents/services.rs#L729" target="_blank" rel="noopener">agents/services.rs#L729-746</a> 依次装配五个检查器：</p>
+<table>
+<tr><th>检查器</th><th>做什么</th><th>默认行为</th></tr>
+<tr><td>Security</td><td>模式匹配与可选的分类模型，检测提示注入和恶意命令</td><td><code>SECURITY_PROMPT_ENABLED</code> 默认 false，即提示注入检测默认关闭（security/mod.rs#L46）</td></tr>
+<tr><td>Egress</td><td>从 shell 和 web 工具的参数里识别外发目标（域名、地址）</td><td>只记日志、放行，不拦截</td></tr>
+<tr><td>Adversary</td><td>按用户写在 <code>adversary.md</code> 里的规则，让模型审查工具调用</td><td>没有这个文件就不启用；只审 <code>shell</code>（可配置）；审查失败时<strong>放行</strong>（fail open）</td></tr>
+<tr><td>Permission</td><td>按模式与用户设置决定允许、拒绝或问人</td><td>见下文</td></tr>
+<tr><td>Repetition</td><td>检测同一调用的重复次数</td><td>上限默认不设（<code>RepetitionInspector::new(None)</code>）</td></tr>
+</table>
+<p>合并规则在 <code>apply_inspection_results_to_permissions</code>（tool_inspection.rs）：任何一个检查器说"拒绝"，就从批准和待批里移出；说"需审批"，就从已批准移到待批；说"允许"则不推翻别人的结论。单个检查器执行出错时记日志、跳过它。</p>
+<p><strong>权限模式</strong>：<code>GooseMode</code>（oi-kit-provider-types/src/goose_mode.rs#L22）有三种，<strong>默认是 <code>Auto</code></strong>：</p>
+<ul>
+  <li><code>Auto</code>：权限检查器直接放行所有工具调用。</li>
+  <li><code>Approve</code>：每次都问（旧名 <code>chat</code> 仍被识别为它）。</li>
+  <li><code>SmartApprove</code>：只在敏感调用时问。判定顺序如下。</li>
+</ul>
+<pre data-title="crates/goose/src/permission/permission_inspector.rs（节选，Apache-2.0）"><code class="lang-rust">
+GooseMode::Approve | GooseMode::SmartApprove =&gt; {
+    // 1. Check user-defined permission first
+    if let Some(level) = permission_manager.get_user_permission(tool_name) { /* … */ }
+    // 2. Check for a read-only annotation in SmartApprove mode
+    else if goose_mode == GooseMode::SmartApprove
+        &amp;&amp; self.is_readonly_annotated_tool(tool_name) { InspectionAction::Allow }
+    // 3. Special case for extension management
+    else if tool_name == MANAGE_EXTENSIONS_TOOL_NAME_COMPLETE { /* RequireApproval */ }
+    // 4. Defer to LLM detection (SmartApprove, uncached or legacy cached allow)
+    else if goose_mode == GooseMode::SmartApprove &amp;&amp; /* … */ { llm_detect_candidates.push(request); continue; }
+    // 5. Default: require approval for unknown tools
+    else { InspectionAction::RequireApproval(None) }
+}
+</code></pre>
+<p>第 2 步用的是 MCP 工具注解里的 <code>readOnlyHint</code>；第 4 步让模型判断这次调用是否只读，而且<strong>只缓存否定结论</strong>（测试名就叫 <code>smart_approve_only_caches_negative_name_wide_decisions</code>）。原因是：同一个工具，换一组参数就可能从只读变成写操作，"它是只读的"不能按工具名推广，"它要审批"却可以。</p>
+<p><strong>为什么这样设计</strong>：权限被拆成了互相独立、可以单独开关的部件，每个部件只回答一个问题。最严格者胜的合并规则，让新增一个检查器只会让系统更保守，不会意外放宽权限。</p>
+<div class="callout warn"><b>默认值要自己判断</b>
+<p>goose 是开发者在自己电脑上用的通用 agent，默认 Auto、提示注入检测默认关闭、Adversary 失败时放行，都是偏向"别打断我"的产品选择。如果你做的 agent 会<strong>代表你对外发消息</strong>，或者会读取不可信的输入，这些默认值都不能照抄：第 9 章的 lethal trifecta 在这里完全成立。值得照抄的是结构——可组合的检查器链和最严格者胜。</p></div>
+<p><strong>对应课程</strong>：<a href="ch08-hitl-autonomy.html">第 8 章</a>（按动作分级）、<a href="ch09-security.html">第 9 章</a>（多层防御、fail open 与 fail closed 的取舍）。</p>
+
+<h3>5.5 上下文：压缩阈值和"把大结果放进文件"</h3>
+<ul>
+  <li><strong>自动压缩阈值</strong>：默认在上下文窗口的 80% 触发（oi-kit-context-management/src/lib.rs#L34），但不超过 22.5 万 token（context_mgmt/mod.rs#L29）。源码注释说明了封顶值的来历：给 OpenAI 长上下文计价档位（输入超过 27.2 万 token）留出余量——<strong>压缩点是按成本而不只是按容量定的</strong>。两个值都能用 <code>GOOSE_AUTO_COMPACT_THRESHOLD</code> 和 <code>GOOSE_AUTO_COMPACT_TOKEN_LIMIT</code> 改。</li>
+  <li><strong>工具调用对的摘要</strong>：<code>ToolPairCompactionOperation</code> 把超出保留范围的旧"调用 + 结果"成对摘要，每批 10 对（<code>TOOLCALL_SUMMARIZATION_BATCH_SIZE</code>）。需用 <code>GOOSE_TOOL_PAIR_SUMMARIZATION</code> 开启，默认关闭。</li>
+  <li><strong>超大结果落盘</strong>：单段文本超过 20 万字符（<code>GOOSE_MAX_TOOL_RESPONSE_SIZE</code> 可改）就写进临时文件，模型只拿到路径和一句说明，需要时再用工具去读、去搜。这正是第 5 章 Manus 经验里的"把文件系统当上下文"。</li>
+  <li><strong>Top Of Mind</strong>（平台扩展 <code>tom</code>，默认启用）：从环境变量 <code>GOOSE_MOIM_MESSAGE_TEXT</code> / <code>GOOSE_MOIM_MESSAGE_FILE</code> 读一段内容，每一轮都注入。</li>
+</ul>
+<p><strong>对应课程</strong>：<a href="ch05-context-engineering.html">第 5 章</a>、<a href="ch14-observability.html">第 14 章</a>（成本）。</p>
+
+<div class="callout deep"><b>顺带一提：hooks 与 ACP</b>
+<p>goose 的生命周期 hooks（hooks/mod.rs#L55）参照 Open Plugins 的 hooks 规范，事件包括 PreToolUse、PostToolUse、SessionStart、UserPromptSubmit、Stop 等，写在插件目录的 <code>hooks/hooks.json</code> 里。它还能通过 ACP 作为别的应用的 agent 后端（README "Build an app over ACP"、<code>goose-acp-types</code> crate）——"agent 本身通过协议暴露出来"，见第 7 节的对照。</p></div>
+
+<h2>6 · 值得借鉴 / 不宜照搬</h2>
+<table>
+<tr><th>值得借鉴</th><th>不宜照搬</th></tr>
+<tr><td>扩展只有三类、共用一套数据模型；新能力只需选"在哪运行"</td><td>默认 Auto、提示注入检测默认关闭、Adversary 失败放行：只适合使用者就是唯一受影响者的本地开发场景</td></tr>
+<tr><td>检查器链 + 最严格者胜，新增检查只会更保守</td><td>用模型判断"是否只读"本身也会出错；能用工具注解或白名单确定的，不要交给模型</td></tr>
+<tr><td>工具名前缀 + 确定性的名称纠错</td><td>扩展管理器让模型自己"找工具、开工具"，在开放环境里等于让模型扩大自己的权限；goose 对它强制审批，你也必须如此</td></tr>
+<tr><td>压缩阈值按成本封顶；超大结果落盘只回路径</td><td>近 28 万行的通用 agent，不是你的单一用途 agent 的模板；借鉴机制，别借鉴规模</td></tr>
+</table>
+
+<h2>7 · 对照复盘</h2>
+<div class="callout case"><b>两个真实项目里的对应问题</b>
+<ul>
+  <li><a href="review.html#f-N17">N17</a> · niuma 的对话助手有 45 个工具，每轮全量下发，再用 18 条"用户说 X 就用 Y"的规则做路由。goose 的四种手段可以直接对照：扩展管理器（按需启用）、工具延迟加载（只列清单）、Code Mode（三个工具代替全部）、recipe 绑定扩展（按任务收窄工具面）。</li>
+  <li><a href="review.html#f-D14">D14</a> · devtask 的编码 agent 没有抽象，状态键和工具名都以某一个 agent 命名，加第二种时到处打补丁。goose 的做法相反：它把自己通过 ACP 暴露出去，任何支持 ACP 的宿主都能把它当后端；扩展这一侧也只认一种数据模型。</li>
+  <li><a href="review.html#f-D8">D8</a> · devtask 把编码 agent 的权限确认交给另一个模型代按。goose 也在 SmartApprove 里用模型判断"只读"，但做了两道保险：只缓存否定结论；模型没判定为只读的，一律问人。</li>
+</ul></div>
+
+<h2>8 · 读码练习</h2>
+<details><summary>练习 1：为什么内置扩展要实现成真正的 MCP server，而不是像平台扩展那样直接写成 Rust trait？</summary>
+<p>看 extension_manager/builtin.rs#L10-43：同一个内置扩展，平时用 duplex 管道在进程内连接，放进 Docker 容器时改成执行 <code>goose mcp &lt;名字&gt;</code> 走 stdio。因为它本来就说 MCP，所以搬进隔离环境不需要改任何代码。平台扩展则需要直接访问 agent 内部，没法这样搬。</p></details>
+<details><summary>练习 2：SmartApprove 里，模型判断"这次调用是只读的"之后，为什么不缓存这个肯定结论？</summary>
+<p>只读与否取决于参数，而缓存是按工具名做的。<code>shell</code> 这次跑 <code>ls</code> 是只读，下次跑 <code>rm</code> 就不是。按名缓存"需审批"是安全的，按名缓存"只读"会放过后续的写操作。看 permission_inspector.rs 的 <code>cache_non_readonly_decision</code> 及相关测试。</p></details>
+<details><summary>练习 3：Egress 检查器发现 shell 命令要把数据发往一个陌生域名，会拦下吗？</summary>
+<p>不会。它只记录外发目标并放行（egress_inspector.rs#L308 起的 <code>inspect</code>，结论固定为 Allow）。拦截要靠 Adversary（配置 <code>adversary.md</code>）、Security 或权限模式。这也说明"可观测"和"可拦截"是两件事：先看见，才谈得上拦。</p></details>
+<details><summary>练习 4：自动压缩为什么同时有比例阈值和绝对封顶两个参数？</summary>
+<p>窗口很大的模型，80% 可能远超长上下文计价档位，费用会陡增；封顶值把触发点压在 22.5 万 token 以内（context_mgmt/mod.rs#L29 的注释）。<code>capped_compaction_threshold</code> 取两者中更早触发的那个。</p></details>
+
+<div class="quiz" data-answer="3">
+<p class="q">goose 的五个检查器里，Permission 说"允许"、Adversary 说"需审批"、其余没有意见。最终这次调用会怎样？</p>
+<ol>
+  <li>直接执行，因为权限检查器的结论优先</li>
+  <li>直接执行，因为"允许"多于"需审批"</li>
+  <li>进入待审批，问人</li>
+  <li>被拒绝</li>
+</ol>
+<div class="explain">合并规则是最严格者胜：Allow 不推翻别人的结论，RequireApproval 会把请求从已批准移到待批（tool_inspection.rs 的 <code>apply_inspection_results_to_permissions</code>）。这让新增检查器只会让系统更保守。</div>
+</div>
+
+<div class="quiz" data-answer="2">
+<p class="q">你在做一个会代表用户回复客户邮件的 agent，想参考 goose 的权限设计。下面哪种做法最合理？</p>
+<ol>
+  <li>沿用 goose 的默认 Auto 模式，靠提示词约束模型</li>
+  <li>借鉴检查器链与最严格者胜的结构，但把对外发送设为必须审批，检查器出错时拒绝而不是放行</li>
+  <li>全部改用 SmartApprove，让模型判断发邮件是不是只读</li>
+  <li>只保留 Egress 检查器，记录所有外发目标</li>
+</ol>
+<div class="explain">goose 的默认值服务于"开发者本人在本机使用"，而你的场景存在不可信输入和对外动作（第 9 章）。结构可以照抄，默认值要按风险重新设定：对外发送是高风险动作，应该 fail closed。</div>
+</div>
+
+<div class="takeaways"><b>本章要点</b>
+<ul>
+  <li>goose 只有三类扩展：外部（MCP 协议）、内置（进程内 duplex 管道上的真 MCP server）、平台（进程内 trait，数据模型与 MCP 一致）。</li>
+  <li>工具名加 <code>扩展名__工具名</code> 前缀，并用确定性的规则纠正模型的常见笔误。</li>
+  <li>工具面靠四种手段收窄：扩展管理器按需启用、延迟加载、Code Mode、recipe 绑定扩展。</li>
+  <li>审批是五个独立检查器的组合，最严格者胜；SmartApprove 只缓存"需审批"这一种结论。</li>
+  <li>默认 Auto、注入检测默认关闭、部分检查失败放行，是面向本地开发者的产品选择；对外发消息的 agent 要反过来设。</li>
+</ul></div>
+
+<h2>参考资料</h2>
+<ul class="refs">
+  <li><a href="https://github.com/aaif-goose/goose/tree/8256b9ac9ffae7d19ef1db1f57e37f84c44915bd" target="_blank" rel="noopener">aaif-goose/goose @ 8256b9a</a> <span class="src">Apache-2.0 · 研读版本 2026-11-25</span></li>
+  <li><a href="https://github.com/aaif-goose/goose/blob/8256b9ac9ffae7d19ef1db1f57e37f84c44915bd/crates/goose/src/permission/permission_inspector.rs" target="_blank" rel="noopener">permission/permission_inspector.rs</a> <span class="src">SmartApprove 的判定顺序</span></li>
+  <li><a href="https://github.com/aaif-goose/goose/blob/8256b9ac9ffae7d19ef1db1f57e37f84c44915bd/crates/goose/src/agents/state_machine_builder.rs" target="_blank" rel="noopener">agents/state_machine_builder.rs</a> <span class="src">Operation 流水线的组装顺序</span></li>
+  <li><a href="https://github.com/aaif-goose/goose/blob/8256b9ac9ffae7d19ef1db1f57e37f84c44915bd/crates/goose/src/agents/platform_extensions/mod.rs" target="_blank" rel="noopener">agents/platform_extensions/mod.rs</a> <span class="src">平台扩展清单与默认启用状态</span></li>
+  <li><a href="https://goose-docs.ai/docs/quickstart" target="_blank" rel="noopener">goose 文档</a> <span class="src">官方文档（README 链接）</span></li>
+  <li><a href="https://aaif.io/" target="_blank" rel="noopener">Agentic AI Foundation</a> <span class="src">Linux 基金会旗下，托管 MCP、goose、AGENTS.md 等项目</span></li>
+  <li><a href="https://www.anthropic.com/engineering/code-execution-with-mcp" target="_blank" rel="noopener">Code execution with MCP</a> <span class="src">Anthropic · 2025-11-04 · Code Mode 背后的思路</span></li>
+</ul>
+</article>
+
+<script>
+window.addEventListener('DOMContentLoaded', () => {
+  // 前 7 项的工具数来自研读版本的源码；后 3 项是示意性的外部扩展，数字仅作演示
+  const EXTS = [
+    { name: 'developer（平台）', tools: 5, on: true, src: 'write · edit · shell · tree · read_image' },
+    { name: '扩展管理器（平台）', tools: 4, on: true, src: '搜索 · 启用 · 资源列表 · 读资源' },
+    { name: 'memory（内置 MCP）', tools: 4, on: false, src: 'goose-mcp/src/memory' },
+    { name: 'computercontroller（内置 MCP）', tools: 4, on: false, src: 'goose-mcp/src/computercontroller' },
+    { name: 'autovisualiser（内置 MCP）', tools: 8, on: false, src: 'goose-mcp/src/autovisualiser' },
+    { name: 'apps（平台）', tools: 6, on: false, src: 'platform_extensions/apps.rs' },
+    { name: 'todo（平台）', tools: 1, on: false, src: 'platform_extensions/todo.rs' },
+    { name: '代码托管 MCP（示意）', tools: 30, on: true, src: '外部扩展，数字为示意' },
+    { name: '日历 MCP（示意）', tools: 8, on: true, src: '外部扩展，数字为示意' },
+    { name: '数据库 MCP（示意）', tools: 12, on: false, src: '外部扩展，数字为示意' },
+  ];
+  const box = document.getElementById('exts');
+  const list = box.querySelector('[data-list]');
+  const per = box.querySelector('[data-per]');
+  const perV = box.querySelector('[data-per-v]');
+  const mode = box.querySelector('[data-mode]');
+  const used = box.querySelector('[data-used]');
+  const usedV = box.querySelector('[data-used-v]');
+  const LIST_LINE = 20; // 延迟加载时每个工具在清单里占一行，按约 20 token 估算（示意）
+  EXTS.forEach((e, i) => {
+    const cb = Course.el('input', { type: 'checkbox', 'data-i': String(i) });
+    cb.checked = e.on;
+    list.append(Course.el('label', {}, [cb, Course.el('span', { html: `${e.name} <small>${e.tools} 个 · ${e.src}</small>` })]));
+  });
+  const render = () => {
+    perV.textContent = ` ${per.value}`;
+    usedV.textContent = ` ${used.value}`;
+    const on = EXTS.filter((_, i) => list.querySelector(`[data-i="${i}"]`).checked);
+    const total = on.reduce((s, e) => s + e.tools, 0);
+    const p = Number(per.value);
+    let n;
+    let listTok = 0;
+    let note;
+    if (mode.value === 'all') {
+      n = total;
+      note = `全部 ${total} 个工具的定义每轮都要发送；它们还排在提示的最前面，任何一个扩展改动都会让后面的缓存失效（第 2、5 章）。`;
+    } else if (mode.value === 'defer') {
+      // 平台扩展的工具常驻；MCP 扩展（内置与外部）的工具只进清单，本轮按工具名启用其中几个
+      const resident = on.filter((e) => e.name.includes('（平台）')).reduce((s, e) => s + e.tools, 0);
+      const deferred = total - resident;
+      const enabled = Math.min(Number(used.value), deferred);
+      n = resident + enabled + 1; // +1 为 enable_tools 本身
+      listTok = deferred * LIST_LINE;
+      note = `常驻 ${resident} 个平台工具 + 本轮按名启用的 ${enabled} 个 + enable_tools；其余 ${deferred - enabled} 个只占清单里的一行（每行约 ${LIST_LINE} token，示意）。代价是多一次"先启用再调用"的往返。`;
+    } else {
+      n = 3;
+      note = '只下发 list_functions / get_function_details / execute_javascript；模型按需查询函数签名，再写代码调用。代价是需要代码执行沙箱，调试也更难。';
+    }
+    const tok = n * p + listTok;
+    box.querySelector('[data-n]').textContent = n;
+    box.querySelector('[data-tok]').textContent = (n * p).toLocaleString();
+    box.querySelector('[data-list-tok]').textContent = listTok.toLocaleString();
+    const max = Math.max(1, total * p);
+    box.querySelector('[data-bar]').style.width = Math.min(100, (tok / max) * 100) + '%';
+    box.querySelector('[data-note]').textContent = `合计约 ${tok.toLocaleString()} token / 轮（相对全量 ${Math.round((tok / max) * 100)}%）。${note}`;
+  };
+  list.addEventListener('change', render);
+  per.addEventListener('input', render);
+  used.addEventListener('input', render);
+  mode.addEventListener('change', render);
+  render();
+});
+</script>
+</body>
+</html>

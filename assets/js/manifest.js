@@ -58,6 +58,21 @@ window.COURSE = {
       ],
     },
     {
+      name: '第六部分 · 名作研读',
+      items: [
+        { id: 'cases', file: 'cases.html', title: '名作研读：怎么读一个成熟 Agent 项目的源码', short: '研读总览', minutes: 20 },
+        { id: 'case-claude-code', file: 'case-claude-code.html', title: 'Claude Code：官方设计与社区分析精华', short: 'Claude Code', minutes: 50 },
+        { id: 'case-codex', file: 'case-codex.html', title: 'OpenAI Codex CLI：审批、沙箱与 agent loop', short: 'Codex CLI', minutes: 45 },
+        { id: 'case-gemini', file: 'case-gemini-cli.html', title: 'Gemini CLI：工具系统、MCP 与上下文压缩', short: 'Gemini CLI', minutes: 45 },
+        { id: 'case-openhands', file: 'case-openhands.html', title: 'OpenHands：事件流架构与运行时沙箱', short: 'OpenHands', minutes: 45 },
+        { id: 'case-swe-agent', file: 'case-swe-agent.html', title: 'SWE-agent 与 mini-swe-agent：为 agent 设计接口', short: 'SWE-agent', minutes: 40 },
+        { id: 'case-aider', file: 'case-aider.html', title: 'Aider：repo map 与编辑格式', short: 'Aider', minutes: 40 },
+        { id: 'case-letta', file: 'case-letta.html', title: 'Letta：分层记忆与 sleep-time 整理', short: 'Letta', minutes: 40 },
+        { id: 'case-langgraph', file: 'case-langgraph.html', title: 'LangGraph：检查点、中断与持久执行', short: 'LangGraph', minutes: 40 },
+        { id: 'case-goose', file: 'case-goose.html', title: 'goose：以 MCP 为骨架的扩展体系', short: 'goose', minutes: 40 },
+      ],
+    },
+    {
       name: '跟练项目',
       items: [
         { id: 'projects', file: 'projects.html', title: '跟练项目总览', short: '项目总览' },

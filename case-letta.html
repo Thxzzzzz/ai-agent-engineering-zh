@@ -1,0 +1,431 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Letta · AI Agent 工程</title>
+<meta name="description" content="研读 Letta（前身 MemGPT）源码：上下文内的记忆块、召回与归档两层外部记忆、agent 状态落库、超限时的滑动窗口压缩，以及由后台 sleep-time agent 负责写记忆的分工。">
+<link rel="stylesheet" href="assets/css/course.css">
+<script src="assets/js/manifest.js"></script>
+<script defer src="assets/js/course.js"></script>
+<style>
+  .cw-bar { position: relative; display: flex; height: 34px; border-radius: 8px; border: 1px solid var(--border); background: var(--surface-2); margin: 14px 0 26px; }
+  .cw-bar > i:first-child { border-radius: 7px 0 0 7px; }
+  .cw-bar > i { display: block; height: 100%; transition: width .35s; }
+  .cw-mark { position: absolute; top: -4px; bottom: -18px; width: 0; border-left: 2px dashed var(--danger); }
+  .cw-mark span { position: absolute; bottom: 0; left: 4px; font-size: 11px; color: var(--muted); white-space: nowrap; }
+  .cw-legend { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 12.5px; color: var(--muted); }
+  .cw-legend b { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 4px; vertical-align: -1px; }
+  .cw-btns { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0; }
+  .cw-log { max-height: 190px; overflow-y: auto; }
+  .cw-log div { padding: 2px 0; border-bottom: 1px dashed var(--border); }
+  .cw-stats { display: flex; flex-wrap: wrap; gap: 14px; margin-top: 8px; }
+</style>
+</head>
+<body data-page="case-letta">
+<article id="content">
+<div class="eyebrow">第六部分 · 名作研读</div>
+<h1>Letta：分层记忆与 sleep-time 整理</h1>
+<p class="lead">Letta 的前身是 MemGPT，那篇论文把大模型类比成操作系统：上下文窗口是内存，外部存储是磁盘，由 agent 自己调用工具在两者之间换入换出。Letta 把这个想法做成了一个"agent 即服务"的系统。读它，能看清长期记忆在工程上到底由哪些部件组成，以及"谁来写记忆"这个最容易被忽略的问题。</p>
+<div class="meta"><span>约 40 分钟</span><span>前置：第 5、6 章</span><span>研读版本：archive 分支 56ba9c2（2026-08-13）</span></div>
+
+<div class="goals"><b>学完你能</b>
+<ul>
+  <li>画出 Letta 的三层记忆：上下文内的记忆块（core memory）、召回记忆（recall）、归档记忆（archival），并说出各自的读写工具</li>
+  <li>解释记忆块怎样渲染进系统提示、为什么"只在记忆变化时才重建系统提示"</li>
+  <li>讲清上下文接近上限时的滑动窗口压缩：何时触发、驱逐多少、切在哪里</li>
+  <li>理解 sleep-time agent 的分工：前台 agent 只读，后台 agent 负责改写记忆，以及这种分工的收益与风险</li>
+</ul></div>
+
+<h2>1 · 速览</h2>
+<div class="cards">
+  <div class="card"><span class="tag">仓库</span><b>letta-ai/letta（archive 分支）</b><small><a href="https://github.com/letta-ai/letta/tree/archive" target="_blank" rel="noopener">github.com/letta-ai/letta/tree/archive</a></small></div>
+  <div class="card"><span class="tag">语言 · 许可证</span><b>Python · Apache-2.0</b><small>见仓库根目录 LICENSE</small></div>
+  <div class="card"><span class="tag">研读版本</span><b>56ba9c2（2026-08-13）</b><small>本页源码链接都固定到这个提交，pyproject 中的版本为 0.16.8</small></div>
+  <div class="card"><span class="tag">规模</span><b>letta/ 包 536 个 .py，约 13.8 万行</b><small>记忆工具、agent 循环、压缩、sleep-time 各有独立模块</small></div>
+  <div class="card"><span class="tag">一句话定位</span><b>有状态 agent 的服务端</b><small>agent 的记忆、消息、工具都存在数据库里，进程本身无状态</small></div>
+</div>
+
+<div class="callout warn"><b>先说明版本</b>
+<p>2026-11 查看时，<code>letta-ai/letta</code> 主分支的 README 写明：现行源码已迁到 <a href="https://github.com/letta-ai/letta-code" target="_blank" rel="noopener">letta-ai/letta-code</a>（TypeScript），<code>archive</code> 分支保留的是已退役的 V1 API 服务端。本页以 archive 分支为主，因为它完整保留了 MemGPT 式分层记忆的实现，最适合学习；第 9 节简述 letta-code 的现状。源码片段很短，引用自 Letta（Apache-2.0）。</p></div>
+
+<h2>2 · 为什么读它</h2>
+<p>第 6 章讲过记忆的分类和检索打分，但真要做一个"记得住、记得对"的 agent，还要回答一串工程问题：记忆放在上下文的什么位置？模型怎么改它？改坏了怎么办？上下文满了怎么办？谁有权写？Letta 给每个问题都留下了一份可读的实现：</p>
+<ul>
+  <li><strong>记忆是一等的数据对象</strong>：记忆块有标签、描述、字数上限、只读标记，存在数据库里，可以被多个 agent 共享。</li>
+  <li><strong>模型通过工具改记忆</strong>，工具的设计借鉴了编码 agent 的"精确替换"思路，带着防呆检查。</li>
+  <li><strong>上下文管理是自动的</strong>：接近窗口上限就压缩，被移出的消息仍在库里，可以检索。</li>
+  <li><strong>写记忆可以交给后台</strong>：sleep-time agent 在对话之后异步整理，前台 agent 专心回应。这就是论文《Sleep-time Compute》（arXiv 2504.13171）的工程落地，在 letta-code 里改名叫 dreaming。</li>
+</ul>
+
+<h2>3 · 架构总览</h2>
+<figure>
+<div class="diagram">
+<svg viewBox="0 0 760 370" width="760" role="img" aria-label="Letta 的记忆架构">
+  <rect x="20" y="20" width="330" height="330" rx="12" fill="none" class="line dash"/>
+  <text class="ta" x="36" y="44">上下文窗口（每次请求发给模型的内容）</text>
+  <rect class="box a" x="40" y="60" width="290" height="148" rx="10"/>
+  <text class="tb" x="185" y="84" text-anchor="middle">系统消息（message_ids[0]）</text>
+  <rect class="box v" x="56" y="96" width="258" height="44" rx="8"/>
+  <text class="t" x="185" y="116" text-anchor="middle">&lt;memory_blocks&gt; 记忆块</text>
+  <text class="ts" x="185" y="132" text-anchor="middle">persona · human · 自定义块，带字数元数据</text>
+  <rect class="box m" x="56" y="148" width="258" height="44" rx="8"/>
+  <text class="t" x="185" y="168" text-anchor="middle">&lt;memory_metadata&gt;</text>
+  <text class="ts" x="185" y="184" text-anchor="middle">召回 N 条 · 归档 M 条 · 可用标签</text>
+  <rect class="box" x="40" y="222" width="290" height="50" rx="10"/>
+  <text class="t" x="185" y="244" text-anchor="middle">在上下文中的消息</text>
+  <text class="ts" x="185" y="262" text-anchor="middle">（最前面可能是一条历史摘要）</text>
+  <rect class="box m" x="40" y="284" width="290" height="50" rx="10"/>
+  <text class="t" x="185" y="306" text-anchor="middle">工具定义</text>
+  <text class="ts" x="185" y="324" text-anchor="middle">memory_* · conversation_search · archival_*</text>
+
+  <rect class="box g" x="420" y="40" width="320" height="64" rx="10"/>
+  <text class="tb" x="580" y="66" text-anchor="middle">blocks 表</text>
+  <text class="ts" x="580" y="88" text-anchor="middle">记忆块的持久化，可被多个 agent 共享</text>
+  <rect class="box g" x="420" y="124" width="320" height="64" rx="10"/>
+  <text class="tb" x="580" y="150" text-anchor="middle">messages 表 = 召回记忆（recall）</text>
+  <text class="ts" x="580" y="172" text-anchor="middle">全部历史消息，包括被移出上下文的</text>
+  <rect class="box g" x="420" y="208" width="320" height="64" rx="10"/>
+  <text class="tb" x="580" y="234" text-anchor="middle">passages / archive = 归档记忆</text>
+  <text class="ts" x="580" y="256" text-anchor="middle">agent 主动写入的条目，带向量与标签</text>
+  <rect class="box b" x="420" y="292" width="320" height="58" rx="10"/>
+  <text class="tb" x="580" y="316" text-anchor="middle">sleep-time agent（后台）</text>
+  <text class="ts" x="580" y="336" text-anchor="middle">共享同一批记忆块，负责改写</text>
+
+  <path class="line" d="M330 118 H420" marker-end="url(#arr)" marker-start="url(#arr)"/>
+  <path class="line" d="M330 247 C380 247 380 156 420 156" marker-end="url(#arr)"/>
+  <path class="line" d="M330 309 C390 309 390 240 420 240" marker-end="url(#arr)"/>
+  <path class="line b dash" d="M420 321 C380 321 380 70 420 70" marker-end="url(#arr-b)"/>
+</svg>
+</div>
+<figcaption>图 L-1 左边是每次发给模型的上下文，右边是数据库里的持久状态。记忆块双向同步；召回与归档只能通过工具检索进上下文；后台 agent 直接改写共享的记忆块。</figcaption>
+</figure>
+
+<table>
+<tr><th>层</th><th>在哪</th><th>读</th><th>写</th></tr>
+<tr><td>记忆块（core）</td><td>渲染在系统消息里，模型每轮都看得到</td><td>不需要工具</td><td><code>memory_replace</code>、<code>memory_insert</code>、<code>memory_rethink</code> 等</td></tr>
+<tr><td>召回（recall）</td><td>messages 表，全部历史消息</td><td><code>conversation_search</code>（文本加语义的混合检索）</td><td>系统自动写入每条消息</td></tr>
+<tr><td>归档（archival）</td><td>passages，带向量与标签</td><td><code>archival_memory_search</code></td><td><code>archival_memory_insert</code></td></tr>
+</table>
+<p>工具的签名与说明在 <a href="https://github.com/letta-ai/letta/blob/56ba9c25552605eec89de8ed3dc6394b625c1993/letta/functions/function_sets/base.py" target="_blank" rel="noopener">letta/functions/function_sets/base.py</a>，真正在服务端执行的版本在 <a href="https://github.com/letta-ai/letta/blob/56ba9c25552605eec89de8ed3dc6394b625c1993/letta/services/tool_executor/core_tool_executor.py" target="_blank" rel="noopener">core_tool_executor.py</a>。base.py 里有些函数体只是 <code>raise NotImplementedError</code>，它们的作用是用 docstring 生成给模型看的工具说明。</p>
+
+<h2>4 · 一次请求的旅程</h2>
+<p>场景：用户告诉一个开启了 sleep-time 的助理"以后月报都发给我，抄送部门负责人"。点"下一步"看它在源码里走过的路。</p>
+
+<figure class="anim" data-dim>
+<div class="diagram">
+<svg viewBox="0 0 760 290" width="760" role="img" aria-label="一次请求在 Letta 中的流程">
+  <g data-k="s1"><rect class="box" x="10" y="20" width="170" height="56" rx="8"/><text class="t" x="95" y="44" text-anchor="middle">① 从库里加载状态</text><text class="ts" x="95" y="64" text-anchor="middle">AgentState</text></g>
+  <g data-k="s2"><rect class="box a" x="200" y="20" width="170" height="56" rx="8"/><text class="t" x="285" y="44" text-anchor="middle">② 组装请求</text><text class="ts" x="285" y="64" text-anchor="middle">系统消息 + 消息 + 工具</text></g>
+  <g data-k="s3"><rect class="box b" x="390" y="20" width="170" height="56" rx="8"/><text class="t" x="475" y="44" text-anchor="middle">③ 模型调用工具</text><text class="ts" x="475" y="64" text-anchor="middle">检索 / 回复</text></g>
+  <g data-k="s4"><rect class="box g" x="580" y="20" width="170" height="56" rx="8"/><text class="t" x="665" y="44" text-anchor="middle">④ 落库</text><text class="ts" x="665" y="64" text-anchor="middle">消息写入 messages</text></g>
+  <g data-k="s5"><rect class="box r" x="580" y="120" width="170" height="56" rx="8"/><text class="t" x="665" y="144" text-anchor="middle">⑤ 检查上下文</text><text class="ts" x="665" y="164" text-anchor="middle">超过 0.9 × 窗口？</text></g>
+  <g data-k="s6"><rect class="box w" x="390" y="120" width="170" height="56" rx="8"/><text class="t" x="475" y="144" text-anchor="middle">⑥ 滑动窗口压缩</text><text class="ts" x="475" y="164" text-anchor="middle">旧消息 → 摘要</text></g>
+  <g data-k="s7"><rect class="box v" x="200" y="120" width="170" height="56" rx="8"/><text class="t" x="285" y="144" text-anchor="middle">⑦ 每 N 轮触发</text><text class="ts" x="285" y="164" text-anchor="middle">sleep-time 组</text></g>
+  <g data-k="s8"><rect class="box b" x="10" y="120" width="170" height="56" rx="8"/><text class="t" x="95" y="144" text-anchor="middle">⑧ 后台 agent</text><text class="ts" x="95" y="164" text-anchor="middle">读对话记录、改记忆块</text></g>
+  <g data-k="s9"><rect class="box a" x="10" y="216" width="360" height="56" rx="8"/><text class="t" x="190" y="240" text-anchor="middle">⑨ 记忆变了 → 重建系统消息</text><text class="ts" x="190" y="260" text-anchor="middle">下一轮前台 agent 看到新记忆</text></g>
+  <g data-k="e1"><path class="line" d="M180 48 H200" marker-end="url(#arr)"/></g>
+  <g data-k="e2"><path class="line" d="M370 48 H390" marker-end="url(#arr)"/></g>
+  <g data-k="e3"><path class="line" d="M560 48 H580" marker-end="url(#arr)"/></g>
+  <g data-k="e4"><path class="line" d="M665 76 V120" marker-end="url(#arr)"/></g>
+  <g data-k="e5"><path class="line r" d="M580 148 H560" marker-end="url(#arr-r)"/></g>
+  <g data-k="e6"><path class="line" d="M390 148 H370" marker-end="url(#arr)"/></g>
+  <g data-k="e7"><path class="line b" d="M200 148 H180" marker-end="url(#arr-b)"/></g>
+  <g data-k="e8"><path class="line b dash" d="M95 176 V216" marker-end="url(#arr-b)"/></g>
+</svg>
+</div>
+<ol class="anim-steps">
+  <li data-show="s1" data-hl="s1">服务端进程不在内存里保存 agent。每次请求先用 <code>agent_manager.get_agent_by_id_async</code> 从数据库加载 <code>AgentState</code>：配置、工具、记忆块、在上下文中的消息 ID 列表。这就是"agent 即服务"：进程可以随时重启、横向扩展，状态都在库里（第 10 章）。</li>
+  <li data-show="s2 e1" data-hl="s2 e1">组装请求。系统消息是 <code>message_ids[0]</code>，里面是基础提示词加上 <code>Memory.compile()</code>（<a href="https://github.com/letta-ai/letta/blob/56ba9c25552605eec89de8ed3dc6394b625c1993/letta/schemas/memory.py#L688" target="_blank" rel="noopener">memory.py#L688</a>）渲染出的记忆块，以及一段记忆元数据（<a href="https://github.com/letta-ai/letta/blob/56ba9c25552605eec89de8ed3dc6394b625c1993/letta/prompts/prompt_generator.py#L26" target="_blank" rel="noopener">prompt_generator.py#L26</a>），告诉模型召回里有多少条消息、归档里有多少条、有哪些标签。</li>
+  <li data-show="s3 e2" data-hl="s3 e2">开启 sleep-time 后，前台 agent 的工具只有 <code>send_message</code>、<code>conversation_search</code>、<code>archival_memory_search</code>（<a href="https://github.com/letta-ai/letta/blob/56ba9c25552605eec89de8ed3dc6394b625c1993/letta/constants.py#L133" target="_blank" rel="noopener">constants.py#L133</a>）。它能查，但<strong>没有改记忆块的工具</strong>。这里它会先查一下有没有关于月报的旧约定，然后回复用户。</li>
+  <li data-show="s4 e3" data-hl="s4 e3">这一轮产生的消息全部写入 messages 表，成为召回记忆的一部分；系统消息里的元数据计数随之变化。</li>
+  <li data-show="s5 e4" data-hl="s5 e4">每一步结束后，<code>LettaAgentV3</code> 比较估算的上下文 token 数与压缩阈值（<a href="https://github.com/letta-ai/letta/blob/56ba9c25552605eec89de8ed3dc6394b625c1993/letta/agents/letta_agent_v3.py#L1438" target="_blank" rel="noopener">letta_agent_v3.py#L1438</a>）。阈值是窗口乘以 <code>SUMMARIZATION_TRIGGER_MULTIPLIER = 0.9</code>（<a href="https://github.com/letta-ai/letta/blob/56ba9c25552605eec89de8ed3dc6394b625c1993/letta/constants.py#L83" target="_blank" rel="noopener">constants.py#L83</a>），注释说留 10% 是为了避免"提示太长"的报错。</li>
+  <li data-show="s6 e5" data-hl="s6 e5">超了就压缩：默认的滑动窗口模式从最旧的 30% 消息开始，每次多驱逐 10%，直到剩下的内容低于窗口的 70%；切点必须落在 assistant 消息上，避免把工具调用和结果拆开（<a href="https://github.com/letta-ai/letta/blob/56ba9c25552605eec89de8ed3dc6394b625c1993/letta/services/summarizer/summarizer_sliding_window.py#L99" target="_blank" rel="noopener">summarizer_sliding_window.py#L99</a>）。被驱逐的消息生成一段摘要放在最前面，原文仍在 messages 表里，可以用 conversation_search 找回来。</li>
+  <li data-show="s7 e6" data-hl="s7 e6">回到前台流程。主 agent 所在的 sleep-time 组记一个轮次计数；默认每 5 轮（<a href="https://github.com/letta-ai/letta/blob/56ba9c25552605eec89de8ed3dc6394b625c1993/letta/server/server.py#L784" target="_blank" rel="noopener">server.py#L784</a> 创建组时的 <code>sleeptime_agent_frequency=5</code>）触发一次后台整理（<a href="https://github.com/letta-ai/letta/blob/56ba9c25552605eec89de8ed3dc6394b625c1993/letta/groups/sleeptime_multi_agent_v4.py#L132" target="_blank" rel="noopener">sleeptime_multi_agent_v4.py#L132</a>）。</li>
+  <li data-show="s8 e7" data-hl="s8 e7">后台任务（<code>_participant_agent_step</code>，<a href="https://github.com/letta-ai/letta/blob/56ba9c25552605eec89de8ed3dc6394b625c1993/letta/groups/sleeptime_multi_agent_v4.py#L202" target="_blank" rel="noopener">#L202</a>）把"上次处理到哪"之后的对话整理成文本，包一段系统提醒（"你不是主 agent，这是已经发生的对话，你的职责是管理记忆"），交给 sleep-time agent。它拥有 <code>memory_replace</code>、<code>memory_insert</code>、<code>memory_rethink</code>、<code>memory_finish_edits</code> 这组工具（<a href="https://github.com/letta-ai/letta/blob/56ba9c25552605eec89de8ed3dc6394b625c1993/letta/constants.py#L135" target="_blank" rel="noopener">constants.py#L135</a>），于是把"月报发给用户并抄送部门负责人"写进 human 块。每次后台运行都记为一个 Run，有状态和结果。</li>
+  <li data-show="s9 e8" data-hl="s9 e8">记忆块写回数据库后，<code>update_memory_if_changed_async</code>（<a href="https://github.com/letta-ai/letta/blob/56ba9c25552605eec89de8ed3dc6394b625c1993/letta/services/agent_manager.py#L1747" target="_blank" rel="noopener">agent_manager.py#L1747</a>）发现编译出的记忆字符串已不在系统消息里，就重建系统消息。因为两个 agent 共享同一批记忆块，前台 agent 的下一轮请求就会看到新的约定。</li>
+</ol>
+<figcaption>图 L-2 前台 agent 负责回应，后台 agent 负责记忆。两者之间不传消息，靠共享的数据库记录协作。</figcaption>
+</figure>
+
+<h2>5 · 关键设计一：记忆块</h2>
+<h3>5.1 记忆块长什么样</h3>
+<p>一个记忆块（Block，<a href="https://github.com/letta-ai/letta/blob/56ba9c25552605eec89de8ed3dc6394b625c1993/letta/schemas/block.py#L20" target="_blank" rel="noopener">schemas/block.py</a>）有这些字段：<code>label</code>（如 persona、human）、<code>value</code>（正文）、<code>limit</code>（字数上限，常量里块默认 100000 字符，persona 和 human 的默认上限是 20000）、<code>description</code>（这个块用来记什么）、<code>read_only</code>。渲染进上下文时，它变成这样一段 XML（<a href="https://github.com/letta-ai/letta/blob/56ba9c25552605eec89de8ed3dc6394b625c1993/letta/schemas/memory.py#L143" target="_blank" rel="noopener">memory.py#L143</a> 的简化示意）：</p>
+<pre data-title="记忆块渲染结果（简化示意）"><code>
+&lt;memory_blocks&gt;
+The following memory blocks are currently engaged in your core memory unit:
+
+&lt;human&gt;
+&lt;description&gt;
+关于用户的信息：身份、偏好、约定。
+&lt;/description&gt;
+&lt;metadata&gt;
+- chars_current=86
+- chars_limit=20000
+&lt;/metadata&gt;
+&lt;value&gt;
+称呼：张经理。月报发给本人，抄送部门负责人。
+&lt;/value&gt;
+&lt;/human&gt;
+&lt;/memory_blocks&gt;
+</code></pre>
+<p>三个细节值得注意：</p>
+<ul>
+  <li><strong>description 告诉模型这个块的用途</strong>，相当于每个块自带一份说明，决定什么内容该往哪里写。</li>
+  <li><strong>metadata 把预算摆在模型眼前</strong>：当前多少字、上限多少字。模型写记忆时能看到"快满了"，自然倾向于精炼而不是追加。</li>
+  <li><strong>按模型提供方切换渲染方式</strong>：对 Anthropic 模型的几类 agent，正文会带"1→"这样的行号，并附一条警告：行号只用于显示，编辑时不要带上（<a href="https://github.com/letta-ai/letta/blob/56ba9c25552605eec89de8ed3dc6394b625c1993/letta/schemas/memory.py#L175" target="_blank" rel="noopener">#L175</a>）。</li>
+</ul>
+
+<h3>5.2 改记忆的工具：精确替换 + 防呆</h3>
+<p><code>memory_replace</code> 的函数说明里注明它基于 Anthropic computer-use 示例中的编辑工具（<a href="https://github.com/letta-ai/letta/blob/56ba9c25552605eec89de8ed3dc6394b625c1993/letta/functions/function_sets/base.py#L310" target="_blank" rel="noopener">base.py#L310</a>）。服务端实现（<a href="https://github.com/letta-ai/letta/blob/56ba9c25552605eec89de8ed3dc6394b625c1993/letta/services/tool_executor/core_tool_executor.py#L346" target="_blank" rel="noopener">core_tool_executor.py#L346</a>）按顺序做了这些检查：</p>
+<ol>
+  <li>块是只读的，直接报错。</li>
+  <li><code>old_string</code> 或 <code>new_string</code> 里带了显示用的行号前缀，或者带了那条行号警告，报错并说明原因。这是专门针对"模型把看到的行号抄进参数"这一常见失误的防呆。</li>
+  <li><code>old_string</code> 在块里出现 0 次，报错"没有逐字出现"；出现多次，报错并列出所在行号，要求它给出唯一的片段。</li>
+  <li>通过后才替换、写回，再调用 <code>update_memory_if_changed_async</code> 持久化。</li>
+</ol>
+<p>对照第 3 章：错误信息说清楚错在哪、怎么改；不唯一时不猜，让模型给出能唯一定位的片段。这和 Aider 的 SEARCH/REPLACE "宁可失败不错改"是同一个思路。</p>
+
+<h3>5.3 只在记忆变化时重建系统提示</h3>
+<p><code>rebuild_system_prompt_async</code>（<a href="https://github.com/letta-ai/letta/blob/56ba9c25552605eec89de8ed3dc6394b625c1993/letta/services/agent_manager.py#L1523" target="_blank" rel="noopener">agent_manager.py#L1523</a>）里有一句注释："we only update the system prompt if the core memory is changed"。它先编译当前记忆，如果结果已经包含在现有系统消息里，并且没有强制刷新，就什么都不做。</p>
+<p>这关系到第 2 章的提示缓存：记忆块位于系统消息里、整个上下文的最前面，每改一次都会让后面全部缓存失效。"没变就不动"至少保证了不会无端破坏缓存。反过来也提醒我们：<strong>把会频繁变化的记忆放在前缀里，是有成本的</strong>，这正是 sleep-time 按频率批量整理的另一层好处。</p>
+
+<h2>6 · 关键设计二：召回与归档</h2>
+<p><strong>召回记忆</strong>就是 messages 表。每条消息都会落库，包括被压缩移出上下文的那些，所以"移出上下文"不等于"遗忘"。<code>conversation_search</code>（<a href="https://github.com/letta-ai/letta/blob/56ba9c25552605eec89de8ed3dc6394b625c1993/letta/functions/function_sets/base.py#L87" target="_blank" rel="noopener">base.py#L87</a>）支持按查询词（文本匹配加语义相似度的混合检索）、角色、日期范围过滤，日期参数的说明写得非常细，连"只给日期时包含当天全天"都写明了。这是第 3 章"工具说明要无歧义"的好例子。</p>
+<p><strong>归档记忆</strong>是 agent 主动写入的条目。<code>archival_memory_insert</code> 的说明（<a href="https://github.com/letta-ai/letta/blob/56ba9c25552605eec89de8ed3dc6394b625c1993/letta/functions/function_sets/base.py#L164" target="_blank" rel="noopener">#L164</a>）教模型：存自包含的事实或摘要，不要存对话碎片；加描述性标签。检索 <code>archival_memory_search</code>（<a href="https://github.com/letta-ai/letta/blob/56ba9c25552605eec89de8ed3dc6394b625c1993/letta/functions/function_sets/base.py#L194" target="_blank" rel="noopener">#L194</a>）按语义相似度排序，可用标签（any/all 两种匹配）和时间范围缩小范围。写入后服务端会强制重建系统提示（<a href="https://github.com/letta-ai/letta/blob/56ba9c25552605eec89de8ed3dc6394b625c1993/letta/services/tool_executor/core_tool_executor.py#L307" target="_blank" rel="noopener">core_tool_executor.py#L307</a>），让元数据里的条目数和标签列表保持最新。</p>
+<div class="callout note"><b>元数据是"目录"，不是内容</b>
+<p>系统提示里不放召回和归档的内容，只放"有多少条、有哪些标签"。模型知道外面有东西，需要时自己去查。这就是第 5 章的"即用即取"（just-in-time）：上下文里放引用和索引，而不是全文。</p></div>
+
+<h2>7 · 关键设计三：上下文满了怎么办</h2>
+<p>压缩逻辑在 <code>summarize_via_sliding_window</code>（<a href="https://github.com/letta-ai/letta/blob/56ba9c25552605eec89de8ed3dc6394b625c1993/letta/services/summarizer/summarizer_sliding_window.py#L99" target="_blank" rel="noopener">#L99</a>），核心几行：</p>
+<pre data-title="summarizer_sliding_window.py#L152-168（节选，Apache-2.0）"><code class="lang-py">
+goal_tokens = (1 - summarizer_config.sliding_window_percentage) * agent_llm_config.context_window
+approx_token_count = agent_llm_config.context_window
+# ...
+while approx_token_count &gt;= goal_tokens and eviction_percentage &lt; 1.0:
+    # more eviction percentage
+    eviction_percentage += 0.10
+    # calculate message_cutoff_index
+    message_cutoff_index = round(eviction_percentage * total_message_count)
+</code></pre>
+<p><code>sliding_window_percentage</code> 默认取 <code>partial_evict_summarizer_percentage = 0.30</code>（<a href="https://github.com/letta-ai/letta/blob/56ba9c25552605eec89de8ed3dc6394b625c1993/letta/settings.py#L86" target="_blank" rel="noopener">settings.py#L86</a>），所以目标是压到窗口的 70% 以下。循环里每次多驱逐 10% 的消息，并把切点回退到最近的 assistant 消息（或带工具调用的审批消息），重新数一次 token。摘要模型可以单独配置；模式除了滑动窗口，还有"全部摘要"和"让 agent 自己摘要"几种（<code>CompactionSettings.mode</code>）。</p>
+<p>另一条路径是请求真的超了：模型返回 <code>ContextWindowExceededError</code> 时，agent 会压缩后重试，最多 <code>max_summarizer_retries = 3</code> 次（<a href="https://github.com/letta-ai/letta/blob/56ba9c25552605eec89de8ed3dc6394b625c1993/letta/agents/letta_agent_v3.py#L1218" target="_blank" rel="noopener">letta_agent_v3.py#L1218</a>）。系统提示本身就超过窗口时，压缩也救不了，会以专门的停止原因 <code>context_window_overflow_in_system_prompt</code> 结束。这说明了一个第 5 章没细说的风险：<strong>记忆块写得太大，最终会让 agent 无法工作</strong>，所以字数上限和"快满了"的提示是必要的。</p>
+
+<div class="widget" id="cw">
+<div class="w-title">上下文窗口模拟（简化示意）</div>
+<p style="font-size:14px;margin:0 0 6px">窗口按 8000 tokens 计。每聊一轮加约 450 tokens 的消息。超过 90% 触发压缩：先驱逐最旧的 30%，不够再每次加 10%，直到低于 70%，并在最前面放一条约 250 tokens 的摘要。</p>
+<div class="cw-bar" id="cwBar"><span class="cw-mark" style="left:70%"><span>70% 目标</span></span><span class="cw-mark" style="left:90%"><span>90% 触发</span></span></div>
+<div class="cw-legend"><span><b style="background:var(--accent)"></b>基础提示</span><span><b style="background:var(--violet)"></b>记忆块</span><span><b style="background:var(--muted)"></b>工具定义</span><span><b style="background:var(--warn)"></b>历史摘要</span><span><b style="background:var(--ok)"></b>上下文中的消息</span></div>
+<div class="cw-btns">
+  <button class="btn primary small" type="button" data-act="turn">聊一轮</button>
+  <button class="btn small" type="button" data-act="turn5">连聊 5 轮</button>
+  <button class="btn small" type="button" data-act="grow">后台整理：记忆块 +300</button>
+  <button class="btn small" type="button" data-act="shrink">memory_rethink：记忆块精炼 −300</button>
+  <button class="btn small" type="button" data-act="archive">archival_memory_insert</button>
+  <button class="btn small" type="button" data-act="reset">重置</button>
+</div>
+<div class="cw-stats" id="cwStats"></div>
+<div class="w-out cw-log" id="cwLog"></div>
+</div>
+
+<h2>8 · 关键设计四：sleep-time，把"写记忆"交给后台</h2>
+<p>MemGPT 论文里，记忆由同一个 agent 一边对话一边管理。这有两个问题：模型要在回应用户的同时分心整理记忆，回复更慢；而且整理得好不好，全看它在那一刻有没有想起来。Letta 的 sleep-time 把两件事拆开了。</p>
+<ul>
+  <li><strong>创建</strong>：<code>create_sleeptime_agent_async</code>（<a href="https://github.com/letta-ai/letta/blob/56ba9c25552605eec89de8ed3dc6394b625c1993/letta/server/server.py#L756" target="_blank" rel="noopener">server.py#L756</a>）新建一个 sleeptime 类型的 agent，把主 agent 的全部记忆块 ID 挂上去（共享，不是复制），另给它一个自己的 <code>memory_persona</code> 块写工作守则；再建一个组，记下管理者是主 agent、频率 5。</li>
+  <li><strong>权限分工</strong>：主 agent 开启 sleep-time 后只拿到 <code>BASE_SLEEPTIME_CHAT_TOOLS</code>（发消息、两种检索），后台 agent 拿到 <code>BASE_SLEEPTIME_TOOLS</code>（四个记忆编辑工具），见 <a href="https://github.com/letta-ai/letta/blob/56ba9c25552605eec89de8ed3dc6394b625c1993/letta/services/agent_manager.py#L396" target="_blank" rel="noopener">agent_manager.py#L396–405</a>。<strong>能写记忆的只有后台</strong>。</li>
+  <li><strong>输入</strong>：只把上次处理之后的新对话给后台 agent，并用一段系统提醒澄清角色："assistant"是主 agent，"user"是主 agent 的用户，你不是主 agent。这避免了后台 agent 把对话当成在和自己说话。</li>
+  <li><strong>可追踪</strong>：每次后台整理都是一个 Run，记录运行中、完成或失败，以及结果。</li>
+</ul>
+<div class="callout deep"><b>和 Anthropic 记忆文章的呼应</b>
+<p>Anthropic 2026-11 的《The components of agent memory》也主张在两次会话之间离线回看记录、修正和提升记忆（文中叫 dreaming）。Letta 在 letta-code 里把 sleep-time 改名为 dreaming，README 写明可以用 <code>/sleeptime</code> 配置定期运行，也可以手动 <code>/dream</code>、<code>/reflect</code>。两边独立得出了同一个结论：<strong>写记忆应该是一个有节奏的后台过程，而不是对话中模型临时起意的副作用</strong>。</p></div>
+<p>这种分工也有代价，值得在借鉴时想清楚：后台 agent 仍然是模型在判断"什么值得记"，没有人工审核；它读的是整段对话，同样会读到不可信的内容（第 9 章的记忆投毒，OWASP ASI06）；而且前台要等下一次触发才看得到新记忆，频率设得低，"刚说过的事"会有几轮记不住。</p>
+
+<div class="quiz" data-answer="3">
+<p class="q">开启 sleep-time 后，用户在第 2 轮说了"以后月报抄送部门负责人"，第 3 轮问"月报要抄送谁？"。在默认配置下，最可能发生什么？</p>
+<ol>
+  <li>前台 agent 在第 2 轮就用 memory_replace 写进了 human 块，第 3 轮直接答对</li>
+  <li>后台 agent 每轮都运行，第 3 轮之前一定已经写好</li>
+  <li>后台整理默认每 5 轮触发一次，第 3 轮时记忆块大概率还没更新；但这句话仍在上下文中的消息里（或可用 conversation_search 查到），前台 agent 依然能答对</li>
+  <li>前台 agent 答不出来，因为没有记忆工具</li>
+</ol>
+<div class="explain">开启 sleep-time 后，前台 agent 没有改记忆块的工具，后台默认每 5 轮整理一次。但"记忆块还没更新"不等于"不知道"：最近的对话仍在上下文中，较早的也能用 conversation_search 从召回记忆里查到。理解这几层记忆各自的时效，才能判断一个 agent"记得"什么。</div>
+</div>
+
+<h2>9 · 现状：letta-code</h2>
+<p>当前的 Letta 以 <a href="https://github.com/letta-ai/letta-code" target="_blank" rel="noopener">letta-code</a>（TypeScript，Apache-2.0，查看时的提交为 c67a0d5，2026-11-24）为主，定位是"有状态的 agent 驾驭器"，可以在终端、桌面、网页和 Slack、Telegram 等渠道里使用同一个 agent。从它的 README 和源码可以确认几处演进：</p>
+<ul>
+  <li><strong>MemFS</strong>：README 写明"包括记忆块在内的全部上下文都用 git 追踪"，可以同步到自定义的 GitHub 仓库。源码里每个 agent 的记忆目录在 <code>.letta/agents/&lt;agent_id&gt;/memory</code> 下，其中 <code>system</code> 子目录对应会渲染进系统提示的部分（<code>src/agent/memory-filesystem.ts</code>）。archive 分支的 <code>Memory</code> 类里已经能看到 git 化的渲染分支（<code>_render_memory_blocks_git</code>）。</li>
+  <li><strong>dreaming</strong>：sleep-time 改名为 dreaming，可以配置定期运行，也可以手动触发 <code>/dream</code>、<code>/reflect</code>（<code>src/agent/reflection-runs.ts</code>）。</li>
+  <li><strong>技能也是记忆</strong>：<code>letta skills install</code> 把 Skill 装进某个 agent 的记忆里，和第 11 章的 Agent Skills 接上了。</li>
+</ul>
+<p>"记忆即文件、文件即 git"这个方向，让记忆天然有版本、有 diff、可回滚、可审阅，正好补上了上面说的"后台写记忆没人审核"的短板：至少每次改动都留下了可以检查和撤销的记录。</p>
+
+<h2>10 · 值得借鉴 / 不宜照搬</h2>
+<table>
+<tr><th>值得借鉴</th><th>不宜照搬</th></tr>
+<tr><td><strong>记忆块是带元数据的数据对象</strong>：标签、用途说明、字数上限、只读，渲染时把预算告诉模型。</td><td><strong>记忆放在系统提示最前面</strong>：每次改写都会让整个前缀的缓存失效。记忆变化频繁的场景，要权衡它的位置和更新节奏。</td></tr>
+<tr><td><strong>记忆工具精确替换、拒绝歧义</strong>，专门拦截"把行号抄进参数"这类常见失误。</td><td><strong>写记忆没有人工审核</strong>：个人助理这类场景，影响路由或对外表述的记忆，应该像第 8 章那样走提案审批，或至少留可撤销的变更日志。</td></tr>
+<tr><td><strong>移出上下文不等于遗忘</strong>：消息全部落库，压缩后仍可检索。</td><td><strong>后台 agent 读全部对话</strong>：不可信内容可能借此写进长期记忆，需要来源标注和过滤（第 9 章）。</td></tr>
+<tr><td><strong>写记忆交给后台、按频率批量做</strong>，前台只读，职责清楚。</td><td><strong>整套服务端很重</strong>：数据库、迁移、多租户、组织权限……单用户的小系统用文件加 SQLite 就能实现同样的分层。</td></tr>
+<tr><td><strong>agent 状态全在库里</strong>，进程无状态、可重启。</td><td><strong>注释与实现不一致</strong>：见读码练习 3。读别人的代码要以实现为准，写自己的代码要让注释跟着改。</td></tr>
+</table>
+
+<h2>11 · 对照复盘</h2>
+<div class="callout case"><b>真实项目复盘</b>
+<ul>
+  <li><a href="review.html#f-N13">N13</a> · niuma 的记忆曾把旧的猜测回灌成证据，写入不经审核。Letta 用"前台只读、后台写"划清了写权限，letta-code 再用 git 给每次改动留版本；但它同样没有人工审核，对影响路由的记忆还要加一道佐证或审批。</li>
+  <li><a href="review.html#f-D11">D11</a> · devtask 的任务记忆要等模型"记得"调用工具才写入。Letta 的 sleep-time 把写记忆变成按轮次触发的后台流程，不依赖前台模型临时起意。</li>
+  <li><a href="review.html#f-N12">N12</a> · niuma 的上下文只按条数截断。Letta 按 token 估算触发压缩、按目标比例驱逐，并保证切点不拆开工具调用。</li>
+</ul></div>
+
+<h2>12 · 读码练习</h2>
+<details><summary>练习 1：前台 agent 在开启 sleep-time 后为什么改不了记忆块？请找出决定这件事的代码。</summary>
+<p>看 <a href="https://github.com/letta-ai/letta/blob/56ba9c25552605eec89de8ed3dc6394b625c1993/letta/services/agent_manager.py#L396" target="_blank" rel="noopener">agent_manager.py#L396–405</a>：<code>enable_sleeptime</code> 为真时，主 agent 的工具集是 <code>BASE_SLEEPTIME_CHAT_TOOLS</code>，只有发消息和两种检索（<a href="https://github.com/letta-ai/letta/blob/56ba9c25552605eec89de8ed3dc6394b625c1993/letta/constants.py#L133" target="_blank" rel="noopener">constants.py#L133</a>）。权限是用"给不给工具"来控制的，而不是在提示词里叮嘱"不要改记忆"。</p></details>
+<details><summary>练习 2：memory_replace 收到的 old_string 在块里出现了两次，模型会看到什么？这样设计比"替换第一处"好在哪？</summary>
+<p>看 <a href="https://github.com/letta-ai/letta/blob/56ba9c25552605eec89de8ed3dc6394b625c1993/letta/services/tool_executor/core_tool_executor.py#L346" target="_blank" rel="noopener">core_tool_executor.py#L346</a> 起：报错"No replacement was performed. Multiple occurrences …in lines […]"，并要求给出唯一片段。替换第一处可能改错位置，而且不会留下任何报错；明确失败、给出行号，模型下一次就能补上足够的上下文。</p></details>
+<details><summary>练习 3：读 thresholds.py 的 get_compaction_trigger_threshold，它的文档说明和实际返回值一致吗？</summary>
+<p>看 <a href="https://github.com/letta-ai/letta/blob/56ba9c25552605eec89de8ed3dc6394b625c1993/letta/services/summarizer/thresholds.py#L27" target="_blank" rel="noopener">thresholds.py#L27–41</a>。说明写的是"GPT-5 系列在 90% 主动触发，其他模型在 100% 触发"，参数里还有 <code>force_proactive</code>；但函数体只有一行，对所有模型都返回"窗口 × 0.9"，既没有判断模型，也没有用到这个参数。读代码要以实现为准，这也是"文档与代码不一致"在成熟项目里同样会出现的例子。</p></details>
+<details><summary>练习 4：滑动窗口压缩为什么要把切点回退到 assistant 消息？如果切在中间会发生什么？</summary>
+<p>看 <a href="https://github.com/letta-ai/letta/blob/56ba9c25552605eec89de8ed3dc6394b625c1993/letta/services/summarizer/summarizer_sliding_window.py#L155" target="_blank" rel="noopener">summarizer_sliding_window.py#L155–176</a> 的 <code>is_valid_cutoff</code>。如果切在一次工具调用和它的结果之间，保留下来的上下文里会出现"没有对应调用的工具结果"，多数模型 API 会直接拒绝这样的消息序列，即使接受，模型也看不懂前因后果。</p></details>
+<details><summary>练习 5：sleep-time agent 收到的消息里为什么要特意说明"assistant 是主 agent，user 是主 agent 的用户"？</summary>
+<p>看 <a href="https://github.com/letta-ai/letta/blob/56ba9c25552605eec89de8ed3dc6394b625c1993/letta/groups/sleeptime_multi_agent_v4.py#L202" target="_blank" rel="noopener">sleeptime_multi_agent_v4.py#L202</a> 起。后台 agent 收到的是一整段转录文本，如果不澄清角色，它可能把用户的话当成对自己的指令去执行，或者把主 agent 的承诺当成自己说过的话。这是第 5 章"上下文要讲清楚每段内容是什么"的具体例子，也是防注入的一个最低要求。</p></details>
+
+<div class="quiz" data-answer="2">
+<p class="q">Letta 的系统提示里只放"召回里有 N 条消息、归档里有 M 条、可用标签有哪些"，而不放这些记忆的内容。这样设计最主要的理由是？</p>
+<ol>
+  <li>数据库查询太慢，来不及放内容</li>
+  <li>让模型知道外面有什么、需要时自己去查，上下文里只放索引，不放全文</li>
+  <li>防止模型看到历史消息</li>
+  <li>为了让系统提示永远不变</li>
+</ol>
+<div class="explain">这是"即用即取"（just-in-time）的上下文策略：上下文是稀缺的注意力预算，常驻的只应是小而关键的记忆块和外部记忆的目录。元数据本身会随写入更新（归档写入后会强制重建系统提示），所以它并不是"永远不变"。</div>
+</div>
+
+<div class="takeaways"><b>本章要点</b>
+<ul>
+  <li>Letta 的记忆分三层：记忆块常驻系统提示，召回是全部消息，归档是主动写入的带向量条目；后两者靠工具检索。</li>
+  <li>记忆块是带用途说明、字数上限和只读标记的数据对象，渲染时把预算展示给模型；编辑工具精确替换、拒绝歧义。</li>
+  <li>上下文超过窗口的 90% 时，按 30% 起、每次加 10% 驱逐旧消息直到低于 70%，切点对齐 assistant 消息，原文仍可检索。</li>
+  <li>sleep-time 把写记忆交给后台 agent、前台只读，按轮次批量整理；letta-code 进一步把记忆放进 git，并改名叫 dreaming。</li>
+  <li>借鉴时要补上两块：影响行为的记忆需要佐证或审批，后台读到的不可信内容需要来源控制。</li>
+</ul></div>
+
+<h2>参考资料</h2>
+<ul class="refs">
+  <li><a href="https://github.com/letta-ai/letta/tree/56ba9c25552605eec89de8ed3dc6394b625c1993" target="_blank" rel="noopener">Letta archive 分支源码（研读版本 56ba9c2）</a> <span class="src">Apache-2.0 · 2026-08-13</span></li>
+  <li><a href="https://github.com/letta-ai/letta-code" target="_blank" rel="noopener">letta-code</a> <span class="src">Letta 当前的源码仓库 · TypeScript · Apache-2.0</span></li>
+  <li><a href="https://arxiv.org/abs/2310.08560" target="_blank" rel="noopener">MemGPT: Towards LLMs as Operating Systems</a> <span class="src">Packer et al. · 2023-10 · 分层记忆与虚拟上下文管理</span></li>
+  <li><a href="https://www.letta.com/blog/sleep-time-compute" target="_blank" rel="noopener">Sleep-time Compute</a> <span class="src">Letta 博客 · 2025-04-21 · 论文 arXiv 2504.13171</span></li>
+  <li><a href="https://docs.letta.com/" target="_blank" rel="noopener">Letta 文档</a> <span class="src">当前的安装、记忆与部署说明</span></li>
+  <li><a href="https://www.anthropic.com/research/components-of-agent-memory" target="_blank" rel="noopener">The components of agent memory</a> <span class="src">Anthropic · 2026-11-06 · dreaming 与记忆分层</span></li>
+</ul>
+</article>
+
+<script>
+window.addEventListener('DOMContentLoaded', () => {
+  const W = 8000;
+  const BASE = 1200;
+  const TOOLS = 700;
+  const TURN = 450;
+  const SUMMARY = 250;
+  let state;
+  const reset = () => {
+    state = { blocks: 600, msgs: [], summary: 0, recall: 0, archival: 0, turn: 0, compactions: 0, rebuilds: 0, log: [] };
+  };
+  reset();
+
+  const bar = document.getElementById('cwBar');
+  const stats = document.getElementById('cwStats');
+  const logBox = document.getElementById('cwLog');
+  const firstMark = bar.querySelector('.cw-mark');
+  const segs = [
+    ['base', 'var(--accent)'],
+    ['blocks', 'var(--violet)'],
+    ['tools', 'var(--muted)'],
+    ['summary', 'var(--warn)'],
+    ['msgs', 'var(--ok)'],
+  ].map(([k, c]) => {
+    const i = Course.el('i', { style: `background:${c};width:0` });
+    bar.insertBefore(i, firstMark); // 分段按顺序排在两条阈值标记之前
+    return [k, i];
+  });
+
+  const msgTokens = () => state.msgs.reduce((a, b) => a + b, 0);
+  const total = () => BASE + state.blocks + TOOLS + state.summary + msgTokens();
+  const log = (t) => state.log.unshift(`第 ${state.turn} 轮：${t}`);
+
+  function compact() {
+    const n = state.msgs.length;
+    let pct = 0.2;
+    let cut = 0;
+    let after = total();
+    while (after >= 0.7 * W && pct < 1) {
+      pct += 0.1;
+      cut = Math.min(n - 1, Math.round(pct * n));
+      // 切点对齐到一轮对话的边界（每轮一条用户消息加一条 assistant 消息，这里按轮记）
+      after = BASE + state.blocks + TOOLS + SUMMARY + state.msgs.slice(cut).reduce((a, b) => a + b, 0);
+    }
+    if (cut <= 0) {
+      log('无法压缩：记忆块与基础提示已经太大。真实系统会以 context_window_overflow_in_system_prompt 停止。');
+      return;
+    }
+    state.msgs = state.msgs.slice(cut);
+    state.recall += cut;
+    state.summary = SUMMARY;
+    state.compactions++;
+    log(`超过 90%，驱逐最旧的 ${cut} 轮（约 ${Math.round(pct * 100)}%），生成摘要放在最前面；这 ${cut} 轮原文仍可用 conversation_search 查到。`);
+  }
+
+  function turn() {
+    state.turn++;
+    state.msgs.push(TURN);
+    if (total() > 0.9 * W) compact();
+  }
+
+  function act(a) {
+    if (a === 'turn') turn();
+    if (a === 'turn5') for (let k = 0; k < 5; k++) turn();
+    if (a === 'grow') {
+      state.blocks += 300;
+      state.rebuilds++;
+      log('后台 agent 改写记忆块 +300：系统消息重建，整个前缀的提示缓存失效。');
+      if (total() > 0.9 * W) compact();
+    }
+    if (a === 'shrink') {
+      if (state.blocks > 300) {
+        state.blocks -= 300;
+        state.rebuilds++;
+        log('memory_rethink 精炼记忆块 −300：系统消息重建，前缀缓存失效。');
+      } else {
+        log('记忆块已经很小了，不再精炼。');
+      }
+    }
+    if (a === 'archive') {
+      state.archival++;
+      state.rebuilds++;
+      log('写入一条归档记忆：内容不进上下文，但元数据计数变化，系统提示被强制重建。');
+    }
+    if (a === 'reset') reset();
+    render();
+  }
+  document.querySelectorAll('#cw [data-act]').forEach((b) => b.addEventListener('click', () => act(b.dataset.act)));
+
+  function render() {
+    const vals = { base: BASE, blocks: state.blocks, tools: TOOLS, summary: state.summary, msgs: msgTokens() };
+    segs.forEach(([k, i]) => (i.style.width = `${Math.min(100, (vals[k] / W) * 100)}%`));
+    const t = total();
+    stats.innerHTML = [
+      ['上下文占用', `${t} / ${W}（${Math.round((t / W) * 100)}%）`],
+      ['上下文中的轮次', state.msgs.length],
+      ['召回中已移出的轮次', state.recall],
+      ['归档条目', state.archival],
+      ['压缩次数', state.compactions],
+      ['系统消息重建', state.rebuilds],
+    ].map(([k, v]) => `<span class="stat"><b>${v}</b><small>${k}</small></span>`).join('');
+    logBox.innerHTML = state.log.length ? state.log.map((l) => `<div>${l}</div>`).join('') : '<div>点"聊一轮"开始。连聊十几轮就会触发压缩；试试先把记忆块加大，看压缩来得更早。</div>';
+  }
+  render();
+});
+</script>
+</body>
+</html>

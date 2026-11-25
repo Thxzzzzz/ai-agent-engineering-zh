@@ -4,6 +4,7 @@
 
 - **16 章理论**：agent loop、模型工程、结构化输出与工具、上下文工程、记忆、检索、人在回路、安全、可靠执行、协议（MCP / A2A / Skills）、长任务与编码 agent、评测、可观测与成本、参考架构。
 - **真实项目复盘**：对照全课知识点，逐条复盘 niuma-agent 与 devtask 因缺少哪些知识而没做好（31 条有证据的发现），每条对比"缺这块知识时"与"有这块知识时"的设计，附整改清单。
+- **名作研读**：Claude Code（官方文档与社区分析）、Codex CLI、Gemini CLI、OpenHands、SWE-agent、Aider、Letta、LangGraph、goose，每篇固定到具体提交、附源码行号链接，并对照课程章节与复盘条目。
 - **7 个跟练项目 + 1 个毕业项目**：在同一个 `agent-lab` 仓库里，用 TypeScript（Bun）从 100 行的最小 agent 一路长成带审批、记忆、MCP、评测和编码驾驭器的系统。
 - **图文并茂**：每章有 SVG 图解、可单步播放的动画、交互组件与小测；学习进度保存在浏览器本地。
 
@@ -29,6 +30,7 @@ python3 -m http.server 8000   # 然后访问 http://localhost:8000
 index.html                 学习地图
 ch00-*.html … ch15-*.html  正文各章
 review.html                真实项目复盘
+cases.html, case-*.html    名作研读
 projects.html, p1-*.html … p7-*.html, capstone.html   跟练项目
 agent-lab/                 跟练项目的完整参考实现（bun test 70 个测试）
 skills.html, glossary.html, resources.html            附录

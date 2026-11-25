@@ -1,0 +1,429 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gemini CLI 研读 · AI Agent 工程</title>
+<meta name="description" content="对照源码研读 Google Gemini CLI：分层策略引擎与工具确认、上下文压缩、循环检测、GEMINI.md 层级记忆与按需加载、MCP 接入、检查点与 ACP。">
+<link rel="stylesheet" href="assets/css/course.css">
+<script src="assets/js/manifest.js"></script>
+<script defer src="assets/js/course.js"></script>
+<style>
+  .hist { display: flex; flex-wrap: wrap; gap: 3px; margin: 10px 0; min-height: 34px; align-items: flex-end; }
+  .hist i { display: block; height: 30px; border-radius: 3px; min-width: 4px; }
+  .hist .u { background: var(--accent); }
+  .hist .m { background: color-mix(in srgb, var(--accent) 45%, var(--surface)); }
+  .hist .t { background: var(--accent-2); }
+  .hist .tt { background: var(--warn-soft); border: 1px dashed var(--warn); }
+  .hist .s { background: var(--violet); }
+  .legend { display: flex; flex-wrap: wrap; gap: 12px; font-size: 12.5px; color: var(--muted); }
+  .legend span::before { content: ""; display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; background: var(--c); }
+  .gauge { position: relative; height: 14px; border-radius: 99px; background: var(--surface-2); overflow: hidden; margin: 8px 0 4px; }
+  .gauge > i { position: absolute; left: 0; top: 0; bottom: 0; background: var(--accent); transition: width .3s; }
+  .gauge > b { position: absolute; top: -2px; bottom: -2px; width: 2px; background: var(--danger); left: 50%; }
+  .log { font: 12.5px/1.6 var(--mono); background: var(--surface-2); border-radius: 8px; padding: 8px 12px; max-height: 210px; overflow-y: auto; white-space: pre-wrap; }
+  .seq { display: flex; flex-wrap: wrap; gap: 4px; margin: 8px 0; min-height: 30px; }
+  .seq span { font: 600 13px var(--mono); padding: 3px 8px; border-radius: 6px; background: var(--surface-2); border: 1px solid var(--border); }
+  .seq span.hit { background: var(--danger-soft); border-color: var(--danger); }
+</style>
+</head>
+<body data-page="case-gemini">
+<article id="content">
+<div class="eyebrow">第六部分 · 名作研读</div>
+<h1>Gemini CLI：工具系统、MCP 与上下文压缩</h1>
+<p class="lead">Gemini CLI 是 Google 开源的终端 agent，用 TypeScript 写成，和本课的跟练项目同一个语言栈，读起来最顺手。它最值得学的三处：一个<strong>按层级和优先级合并规则的策略引擎</strong>；一套<strong>把"失败"也设计进去的上下文压缩</strong>；以及<strong>把模型自己可能出的毛病（绕圈、停在半路）当成要监测的对象</strong>。</p>
+<div class="meta"><span>约 45 分钟</span><span>前置：第 3、5、8、11 章</span><span>研读版本：08e9a20（2026-11-24）</span></div>
+
+<div class="goals"><b>学完你能</b>
+<ul>
+  <li>在 Gemini CLI 的 monorepo 里找到主循环、工具调度、策略引擎、压缩、记忆加载各自的文件</li>
+  <li>讲清它的策略引擎如何把默认、扩展、工作区、用户、管理员五层规则合并成一个"允许 / 拒绝 / 询问"</li>
+  <li>复述上下文压缩的每一步：何时触发、保留什么、怎么验证、失败时怎么办</li>
+  <li>给自己的 agent 加上循环检测、按需加载的项目记忆和"无交互时询问即拒绝"</li>
+</ul></div>
+
+<h2>1 · 速览</h2>
+<div class="cards">
+  <div class="card"><span class="tag">仓库</span><b>google-gemini/gemini-cli</b><small><a href="https://github.com/google-gemini/gemini-cli/tree/08e9a20f749aefcbda38622ac757899c3d6216e0" target="_blank" rel="noopener">github.com/google-gemini/gemini-cli</a></small></div>
+  <div class="card"><span class="tag">语言与许可证</span><b>TypeScript · Apache-2.0</b><small>npm workspaces 组织的 monorepo</small></div>
+  <div class="card"><span class="tag">研读版本</span><b>08e9a20 · 2026-11-24</b><small>本页所有源码链接都固定在这个提交</small></div>
+  <div class="card"><span class="tag">规模</span><b>7 个包 · 约 24.5 万行 TS</b><small>不含测试约 900 个源文件；核心在 packages/core</small></div>
+</div>
+<p><strong>一句话定位</strong>：一个终端里的通用 agent。交互界面、无交互的命令行调用（可输出 <code>text</code> / <code>json</code> / <code>stream-json</code>）、通过 ACP 给编辑器调用，三种入口共用同一个核心包。</p>
+<p>包结构：<code>packages/core</code>（agent 内核）、<code>packages/cli</code>（交互界面、无交互入口、ACP）、<code>packages/sdk</code>、<code>packages/a2a-server</code>、<code>packages/vscode-ide-companion</code>、<code>packages/devtools</code>、<code>packages/test-utils</code>。</p>
+
+<h2>2 · 为什么读它</h2>
+<ul>
+  <li><strong>和你的栈一样</strong>：TypeScript、Node 生态、zod，读到的模式能直接搬进 agent-lab。</li>
+  <li><strong>防御写在了显眼处</strong>：策略文件是 TOML，注释里把优先级分层写得清清楚楚；压缩、循环检测的每个阈值都是带注释的具名常量。好的工程习惯本身就是教材。</li>
+  <li><strong>它承认模型会犯错</strong>：绕圈、话说一半就停、压缩时漏掉关键细节，都有专门的代码去检测和兜底。这正是第 4、5、12 章反复强调的"不要相信模型自己说的"。</li>
+</ul>
+
+<h2>3 · 架构总览</h2>
+<figure>
+<div class="diagram">
+<svg viewBox="0 0 760 390" width="760" role="img" aria-label="Gemini CLI 架构总览">
+  <rect class="box m" x="20" y="20" width="720" height="62" rx="10"/>
+  <text class="tb" x="40" y="45">packages/cli：三种入口</text>
+  <rect class="box" x="40" y="52" width="150" height="24" rx="6"/><text class="ts" x="115" y="68" text-anchor="middle">交互界面（Ink）</text>
+  <rect class="box" x="200" y="52" width="200" height="24" rx="6"/><text class="ts" x="300" y="68" text-anchor="middle">nonInteractiveCli.ts</text>
+  <rect class="box" x="410" y="52" width="180" height="24" rx="6"/><text class="ts" x="500" y="68" text-anchor="middle">acp/（编辑器协议）</text>
+  <rect class="box a" x="20" y="110" width="350" height="250" rx="12"/>
+  <text class="tb" x="40" y="135">packages/core：回合与上下文</text>
+  <rect class="box" x="40" y="148" width="150" height="52" rx="8"/><text class="t" x="115" y="170" text-anchor="middle">GeminiClient</text><text class="ts" x="115" y="189" text-anchor="middle">core/client.ts</text>
+  <rect class="box" x="200" y="148" width="150" height="52" rx="8"/><text class="t" x="275" y="170" text-anchor="middle">GeminiChat · Turn</text><text class="ts" x="275" y="189" text-anchor="middle">流式事件</text>
+  <rect class="box w" x="40" y="212" width="150" height="52" rx="8"/><text class="t" x="115" y="234" text-anchor="middle">压缩服务</text><text class="ts" x="115" y="253" text-anchor="middle">context/</text>
+  <rect class="box v" x="200" y="212" width="150" height="52" rx="8"/><text class="t" x="275" y="234" text-anchor="middle">层级记忆</text><text class="ts" x="275" y="253" text-anchor="middle">GEMINI.md</text>
+  <rect class="box r" x="40" y="276" width="150" height="52" rx="8"/><text class="t" x="115" y="298" text-anchor="middle">循环检测</text><text class="ts" x="115" y="317" text-anchor="middle">services/</text>
+  <rect class="box" x="200" y="276" width="150" height="52" rx="8"/><text class="t" x="275" y="298" text-anchor="middle">检查点</text><text class="ts" x="275" y="317" text-anchor="middle">影子 git 仓库</text>
+  <rect class="box b" x="400" y="110" width="340" height="250" rx="12"/>
+  <text class="tb" x="420" y="135">packages/core：工具与权限</text>
+  <rect class="box" x="420" y="148" width="145" height="52" rx="8"/><text class="t" x="492" y="170" text-anchor="middle">Scheduler</text><text class="ts" x="492" y="189" text-anchor="middle">工具调用状态机</text>
+  <rect class="box r" x="575" y="148" width="145" height="52" rx="8"/><text class="t" x="647" y="170" text-anchor="middle">PolicyEngine</text><text class="ts" x="647" y="189" text-anchor="middle">允许 / 拒绝 / 询问</text>
+  <rect class="box" x="420" y="212" width="145" height="52" rx="8"/><text class="t" x="492" y="234" text-anchor="middle">MessageBus</text><text class="ts" x="492" y="253" text-anchor="middle">确认请求与回复</text>
+  <rect class="box" x="575" y="212" width="145" height="52" rx="8"/><text class="t" x="647" y="234" text-anchor="middle">ToolRegistry</text><text class="ts" x="647" y="253" text-anchor="middle">内置 + MCP + 发现</text>
+  <rect class="box g" x="420" y="276" width="145" height="52" rx="8"/><text class="t" x="492" y="298" text-anchor="middle">沙箱（可选）</text><text class="ts" x="492" y="317" text-anchor="middle">seatbelt / 容器</text>
+  <rect class="box v" x="575" y="276" width="145" height="52" rx="8"/><text class="t" x="647" y="298" text-anchor="middle">MCP 客户端</text><text class="ts" x="647" y="317" text-anchor="middle">tools/mcp-client.ts</text>
+  <path class="line" d="M200 82 V110" marker-end="url(#arr)"/>
+  <path class="line" d="M500 82 V110" marker-end="url(#arr)"/>
+  <path class="line" d="M370 175 H400" marker-end="url(#arr)"/>
+</svg>
+</div>
+<figcaption>图 C2-1 Gemini CLI 的主要模块。三种入口共用 core；左半边管"说什么"（回合与上下文），右半边管"能做什么"（工具与权限）。</figcaption>
+</figure>
+
+<h2>4 · 一次请求的旅程</h2>
+<p>同样的需求："给月报导出加一个按部门筛选的参数，并跑一下测试"。</p>
+<figure class="anim" data-dim>
+<div class="diagram">
+<svg viewBox="0 0 760 300" width="760" role="img" aria-label="一次请求在 Gemini CLI 中的流转">
+  <g data-k="mem"><rect class="box v" x="20" y="20" width="150" height="56" rx="8"/><text class="t" x="95" y="44" text-anchor="middle">层级记忆</text><text class="ts" x="95" y="64" text-anchor="middle">GEMINI.md</text></g>
+  <g data-k="cli"><rect class="box a" x="20" y="120" width="150" height="56" rx="8"/><text class="t" x="95" y="144" text-anchor="middle">sendMessageStream</text><text class="ts" x="95" y="164" text-anchor="middle">最多 100 回合</text></g>
+  <g data-k="cmp"><rect class="box w" x="20" y="220" width="150" height="56" rx="8"/><text class="t" x="95" y="244" text-anchor="middle">tryCompressChat</text><text class="ts" x="95" y="264" text-anchor="middle">超 50% 就压缩</text></g>
+  <g data-k="model"><rect class="box" x="210" y="120" width="130" height="56" rx="8"/><text class="t" x="275" y="144" text-anchor="middle">模型流式输出</text><text class="ts" x="275" y="164" text-anchor="middle">+ 循环检测</text></g>
+  <g data-k="sch"><rect class="box b" x="380" y="120" width="120" height="56" rx="8"/><text class="t" x="440" y="144" text-anchor="middle">Scheduler</text><text class="ts" x="440" y="164" text-anchor="middle">校验参数</text></g>
+  <g data-k="pol"><rect class="box r" x="380" y="20" width="120" height="56" rx="8"/><text class="t" x="440" y="44" text-anchor="middle">PolicyEngine</text><text class="ts" x="440" y="64" text-anchor="middle">规则 + shell 检查</text></g>
+  <g data-k="ask"><rect class="box" x="540" y="20" width="200" height="56" rx="8"/><text class="t" x="640" y="44" text-anchor="middle">等待确认</text><text class="ts" x="640" y="64" text-anchor="middle">一次 / 总是 / 改了再执行</text></g>
+  <g data-k="cp"><rect class="box m" x="540" y="120" width="200" height="56" rx="8"/><text class="t" x="640" y="144" text-anchor="middle">检查点快照（可选）</text><text class="ts" x="640" y="164" text-anchor="middle">编辑类工具待批准时</text></g>
+  <g data-k="exe"><rect class="box g" x="540" y="220" width="200" height="56" rx="8"/><text class="t" x="640" y="244" text-anchor="middle">执行 → 结果回灌</text><text class="ts" x="640" y="264" text-anchor="middle">+ 子目录 GEMINI.md</text></g>
+  <g data-k="e1"><path class="line" d="M95 76 V120" marker-end="url(#arr)"/></g>
+  <g data-k="e2"><path class="line" d="M95 176 V220" marker-end="url(#arr)" marker-start="url(#arr)"/></g>
+  <g data-k="e3"><path class="line a" d="M170 148 H210" marker-end="url(#arr-a)"/></g>
+  <g data-k="e4"><path class="line b" d="M340 148 H380" marker-end="url(#arr-b)"/></g>
+  <g data-k="e5"><path class="line r" d="M440 120 V76" marker-end="url(#arr-r)"/></g>
+  <g data-k="e6"><path class="line r" d="M500 48 H540" marker-end="url(#arr-r)"/></g>
+  <g data-k="e7"><path class="line" d="M640 76 V120" marker-end="url(#arr)"/></g>
+  <g data-k="e8"><path class="line g" d="M640 176 V220" marker-end="url(#arr-g)"/></g>
+  <g data-k="e9"><path class="line g" d="M540 248 H200 C165 248 150 215 150 176" marker-end="url(#arr-g)"/></g>
+</svg>
+</div>
+<ol class="anim-steps">
+  <li data-show="mem cli e1" data-hl="mem e1 cli">启动时，<a href="https://github.com/google-gemini/gemini-cli/blob/08e9a20f749aefcbda38622ac757899c3d6216e0/packages/core/src/utils/memoryDiscovery.ts#L405" target="_blank" rel="noopener"><code>memoryDiscovery.ts</code></a> 收集层级记忆：全局的 <code>~/.gemini/</code>、扩展、项目（从受信任根目录往上找到 git 根为止）。请求进入 <a href="https://github.com/google-gemini/gemini-cli/blob/08e9a20f749aefcbda38622ac757899c3d6216e0/packages/core/src/core/client.ts#L954" target="_blank" rel="noopener"><code>GeminiClient.sendMessageStream</code></a>，回合数上限是 <code>MAX_TURNS = 100</code>。</li>
+  <li data-show="cmp e2" data-hl="cli e2 cmp">每回合开始先 <code>tryCompressChat</code>：历史超过模型上下文上限的 50% 就压缩（细节见第 7 节）。</li>
+  <li data-show="model e3" data-hl="e3 model">请求模型，流式接收内容和函数调用。每个事件都交给 <a href="https://github.com/google-gemini/gemini-cli/blob/08e9a20f749aefcbda38622ac757899c3d6216e0/packages/core/src/services/loopDetectionService.ts#L133" target="_blank" rel="noopener"><code>LoopDetectionService</code></a> 检查是否在绕圈。</li>
+  <li data-show="sch e4" data-hl="model e4 sch">模型请求运行 <code>npm test</code>。函数调用交给 <a href="https://github.com/google-gemini/gemini-cli/blob/08e9a20f749aefcbda38622ac757899c3d6216e0/packages/core/src/scheduler/scheduler.ts#L165" target="_blank" rel="noopener"><code>Scheduler</code></a>，它是一个事件驱动的状态机：validating → scheduled / awaiting_approval → executing → success / error / cancelled。</li>
+  <li data-show="pol e5" data-hl="sch e5 pol">先问 <a href="https://github.com/google-gemini/gemini-cli/blob/08e9a20f749aefcbda38622ac757899c3d6216e0/packages/core/src/policy/policy-engine.ts#L271" target="_blank" rel="noopener"><code>PolicyEngine</code></a>：按优先级找到第一条命中的规则，对 shell 命令再做一轮启发式检查（工作目录在工作区外、不受信任目录里跑 git、危险命令、含未展开的 shell 变量……都会强制改成询问）。</li>
+  <li data-show="ask e6" data-hl="pol e6 ask">结论是"询问"时，经 MessageBus 发出确认请求。用户可以选：只这一次、总是允许（还能保存成规则）、用编辑器改了再执行、取消。</li>
+  <li data-show="cp e7" data-hl="ask e7 cp">如果开启了检查点（默认关闭），编辑、写文件这两类工具一进入等待批准状态，就先往影子 git 仓库存一份快照（连同当时的对话历史），之后可以用 <code>/restore</code> 回到这一步。</li>
+  <li data-show="exe e8 e9" data-hl="cp e8 exe e9">执行，结果回灌进历史。工具访问了某个子目录时，那里的 GEMINI.md 会按需加载进来。然后进入下一回合，直到模型不再调用工具。</li>
+</ol>
+<figcaption>图 C2-2 一次请求在 Gemini CLI 里的流转。</figcaption>
+</figure>
+
+<h2>5 · 关键设计一：分层、按优先级合并的策略引擎</h2>
+<p>工具能不能执行，由 <code>PolicyEngine</code> 给出三种结论之一（<a href="https://github.com/google-gemini/gemini-cli/blob/08e9a20f749aefcbda38622ac757899c3d6216e0/packages/core/src/policy/types.ts#L11" target="_blank" rel="noopener">policy/types.ts</a>）：<code>allow</code>、<code>deny</code>、<code>ask_user</code>。规则写在 TOML 文件里，内置的在 <code>packages/core/src/policy/policies/</code>，比如 <code>read-only.toml</code>、<code>write.toml</code>、<code>plan.toml</code>、<code>yolo.toml</code>、<code>non-interactive.toml</code>。</p>
+<p>多条规则命中时，取优先级最高的那条。精妙之处在优先级的编码方式，每个内置策略文件开头都有同一段注释：</p>
+<pre data-title="packages/core/src/policy/policies/write.toml 文件头注释（节选，Apache-2.0）"><code class="lang-yaml">
+# Priority bands (tiers):
+# - Default policies (TOML): 1 + priority/1000 (e.g., priority 100 → 1.100)
+# - Extension policies (TOML): 2 + priority/1000 (e.g., priority 100 → 2.100)
+# - Workspace policies (TOML): 3 + priority/1000 (e.g., priority 100 → 3.100)
+# - User policies (TOML): 4 + priority/1000 (e.g., priority 100 → 4.100)
+# - Admin policies (TOML): 5 + priority/1000 (e.g., priority 100 → 5.100)
+#
+# This ensures Admin > User > Workspace > Extension > Default hierarchy is always preserved,
+# while allowing user-specified priorities to work within each tier.
+</code></pre>
+<p>整数部分是"谁说的"，小数部分是"在同一层里多重要"。这样无论扩展作者把优先级写得多高，都压不过用户；无论用户写得多高，都压不过管理员。用户在界面里点"总是允许"，会落成用户层里的一条高优先级规则（注释里写的是 4.95）。</p>
+
+<h3>审批模式：同一套规则，按模式开关</h3>
+<p><code>ApprovalMode</code> 有四档，按宽松程度排列为 <code>plan</code> → <code>default</code> → <code>autoEdit</code> → <code>yolo</code>（常量 <code>MODES_BY_PERMISSIVENESS</code> 就是这个顺序，注释要求：宽松模式下必须允许所有严格模式下允许的工具）。规则可以用 <code>modes = [...]</code> 指定只在某些模式下生效：</p>
+<ul>
+  <li><code>write.toml</code>：<code>replace</code>（编辑）工具默认 <code>ask_user</code>（优先级 10）；在 <code>autoEdit</code> 模式下改为 <code>allow</code>（优先级 15），但同时挂一个 <code>allowed-path</code> 安全检查器，限制只能改允许的路径。</li>
+  <li><code>yolo.toml</code>：<code>*</code> 一律允许（优先级 998），但 <code>ask_user</code> 这个"向用户提问"的工具仍然是询问（999）。</li>
+  <li><code>non-interactive.toml</code>：无交互时 <code>ask_user</code> 工具直接拒绝。更关键的是引擎本身：<code>nonInteractive</code> 为真时，没有规则命中的默认结论从"询问"变成"拒绝"（policy-engine.ts:332）。</li>
+</ul>
+
+<h3>shell 命令的额外检查</h3>
+<p>工具级规则管不到命令内容，所以 <a href="https://github.com/google-gemini/gemini-cli/blob/08e9a20f749aefcbda38622ac757899c3d6216e0/packages/core/src/policy/policy-engine.ts#L424" target="_blank" rel="noopener"><code>applyShellHeuristics</code></a> 会先解析命令，再按顺序检查。下面这几种情况会把结论强制改成"询问"：</p>
+<table>
+<tr><th>情形</th><th>为什么</th></tr>
+<tr><td>命令的工作目录不在工作区内（yolo 除外）</td><td>越界操作，默认需要人看一眼</td></tr>
+<tr><td>在不受信任的目录里执行 git 命令</td><td>仓库里的 git hooks、配置本身就能执行任意代码，陌生仓库里跑 git 等于运行它的代码</td></tr>
+<tr><td>命令被判定为危险（yolo 下保留原结论）</td><td>与 Codex 的危险命令启发式同理</td></tr>
+<tr><td>"已知安全"的命令里含有未展开的 shell 变量或替换</td><td>源码注释："分类器看到的是展开前的文本，替 bash 会改写的参数担保不了"</td></tr>
+</table>
+<div class="callout tip"><b>可迁移的经验：分类器要知道自己看不到什么</b>
+<p>"含未展开的变量就不替它担保"是一个很好的思维方式：你的安全判断基于什么输入，输入在执行前还会不会变？会变，就不要放行。第 9 章讲的 TOCTOU（检查时与使用时不一致）在 agent 里非常常见，比如审批时看到的是草稿，发送时用的是另一个版本。</p></div>
+
+<h2>6 · 关键设计二：确认不只是"是 / 否"</h2>
+<p>工具确认的结果是一个枚举 <a href="https://github.com/google-gemini/gemini-cli/blob/08e9a20f749aefcbda38622ac757899c3d6216e0/packages/core/src/tools/tools.ts#L1110" target="_blank" rel="noopener"><code>ToolConfirmationOutcome</code></a>：</p>
+<table>
+<tr><th>选项</th><th>含义</th><th>对应课程概念</th></tr>
+<tr><td><code>proceed_once</code></td><td>只批准这一次</td><td>标准审批</td></tr>
+<tr><td><code>proceed_always</code> / <code>proceed_always_and_save</code></td><td>本次会话内总是允许 / 并保存成持久规则</td><td>第 8 章：按采纳记录逐步放权</td></tr>
+<tr><td><code>proceed_always_server</code> / <code>proceed_always_tool</code></td><td>信任整个 MCP 服务器 / 这个工具</td><td>放权的粒度</td></tr>
+<tr><td><code>modify_with_editor</code></td><td>用编辑器改了参数再执行</td><td>第 8 章：改写后再发</td></tr>
+<tr><td><code>cancel</code></td><td>取消</td><td>拒绝</td></tr>
+</table>
+<p>这几个选项覆盖了第 8 章讲的审批界面的全部要素：批准、拒绝、改了再批、按粒度放权。还有一点值得注意：确认请求走的是 MessageBus（<code>confirmation-bus/</code>），调度器和界面之间只交换消息。同一套确认流程因此可以同时服务交互界面、无交互入口和 ACP 客户端，三者只是对消息的处理方式不同。</p>
+
+<h2>7 · 关键设计三：把失败也设计进去的上下文压缩</h2>
+<p><a href="https://github.com/google-gemini/gemini-cli/blob/08e9a20f749aefcbda38622ac757899c3d6216e0/packages/core/src/context/chatCompressionService.ts#L620" target="_blank" rel="noopener"><code>ChatCompressionService</code></a> 是本页最值得逐行读的一个文件。它的关键常量都在文件开头附近：</p>
+<table>
+<tr><th>常量</th><th>值</th><th>含义</th></tr>
+<tr><td><code>DEFAULT_COMPRESSION_TOKEN_THRESHOLD</code></td><td>0.5</td><td>历史超过模型上下文上限的 50% 就压缩</td></tr>
+<tr><td><code>COMPRESSION_PRESERVE_THRESHOLD</code></td><td>0.3</td><td>压缩后保留最近 30% 的历史原文</td></tr>
+<tr><td><code>COMPRESSION_FUNCTION_RESPONSE_TOKEN_BUDGET</code></td><td>50,000</td><td>保留部分里工具输出的 token 预算</td></tr>
+<tr><td><code>RECENT_TURNS_PROTECTED</code></td><td>3</td><td>最近 3 个带工具输出的回合必须原样保留</td></tr>
+</table>
+<p>压缩流程（简化后的顺序）：</p>
+<ol class="steps">
+  <li><strong>逆序预算截断</strong>：从最新往最旧数工具输出的 token，超过 5 万之后，更旧的大块工具输出只保留最后若干行，<strong>全文另存为临时文件</strong>，历史里只留截断后的版本和文件位置。这就是 Manus 说的"压缩要可恢复"（第 5 章）。</li>
+  <li><strong>找切分点</strong>：<a href="https://github.com/google-gemini/gemini-cli/blob/08e9a20f749aefcbda38622ac757899c3d6216e0/packages/core/src/context/chatCompressionService.ts#L380" target="_blank" rel="noopener"><code>findCompressSplitPoint</code></a> 按字符数找到前 70% 的位置，并且只在"用户发的、不是工具结果"的消息处切，保证不会把一次函数调用和它的结果切开。</li>
+  <li><strong>生成状态快照</strong>：把前 70% 交给模型，生成一个 <code>&lt;state_snapshot&gt;</code>。如果历史里已经有上一次的快照，提示词会要求"必须把旧快照里仍然有效的信息合并进新的"，避免多次压缩后信息逐渐流失。</li>
+  <li><strong>自我核对</strong>：再跑一轮："批判性地检查你刚写的快照，是否漏了具体的技术细节、文件路径、工具结果或用户约束？有就输出改进后的最终版，没有就原样重复。"</li>
+  <li><strong>失败判定</strong>：摘要为空，或者压缩后的 token 数比原来还多，就判压缩失败、保留原历史，并记一个具体的失败状态（<code>COMPRESSION_FAILED_EMPTY_SUMMARY</code>、<code>COMPRESSION_FAILED_INFLATED_TOKEN_COUNT</code> 等）。</li>
+</ol>
+
+<div class="widget" id="cmp">
+  <div class="w-title">上下文压缩模拟器</div>
+  <p style="font-size:14px;margin:0 0 6px">每点一次"再来一回合"，历史里加一条用户消息、一条模型回复和一次工具输出（大小随机）。阈值、保留比例和工具输出预算取自源码；每条消息的大小和快照的大小是示意值。</p>
+  <div class="w-row">
+    <label>模型上下文上限
+      <select id="limit"><option value="128000">128k tokens</option><option value="200000" selected>200k tokens</option><option value="1000000">1M tokens</option></select>
+    </label>
+    <label>工具输出大小
+      <select id="toolSize"><option value="s">偏小（1k–8k）</option><option value="m" selected>中等（2k–30k）</option><option value="l">偏大（10k–60k）</option></select>
+    </label>
+  </div>
+  <div class="gauge"><i id="gfill"></i><b title="压缩阈值 50%"></b></div>
+  <div style="display:flex;justify-content:space-between;font-size:13px;color:var(--muted)"><span id="gtext"></span><span>红线 = 50% 阈值</span></div>
+  <div class="hist" id="hist"></div>
+  <div class="legend"><span style="--c:var(--accent)">用户</span><span style="--c:color-mix(in srgb, var(--accent) 45%, var(--surface))">模型</span><span style="--c:var(--accent-2)">工具输出</span><span style="--c:var(--warn)">已截断（全文存文件）</span><span style="--c:var(--violet)">状态快照</span></div>
+  <div style="display:flex;gap:8px;margin:10px 0">
+    <button class="btn primary small" id="turn" type="button">再来一回合</button>
+    <button class="btn small" id="turn5" type="button">连跑 5 回合</button>
+    <button class="btn small" id="reset" type="button">重来</button>
+  </div>
+  <div class="log" id="log">点"再来一回合"开始；历史超过红线时会自动压缩。</div>
+</div>
+
+<div class="quiz" data-answer="4">
+<p class="q">压缩后的 token 数反而比压缩前多，Gemini CLI 会怎么做？</p>
+<ol>
+  <li>照样用压缩后的历史，因为摘要的信息密度更高</li>
+  <li>重新压缩一次，直到变小为止</li>
+  <li>删除最旧的一半历史</li>
+  <li>判定压缩失败，保留原历史，并记录失败状态 <code>COMPRESSION_FAILED_INFLATED_TOKEN_COUNT</code></li>
+</ol>
+<div class="explain">压缩的目的就是变小。变大说明摘要质量有问题（比如模型把历史又复述了一遍），此时最安全的做法是不采用。这体现了一个通用原则：<strong>任何由模型产出、要替换原始数据的东西，都要有一个确定性的验收条件</strong>，过不了就回退。</div>
+</div>
+
+<h2>8 · 关键设计四：监测模型自己的毛病</h2>
+<h3>循环检测</h3>
+<p><a href="https://github.com/google-gemini/gemini-cli/blob/08e9a20f749aefcbda38622ac757899c3d6216e0/packages/core/src/services/loopDetectionService.ts#L313" target="_blank" rel="noopener"><code>checkToolCallLoop</code></a> 把每次工具调用（名字加参数的 JSON）做 SHA-256 哈希，存入一个滑动窗口，然后检查最近的调用里是否存在长度为 1 到 5 的循环节，连续重复了 5 次（<code>TOOL_CALL_LOOP_THRESHOLD = 5</code>）。比如同一个调用连续 5 次，或者"读 A、读 B"交替出现 5 轮。</p>
+<p>除了工具调用，它还检测流式文本里重复出现的内容块，而且在代码块里关闭这项检测，因为重复的代码结构很常见，并不意味着在绕圈。一个回合超过 30 轮之后，还会定期请模型判断"是不是陷入了循环"，置信度达到 0.9 才认定；检查间隔在 5 到 15 轮之间，按上一次判断的置信度动态调整。</p>
+
+<div class="widget" id="loop">
+  <div class="w-title">循环检测器（按源码算法复刻）</div>
+  <p style="font-size:14px;margin:0 0 6px">点按钮模拟模型发出的工具调用。同名同参数视为同一个调用。</p>
+  <div style="display:flex;flex-wrap:wrap;gap:8px">
+    <button class="btn small" type="button" data-c="A">read_file(export.ts)</button>
+    <button class="btn small" type="button" data-c="B">grep("dept")</button>
+    <button class="btn small" type="button" data-c="C">run_shell("npm test")</button>
+    <button class="btn small" type="button" data-c="D">read_file(report.ts)</button>
+    <button class="btn small" type="button" id="lreset">清空</button>
+  </div>
+  <div class="seq" id="seq"></div>
+  <div class="w-out" id="lout"></div>
+</div>
+
+<h3>"话说一半"检查</h3>
+<p>模型有时会说"接下来我要运行测试"然后就停了，没有真的发起调用。<a href="https://github.com/google-gemini/gemini-cli/blob/08e9a20f749aefcbda38622ac757899c3d6216e0/packages/core/src/utils/nextSpeakerChecker.ts#L44" target="_blank" rel="noopener"><code>checkNextSpeaker</code></a> 用一次结构化输出判断下一位该谁说话（<code>next_speaker</code> 只能是 <code>user</code> 或 <code>model</code>）：如果上一条回复声明了要做的下一步，或者明显没说完，就判 <code>model</code>，客户端自动发一句"Please continue."。</p>
+<p>注意：这个检查在当前版本里<strong>默认是跳过的</strong>（配置项 <code>skipNextSpeakerCheck</code> 默认为 true）。这本身也是一课：它多花一次模型调用，换来的收益取决于模型的毛病有多严重。随着模型变强，这类脚手架就成了第 12 章说的"不再承重的组件"，可以默认关掉，但保留开关。</p>
+
+<h2>9 · 关键设计五：记忆按需加载，MCP 按信任接入</h2>
+<h3>GEMINI.md 层级记忆</h3>
+<p>启动时加载四类记忆，按类别分别拼接：global（<code>~/.gemini/</code> 下）、extension、project（从每个受信任的根目录往上找，<strong>到 git 根为止</strong>）、userProjectMemory。更值得学的是 <a href="https://github.com/google-gemini/gemini-cli/blob/08e9a20f749aefcbda38622ac757899c3d6216e0/packages/core/src/utils/memoryDiscovery.ts#L512" target="_blank" rel="noopener"><code>loadJitSubdirectoryMemory</code></a>：读写文件、列目录这类"高意图"工具访问某个子目录时，才把那里的 GEMINI.md 加进来。前提是这个路径在某个受信任的根目录之内，否则直接跳过。</p>
+<p>这就是第 5 章 just-in-time 检索和第 11 章 Skills"渐进披露"在项目记忆上的应用：monorepo 里每个子包都可以有自己的说明，但只有 agent 真的进入那个子包时才占用上下文。</p>
+
+<h3>MCP 接入</h3>
+<ul>
+  <li><strong>命名空间</strong>：MCP 工具在模型面前的名字是 <code>mcp_{服务器名}_{工具名}</code>（<code>MCP_TOOL_PREFIX = 'mcp_'</code>），策略规则可以写成 <code>服务器名__*</code> 这样的通配，一次管住整个服务器。</li>
+  <li><strong>按信任启用</strong>：当前目录不受信任时，stdio 方式的 MCP 服务器不会启动，报错提示"use 'gemini trust' to enable it"。stdio 服务器就是在你机器上跑一个本地进程，陌生项目里配置的服务器不能自动运行。</li>
+  <li><strong>工具过滤</strong>：每个服务器可以配 <code>includeTools</code> / <code>excludeTools</code>，排除优先于包含。这正是复盘里 N17"工具面太宽"的直接解法之一。</li>
+</ul>
+
+<h3>检查点与 ACP</h3>
+<ul>
+  <li><strong>检查点</strong>（默认关闭）：开启后，编辑、写文件这两类工具（<code>EDIT_TOOL_NAMES</code>）进入等待批准状态时，<a href="https://github.com/google-gemini/gemini-cli/blob/08e9a20f749aefcbda38622ac757899c3d6216e0/packages/core/src/services/gitService.ts#L384" target="_blank" rel="noopener"><code>GitService.createFileSnapshot</code></a> 往一个与用户仓库隔离的影子 git 仓库提交一次快照，<code>/restore</code> 可以把文件和对话一起回到那一刻。用影子仓库而不是用户自己的仓库，避免污染用户的提交历史。</li>
+  <li><strong>ACP</strong>：<code>--acp</code> 启动时，CLI 通过 stdin/stdout 上按行分隔的 JSON-RPC 与编辑器通信，实现在 <code>packages/cli/src/acp/</code>（会话管理、提示执行、权限请求、文件系统访问都是协议里的结构化消息）。这就是第 11 章讲的"编辑器 ↔ 编码 agent"协议的一个真实实现。</li>
+</ul>
+
+<h2>10 · 值得借鉴 / 不宜照搬</h2>
+<table>
+<tr><th>值得借鉴</th><th>不宜照搬</th></tr>
+<tr><td>规则分层：整数位表示来源、小数位表示层内优先级，保证"管理员 &gt; 用户 &gt; 工作区 &gt; 扩展 &gt; 默认"永远成立</td><td>沙箱默认关闭：对通用终端 agent 是体验取舍，但你的 agent 如果会执行模型生成的命令，默认应该更保守（对照 Codex）</td></tr>
+<tr><td>无交互时，没有规则命中的默认结论从"询问"变成"拒绝"</td><td>大量具名常量阈值：它们是针对特定模型调出来的，换模型后要用自己的评测重新校准，不要照抄数值</td></tr>
+<tr><td>压缩：逆序预算截断并落盘、按消息边界切分、合并旧快照、自我核对、膨胀即失败</td><td>"话说一半"检查：多一次模型调用，先确认你的模型确实有这个毛病再加</td></tr>
+<tr><td>按哈希加循环节检测绕圈；在代码块里关闭文本重复检测以免误报</td><td></td></tr>
+<tr><td>项目记忆按子目录按需加载；不受信任的目录里不启动本地 MCP 进程</td><td></td></tr>
+</table>
+
+<h2>11 · 对照复盘</h2>
+<div class="callout case"><b>和两个真实项目的对照</b>
+<ul>
+  <li><a href="review.html#f-N12">N12 上下文只按条数截断，没有 token 预算</a>：Gemini CLI 的压缩以 token 计（阈值是上下文上限的比例），工具输出有单独的 token 预算，超出部分截断并落盘，压缩前后都计 token 并在膨胀时回退。按"最近 40 条"截断回答不了"现在有多满"。</li>
+  <li><a href="review.html#f-N17">N17 助手工具面太宽</a>：Gemini 给每个 MCP 服务器配 <code>includeTools</code> / <code>excludeTools</code>，用命名空间加通配符整体管理，项目记忆也按子目录按需加载，而不是每轮把所有东西都发给模型。</li>
+  <li><a href="review.html#f-D6">D6 没用程序化协议</a>：Gemini CLI 自带 ACP 和 <code>stream-json</code> 输出，外部程序应该通过它们驱动和观察 agent。</li>
+</ul></div>
+
+<h2>12 · 读码练习</h2>
+<details><summary>练习 1：用户在界面里对某个工具点了"总是允许"，这条规则落在哪一层？为什么它压不过管理员策略里的 deny？</summary>
+<p>要点：看任一内置策略 TOML 的文件头注释：界面里的 Always Allow 落在用户层 4.95；管理员策略在 5.x。最终优先级 = 层号 + priority/1000，所以用户层无论写多高都低于 5。规则合并逻辑在 <code>packages/core/src/policy/policy-engine.ts</code>。</p></details>
+<details><summary>练习 2：<code>findCompressSplitPoint</code> 为什么只在"不含函数结果的用户消息"处切分？在别处切会怎样？</summary>
+<p>要点：函数调用（模型消息）和函数结果（用户角色消息）必须成对出现。如果在二者之间切，压缩后的历史里会出现没有调用的结果或没有结果的调用，下一次请求会被 API 拒绝或让模型困惑。看 <code>context/chatCompressionService.ts</code> 第 380 行起的实现，以及末尾"能否把全部历史都压缩"的判断：最后一条必须是没有函数调用的模型消息。</p></details>
+<details><summary>练习 3：工具调用序列 A B A B A B A B A B，第几次调用时会被判定为循环？如果是 A B C A B C……呢？</summary>
+<p>要点：循环节长度 k=2 时需要 k×5=10 次，所以第 10 次调用时命中；k=3 时需要 15 次。算法在 <code>services/loopDetectionService.ts</code> 的 <code>checkToolCallLoop</code>：对 k=1..5，取最近 k 个哈希作为循环节，向前检查 k×5 个位置是否完全匹配。可以用上面的检测器验证。</p></details>
+<details><summary>练习 4：无交互模式下，一个没有任何规则命中的工具调用会得到什么结论？在哪一行决定？</summary>
+<p>要点：<code>policy/policy-engine.ts</code> 构造函数里：<code>defaultDecision = config.defaultDecision ?? (nonInteractive ? DENY : ASK_USER)</code>。另外 <code>non-interactive.toml</code> 把 <code>ask_user</code> 工具本身设为 deny。两处一起保证没人值守时不会卡在等待确认上，也不会悄悄放行。</p></details>
+
+<div class="quiz" data-answer="2">
+<p class="q">Gemini CLI 在"不受信任的目录"里执行 git 命令时强制询问用户，最主要的原因是？</p>
+<ol>
+  <li>git 命令通常很慢</li>
+  <li>仓库自带的 git hooks 和配置可以在执行 git 时运行任意代码，陌生仓库里跑 git 相当于运行它的代码</li>
+  <li>git 命令会修改远端仓库</li>
+  <li>模型不擅长写 git 命令</li>
+</ol>
+<div class="explain">像 <code>git status</code> 这样看似只读的命令，也会读取仓库配置、可能触发 fsmonitor 等钩子。对陌生仓库，"只读命令"并不安全。这是第 9 章"不可信输入不只是文本"的好例子：一个目录本身就可以是攻击载体。</div>
+</div>
+
+<div class="takeaways"><b>本章要点</b>
+<ul>
+  <li>策略引擎给出允许 / 拒绝 / 询问三种结论；规则按"来源层 + 层内优先级"合并，管理员 &gt; 用户 &gt; 工作区 &gt; 扩展 &gt; 默认永远成立。</li>
+  <li>shell 命令额外做启发式检查：越界目录、不受信任目录里的 git、危险命令、未展开的变量都强制询问；无交互时默认拒绝。</li>
+  <li>压缩流程：50% 触发、逆序预算截断并落盘、按消息边界切分、合并旧快照、自我核对，压完反而变大就回退。</li>
+  <li>主动监测模型的毛病：哈希加循环节检测绕圈，按需检查"话说一半就停"，后者默认关闭。</li>
+  <li>项目记忆按子目录按需加载；MCP 工具加命名空间，可按服务器过滤，陌生目录里不启动本地 MCP 进程。</li>
+</ul></div>
+
+<h2>参考资料</h2>
+<ul class="refs">
+  <li><a href="https://github.com/google-gemini/gemini-cli/tree/08e9a20f749aefcbda38622ac757899c3d6216e0" target="_blank" rel="noopener">google-gemini/gemini-cli（研读版本 08e9a20）</a> <span class="src">Apache-2.0 · 本页源码引用均固定于此提交</span></li>
+  <li><a href="https://github.com/google-gemini/gemini-cli/blob/08e9a20f749aefcbda38622ac757899c3d6216e0/packages/core/src/context/chatCompressionService.ts" target="_blank" rel="noopener">context/chatCompressionService.ts</a> <span class="src">上下文压缩的完整实现</span></li>
+  <li><a href="https://github.com/google-gemini/gemini-cli/tree/08e9a20f749aefcbda38622ac757899c3d6216e0/packages/core/src/policy/policies" target="_blank" rel="noopener">policy/policies/*.toml</a> <span class="src">内置策略与优先级分层说明</span></li>
+  <li><a href="https://github.com/google-gemini/gemini-cli/blob/08e9a20f749aefcbda38622ac757899c3d6216e0/packages/cli/src/acp/README.md" target="_blank" rel="noopener">packages/cli/src/acp/README.md</a> <span class="src">ACP 实现的模块划分</span></li>
+  <li><a href="https://manus.im/blog/Context-Engineering-for-AI-Agents-Lessons-from-Building-Manus" target="_blank" rel="noopener">Context Engineering for AI Agents: Lessons from Building Manus</a> <span class="src">Manus · 2025-07-18 · 可恢复的压缩</span></li>
+  <li><a href="ch05-context-engineering.html">第 5 章 · 上下文工程</a> · <a href="ch08-hitl-autonomy.html">第 8 章 · 人在回路</a> · <a href="ch11-protocols.html">第 11 章 · 协议</a></li>
+</ul>
+</article>
+
+<script>
+window.addEventListener('DOMContentLoaded', () => {
+  // ---- 压缩模拟器：阈值 0.5、保留 30%、工具输出预算 5 万取自源码，其余为示意 ----
+  const THRESHOLD = 0.5, PRESERVE = 0.3, TOOL_BUDGET = 50000, TRUNC_KEEP = 600, SNAP = 3000;
+  const $ = (id) => document.getElementById(id);
+  let hist = [], logLines = [], rounds = 0;
+  const rnd = (a, b) => Math.round(a + Math.random() * (b - a));
+  const sizes = { s: [1000, 8000], m: [2000, 30000], l: [10000, 60000] };
+  const total = () => hist.reduce((s, h) => s + h.tok, 0);
+  const log = (s) => { logLines.push(s); $('log').textContent = logLines.slice(-40).join('\n'); $('log').scrollTop = 1e9; };
+  function render() {
+    const limit = Number($('limit').value);
+    const t = total();
+    $('gfill').style.width = Math.min(100, (t / limit) * 100) + '%';
+    $('gtext').textContent = `历史 ${t.toLocaleString()} / ${limit.toLocaleString()} tokens（${((t / limit) * 100).toFixed(1)}%）`;
+    const scale = 600 / Math.max(limit * 0.6, t);
+    $('hist').innerHTML = hist.map((h) => `<i class="${h.k}" style="width:${Math.max(4, h.tok * scale)}px" title="${h.label}：${h.tok.toLocaleString()} tokens"></i>`).join('');
+  }
+  function compress() {
+    const limit = Number($('limit').value);
+    const before = total();
+    log(`▶ 超过阈值（${(THRESHOLD * 100)}% = ${(limit * THRESHOLD).toLocaleString()}），开始压缩，压缩前 ${before.toLocaleString()}`);
+    // 1) 逆序预算：从新到旧累计工具输出，超预算的旧工具输出截断并"落盘"
+    let acc = 0, truncated = 0;
+    for (let i = hist.length - 1; i >= 0; i--) {
+      const h = hist[i];
+      if (h.k !== 't') continue;
+      acc += h.tok;
+      if (acc > TOOL_BUDGET && h.tok > TRUNC_KEEP) { h.tok = TRUNC_KEEP; h.k = 'tt'; h.label = '已截断的工具输出（全文存为临时文件）'; truncated++; }
+    }
+    if (truncated) log(`  1. 工具输出累计超过 ${TOOL_BUDGET.toLocaleString()}：${truncated} 个旧工具输出只留末尾若干行，全文存文件`);
+    else log('  1. 工具输出未超预算，不截断');
+    // 2) 切分：按大小找前 70%，只在用户消息处切
+    const sum = total(); let cum = 0, split = 0;
+    for (let i = 0; i < hist.length; i++) {
+      if (hist[i].k === 'u' || hist[i].k === 's') { if (cum >= sum * (1 - PRESERVE)) { split = i; break; } split = i; }
+      cum += hist[i].tok;
+    }
+    const old = hist.slice(0, split), keep = hist.slice(split);
+    const hadSnap = old.some((h) => h.k === 's');
+    log(`  2. 在第 ${split + 1} 条（用户消息边界）切分：前 ${old.length} 条压缩，后 ${keep.length} 条原样保留`);
+    log(`  3. 生成 <state_snapshot>${hadSnap ? '（合并上一次的快照）' : ''}，再跑一轮自我核对`);
+    const snapTok = SNAP + (hadSnap ? 800 : 0);
+    const after = snapTok + keep.reduce((s, h) => s + h.tok, 0);
+    if (after >= before) {
+      log(`  ✗ 压缩后 ${after.toLocaleString()} ≥ 压缩前，判定 COMPRESSION_FAILED_INFLATED_TOKEN_COUNT，保留原历史`);
+      return;
+    }
+    hist = [{ k: 's', tok: snapTok, label: '状态快照' }, ...keep];
+    log(`  ✓ 压缩完成：${before.toLocaleString()} → ${after.toLocaleString()} tokens`);
+  }
+  function oneTurn() {
+    rounds++;
+    const [a, b] = sizes[$('toolSize').value];
+    hist.push({ k: 'u', tok: rnd(200, 1500), label: '用户消息' });
+    hist.push({ k: 'm', tok: rnd(300, 2000), label: '模型回复与函数调用' });
+    hist.push({ k: 't', tok: rnd(a, b), label: '工具输出' });
+    log(`第 ${rounds} 回合：历史 ${total().toLocaleString()} tokens`);
+    if (total() >= Number($('limit').value) * THRESHOLD) compress();
+    render();
+  }
+  $('turn').addEventListener('click', oneTurn);
+  $('turn5').addEventListener('click', () => { for (let i = 0; i < 5; i++) oneTurn(); });
+  $('reset').addEventListener('click', () => { hist = []; logLines = []; rounds = 0; $('log').textContent = '点"再来一回合"开始；历史超过红线时会自动压缩。'; render(); });
+  $('limit').addEventListener('change', render);
+  render();
+
+  // ---- 循环检测器：k = 1..5 的循环节连续重复 5 次 ----
+  const R = 5;
+  let calls = [];
+  function detect() {
+    const n = calls.length;
+    for (let k = 1; k <= 5; k++) {
+      const need = k * R;
+      if (n < need) continue;
+      const cycle = calls.slice(-k);
+      let ok = true;
+      for (let i = 0; i < need; i++) if (calls[n - need + i] !== cycle[i % k]) { ok = false; break; }
+      if (ok) return { k, need };
+    }
+    return null;
+  }
+  const names = { A: 'read_file(export.ts)', B: 'grep("dept")', C: 'run_shell("npm test")', D: 'read_file(report.ts)' };
+  function renderLoop() {
+    const hit = detect();
+    $('seq').innerHTML = calls.map((c, i) => `<span class="${hit && i >= calls.length - hit.need ? 'hit' : ''}" title="${names[c]}">${c}</span>`).join('');
+    $('lout').innerHTML = calls.length === 0 ? '还没有调用。试试连点同一个，或者 A、B 交替点。'
+      : hit ? `<b style="color:var(--danger)">检测到循环</b>：长度为 ${hit.k} 的循环节连续重复了 ${R} 次（最近 ${hit.need} 次调用）。真实系统会在这里中断这一回合，提示模型换一种做法。`
+      : `共 ${calls.length} 次调用，暂未发现循环。`;
+  }
+  document.querySelectorAll('#loop [data-c]').forEach((b) => b.addEventListener('click', () => { calls.push(b.dataset.c); if (calls.length > 25) calls = calls.slice(-25); renderLoop(); }));
+  $('lreset').addEventListener('click', () => { calls = []; renderLoop(); });
+  renderLoop();
+});
+</script>
+</body>
+</html>

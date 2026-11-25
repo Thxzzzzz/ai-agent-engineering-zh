@@ -1,0 +1,442 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Claude Code 研读 · AI Agent 工程</title>
+<meta name="description" content="对照官方文档、工程博客与社区拆解，研读 Claude Code 的主循环、工具分层、上下文管理、子 agent、权限与沙箱、hooks 和 auto mode 的设计精华。">
+<link rel="stylesheet" href="assets/css/course.css">
+<script src="assets/js/manifest.js"></script>
+<script defer src="assets/js/course.js"></script>
+<style>
+  .sim-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .sim-result { margin-top: 12px; padding: 12px 14px; border-radius: 8px; font-size: 14.5px; }
+  .sim-result.allow { background: var(--ok-soft); }
+  .sim-result.ask { background: var(--warn-soft); }
+  .sim-result.deny { background: var(--danger-soft); }
+  .sim-result.review { background: var(--violet-soft); }
+  .sim-result b { display: block; font-size: 16px; margin-bottom: 4px; }
+  .src-tag { font-size: 12px; color: var(--muted); }
+  .survey { min-width: 1080px; font-size: 13.5px; }
+  .survey td:nth-child(1) { min-width: 150px; }
+  .survey td:nth-child(5) { min-width: 280px; }
+  .survey td:nth-child(6) { min-width: 200px; }
+  .survey td:nth-child(2) { white-space: nowrap; }
+  @media (max-width: 640px) { .sim-grid { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body data-page="case-claude-code">
+<article id="content">
+<div class="eyebrow">第六部分 · 名作研读</div>
+<h1>Claude Code：官方设计与社区分析精华</h1>
+<p class="lead">Claude Code 是目前被拆解得最多的编码 agent。它是闭源的，但官方文档和工程博客写得很透，社区还用抓包、运行时日志等方法做了大量分析。这一章把两类材料对照着读：哪些是官方说的，哪些是社区推断的，哪些已经过时，最后落到你自己的 agent 该借鉴什么。</p>
+<div class="meta"><span>约 50 分钟</span><span>前置：第 4、5、8、9、12 章</span><span>资料核实于 2026-11</span></div>
+
+<div class="goals"><b>学完你能</b>
+<ul>
+  <li>画出 Claude Code 的整体结构：单线程主循环、分层工具、上下文管理、子 agent、权限与沙箱、hooks</li>
+  <li>说清它"简单主循环 + 厚 harness"的取舍，以及哪些部分值得搬进你自己的 agent</li>
+  <li>区分官方事实、社区推断与已经过时的说法，养成"按来源性质给结论打折"的习惯</li>
+  <li>理解 auto mode 分类器和沙箱背后的安全设计，并用它对照自己项目里的权限问题</li>
+</ul></div>
+
+<h2>1 · 速览：我们靠什么材料研读</h2>
+<div class="cards">
+  <div class="card"><span class="tag">是什么</span><b>终端里的编码 agent</b><small>能读写项目文件、跑命令、联网、接 MCP；同一套 agentic loop 也跑在 IDE、桌面端、网页和 CI 里。</small></div>
+  <div class="card"><span class="tag">源码</span><b>闭源</b><small>没有公开仓库可读。本章只依据官方材料与合规的第三方分析，不收录任何泄露或反编译得到的代码。</small></div>
+  <div class="card"><span class="tag">一手</span><b>官方文档 + 工程博客</b><small>code.claude.com/docs 的运行原理、权限模式、hooks、子 agent、Skills、记忆、headless 页面；Anthropic 关于 auto mode、沙箱、隔离的工程文章。</small></div>
+  <div class="card"><span class="tag">二手</span><b>社区文章与 GitHub 仓库</b><small>5 篇文章、1 个运行时抓取工具、5 个高星 GitHub 仓库：抓包、运行时日志、从公开 npm 包提取提示词、clean-room 教学实现，以及基于 2026-03 意外公开源码的分析（只转述结论）。见第 5 节。</small></div>
+</div>
+
+<div class="callout warn"><b>读这类材料的规矩</b>
+<p>闭源产品的分析很容易被当成事实传来传去。本章按来源性质分三档：<span class="pill ok">官方</span> 以官方文档和工程博客为准；<span class="pill accent">社区·运行时</span> 是抓包或运行时日志直接看到的提示词与请求，可信但会随版本变化；<span class="pill warn">社区·推断</span> 是对混淆代码命名、内部阈值的推断，或者只有一个来源的说法。与官方冲突时一律以官方为准，第 5 节专门列出了冲突。</p></div>
+
+<h2>2 · 架构总览</h2>
+<p>官方文档对它的定位只有一句：Claude Code 是"模型外面那一层"，负责提供工具、管理模型看到的上下文，这一层就叫 <strong>agentic harness</strong>。下图把这一层拆开：</p>
+
+<figure>
+<div class="diagram">
+<svg viewBox="0 0 760 420" width="760" role="img" aria-label="Claude Code 架构总览">
+  <rect class="box m" x="20" y="16" width="720" height="44" rx="10"/>
+  <text class="tb" x="380" y="36" text-anchor="middle">Hooks：贯穿整个生命周期的确定性扩展点</text>
+  <text class="ts" x="380" y="53" text-anchor="middle">SessionStart · UserPromptSubmit · PreToolUse · PostToolUse · PreCompact · Stop · SubagentStop …</text>
+
+  <rect class="box v" x="20" y="80" width="210" height="232" rx="10"/>
+  <text class="tb" x="125" y="104" text-anchor="middle">上下文层</text>
+  <text class="t" x="38" y="132">系统提示 + 工具定义</text>
+  <text class="t" x="38" y="158">CLAUDE.md（多层级）</text>
+  <text class="t" x="38" y="184">auto memory 摘要</text>
+  <text class="t" x="38" y="210">Skills 描述（按需展开）</text>
+  <text class="t" x="38" y="236">MCP 工具名（延迟加载）</text>
+  <text class="t" x="38" y="262">system reminder</text>
+  <text class="ts" x="38" y="292">接近上限 → 自动压缩</text>
+
+  <rect class="box a" x="270" y="104" width="210" height="112" rx="12"/>
+  <text class="tb" x="375" y="132" text-anchor="middle">单线程主循环</text>
+  <text class="ts" x="375" y="156" text-anchor="middle">调模型 → 执行工具 → 回灌结果</text>
+  <text class="ts" x="375" y="178" text-anchor="middle">无工具调用即结束本轮</text>
+  <text class="ts" x="375" y="200" text-anchor="middle">运行中可插话纠偏</text>
+
+  <rect class="box b" x="520" y="80" width="220" height="150" rx="10"/>
+  <text class="tb" x="630" y="104" text-anchor="middle">工具层</text>
+  <text class="t" x="538" y="130">文件：Read · Edit · Write</text>
+  <text class="t" x="538" y="154">搜索：Grep · Glob</text>
+  <text class="t" x="538" y="178">执行：Bash（可进沙箱）</text>
+  <text class="t" x="538" y="202">Web · 子 agent · MCP</text>
+  <text class="ts" x="538" y="222">代码智能需插件</text>
+
+  <rect class="box r" x="520" y="248" width="220" height="96" rx="10"/>
+  <text class="tb" x="630" y="272" text-anchor="middle">权限层</text>
+  <text class="t" x="538" y="296">deny / ask / allow 规则</text>
+  <text class="t" x="538" y="318">权限模式 · auto 分类器</text>
+  <text class="t" x="538" y="338">沙箱：文件 + 网络隔离</text>
+
+  <rect class="box g" x="270" y="246" width="210" height="66" rx="10"/>
+  <text class="tb" x="375" y="272" text-anchor="middle">子 agent</text>
+  <text class="ts" x="375" y="294" text-anchor="middle">独立上下文，只回传摘要</text>
+
+  <rect class="box w" x="20" y="336" width="460" height="66" rx="10"/>
+  <text class="tb" x="250" y="362" text-anchor="middle">会话与持久化</text>
+  <text class="ts" x="250" y="384" text-anchor="middle">JSONL 记录 · resume / fork · 编辑前快照（checkpoint）</text>
+  <rect class="box m" x="520" y="360" width="220" height="42" rx="10"/>
+  <text class="t" x="630" y="386" text-anchor="middle">插件：打包以上各类扩展</text>
+
+  <path class="line" d="M230 158 H270" marker-end="url(#arr)"/>
+  <path class="line b" d="M480 150 H520" marker-end="url(#arr-b)"/>
+  <path class="line r" d="M630 230 V248" marker-end="url(#arr-r)"/>
+  <path class="line g" d="M375 216 V246" marker-end="url(#arr-g)" marker-start="url(#arr-g)"/>
+  <path class="line dash" d="M375 312 V336" marker-end="url(#arr)"/>
+</svg>
+</div>
+<figcaption>图 C-1 依据官方"How Claude Code works"、权限模式、hooks、子 agent、Skills、记忆文档整理。工具名以 2026-11 的官方工具列表为准，早期版本的名字（如 View、dispatch_agent）已改。</figcaption>
+</figure>
+
+<p>GitHub 上星标最多的相关仓库 <a href="https://github.com/shareAI-lab/learn-claude-code" target="_blank" rel="noopener">shareAI-lab/learn-claude-code</a><span class="pill accent">GitHub 仓库 · clean-room 教学实现</span> 把它概括成一个公式：<strong>agent 产品 = 模型 + harness</strong>；而 Claude Code = 一个 agent 循环 + 工具 + 按需加载的 Skills + 上下文压缩 + 子 agent + 带依赖的任务系统 + 并行编辑用的 worktree + 权限治理 + hooks + 记忆持久化 + MCP。这个仓库把每一项拆成一节可运行的教学代码（s01 循环、s02 工具……s17 目标循环），适合作为本章的跟练材料。</p>
+<p>值得先记住的一个比例：一篇社区分析<span class="pill warn">社区·推断</span>（基于 2026-03 随 npm 包意外公开的源码，只转述结论）统计到，主循环只有约 1,700 行，整个代码库约 51 万行。剩下的全是 harness：工具安全、上下文预算、错误恢复、权限、配置、遥测。<strong>循环决定 agent 怎么跑，harness 决定它能不能活下去</strong>。这和第 12 章"驾驭器"的观点完全一致。</p>
+
+<h2>3 · 一次请求的旅程</h2>
+<p>以"修好失败的测试"为例，按官方文档描述的生命周期走一遍。每一步的说明里都标了依据。</p>
+
+<figure class="anim" data-dim>
+<div class="diagram">
+<svg viewBox="0 0 760 330" width="760" role="img" aria-label="一次请求在 Claude Code 内部的旅程">
+  <g data-k="s1"><rect class="box v" x="20" y="20" width="160" height="60" rx="10"/><text class="tb" x="100" y="45" text-anchor="middle">① 会话启动</text><text class="ts" x="100" y="66" text-anchor="middle">装载上下文</text></g>
+  <g data-k="s2"><rect class="box m" x="200" y="20" width="160" height="60" rx="10"/><text class="tb" x="280" y="45" text-anchor="middle">② 提交提示</text><text class="ts" x="280" y="66" text-anchor="middle">UserPromptSubmit</text></g>
+  <g data-k="s3"><rect class="box a" x="380" y="20" width="160" height="60" rx="10"/><text class="tb" x="460" y="45" text-anchor="middle">③ 模型决策</text><text class="ts" x="460" y="66" text-anchor="middle">输出 tool_use</text></g>
+  <g data-k="s4"><rect class="box r" x="560" y="20" width="180" height="60" rx="10"/><text class="tb" x="650" y="45" text-anchor="middle">④ 权限判定</text><text class="ts" x="650" y="66" text-anchor="middle">规则 → 模式 → 分类器</text></g>
+  <g data-k="s5"><rect class="box b" x="560" y="130" width="180" height="60" rx="10"/><text class="tb" x="650" y="155" text-anchor="middle">⑤ 执行工具</text><text class="ts" x="650" y="176" text-anchor="middle">Bash 可在沙箱内</text></g>
+  <g data-k="s6"><rect class="box m" x="380" y="130" width="160" height="60" rx="10"/><text class="tb" x="460" y="155" text-anchor="middle">⑥ 结果回灌</text><text class="ts" x="460" y="176" text-anchor="middle">PostToolUse</text></g>
+  <g data-k="s7"><rect class="box g" x="200" y="130" width="160" height="60" rx="10"/><text class="tb" x="280" y="155" text-anchor="middle">⑦ 派子 agent</text><text class="ts" x="280" y="176" text-anchor="middle">隔离探索</text></g>
+  <g data-k="s8"><rect class="box w" x="20" y="130" width="160" height="60" rx="10"/><text class="tb" x="100" y="155" text-anchor="middle">⑧ 自动压缩</text><text class="ts" x="100" y="176" text-anchor="middle">接近上限时</text></g>
+  <g data-k="s9"><rect class="box g" x="200" y="240" width="340" height="66" rx="10"/><text class="tb" x="370" y="266" text-anchor="middle">⑨ 本轮结束：Stop hook → 返回用户</text><text class="ts" x="370" y="288" text-anchor="middle">会话写入 JSONL，可 resume / fork；改过的文件有快照</text></g>
+  <g data-k="e1"><path class="line" d="M180 50 H200" marker-end="url(#arr)"/></g>
+  <g data-k="e2"><path class="line" d="M360 50 H380" marker-end="url(#arr)"/></g>
+  <g data-k="e3"><path class="line r" d="M540 50 H560" marker-end="url(#arr-r)"/></g>
+  <g data-k="e4"><path class="line b" d="M650 80 V130" marker-end="url(#arr-b)"/></g>
+  <g data-k="e5"><path class="line" d="M560 160 H540" marker-end="url(#arr)"/></g>
+  <g data-k="e6"><path class="line a" d="M460 130 V80" marker-end="url(#arr-a)"/></g>
+  <g data-k="e7"><path class="line g" d="M380 175 H360" marker-end="url(#arr-g)"/></g>
+  <g data-k="e8"><path class="line dash" d="M200 160 H180" marker-end="url(#arr)"/></g>
+  <g data-k="e9"><path class="line g" d="M460 190 C460 220 420 225 400 240" marker-end="url(#arr-g)"/></g>
+</svg>
+</div>
+<ol class="anim-steps">
+  <li data-show="s1" data-hl="s1"><b>会话启动</b>：载入多层级的 CLAUDE.md、auto memory（MEMORY.md 前 200 行或 25KB，取先到者）、Skills 的描述（正文要等调用时才载入）、MCP 工具名（定义默认延迟加载，用到时经工具搜索取回）。<span class="src-tag">依据：官方 How Claude Code works、Memory、Skills</span></li>
+  <li data-show="s2 e1" data-hl="s2 e1"><b>提交提示</b>：UserPromptSubmit hook 先运行，可以补充上下文，也可以拦下这条提示。Claude Code 还会在对话里插入自己的 system reminder，比如"你改过的文件在磁盘上又变了"。<span class="src-tag">依据：官方 Hooks、How Claude Code works</span></li>
+  <li data-show="s3 e2" data-hl="s3 e2"><b>模型决策</b>：主循环把整个上下文发给模型，模型返回 tool_use，比如先跑测试看失败信息。官方把这个过程概括为"收集上下文 → 行动 → 验证"三个阶段交织进行。<span class="src-tag">依据：官方；社区抓包也证实是一个 while 循环加一份扁平的消息历史（MinusX、claude-trace）</span></li>
+  <li data-show="s4 e3" data-hl="s4 e3"><b>权限判定</b>：deny 规则在任何模式下都生效，ask 规则在任何模式下都不会被自动批准；剩下的按当前权限模式处理。auto 模式下，有真实风险的动作交给分类器审查，PreToolUse hook 也能直接拒绝。<span class="src-tag">依据：官方 Permission modes、auto mode 工程文章</span></li>
+  <li data-show="s5 e4" data-hl="s5 e4"><b>执行工具</b>：开启沙箱时，Bash 命令及其派生的所有子进程都受操作系统级的文件和网络隔离约束，网络只能经沙箱外的代理访问白名单域名。<span class="src-tag">依据：官方工程文章 Beyond permission prompts（2025-10-20）</span></li>
+  <li data-show="s6 e5 e6" data-hl="s6 e5 e6"><b>结果回灌</b>：PostToolUse hook 可以对结果做确定性处理，比如编辑后自动格式化。结果追加进上下文，回到第 ③ 步。任务清单的当前状态也会以提醒的形式回灌，让模型不忘记目标。<span class="src-tag">依据：官方 Hooks；任务清单回灌来自社区运行时日志（claude-code-reverse、MinusX）</span></li>
+  <li data-show="s7 e7" data-hl="s7 e7"><b>派子 agent</b>：需要大范围搜索时派出子 agent。它在自己的上下文窗口里工作，工具调用不进主对话，结束时只交回一份摘要。<span class="src-tag">依据：官方 Subagents</span></li>
+  <li data-show="s8 e8" data-hl="s8 e8"><b>自动压缩</b>：上下文接近上限时，对话被压缩成摘要，保留请求和关键代码，早期的细节指令可能丢失；可以在 CLAUDE.md 里写"Compact Instructions"指定保留什么。如果某个输出大到压缩后马上又满，几次之后就停止自动压缩、报错，不会死循环。<span class="src-tag">依据：官方 How Claude Code works</span></li>
+  <li data-show="s9 e9" data-hl="s9 e9"><b>本轮结束</b>：模型不再调用工具时本轮结束；Stop hook 可以用退出码 2 阻止停下（例如"还有测试没过"）。所有消息、工具调用和结果都写进本地 JSONL，可以 resume 或 fork；编辑前的文件快照让你按两下 Esc 就能回滚。<span class="src-tag">依据：官方 Hooks、How Claude Code works</span></li>
+</ol>
+<figcaption>图 C-2 九步走完一次请求。真实运行中，③→⑥ 会循环几十次。</figcaption>
+</figure>
+
+<h2>4 · 精华逐条拆</h2>
+
+<h3>4.1 单线程主循环：把复杂度放在 harness，不放在编排</h3>
+<p><strong>它怎么做</strong>：只有一个主线程、一份扁平的消息历史。需要分解任务时，靠任务清单和子 agent，而不是多个 agent 互相传话。用户可以在 agent 工作时插话，消息会在当前这批工具调用结束后被读到（官方文档的"queue messages"）。</p>
+<p><strong>依据</strong>：<span class="pill ok">官方</span> 运行原理文档描述的就是这个循环。<span class="pill accent">社区·运行时</span> MinusX 抓包后的第一条结论就是"Keep Things Simple"：一个主循环、最多一个分支、一份消息历史。<span class="pill warn">社区·推断</span> PromptLayer 一文里流传很广的内部代号 "nO""h2A"，来自对混淆代码的逆向，不是官方命名，没有学习价值。</p>
+<p><strong>为什么有效</strong>：可调试。出问题时只有一条轨迹要读。这正是第 11 章 Cognition"写操作保持单线程"的观点。</p>
+<p><strong>对应</strong>：<a href="ch04-agent-loop.html">第 4 章</a> · <a href="ch11-protocols.html">第 11 章</a></p>
+
+<h3>4.2 工具分层：常用操作做成专用工具，长尾交给 Bash</h3>
+<p><strong>它怎么做</strong>：同时提供低层（Bash、Read、Write）、中层（Edit、Grep、Glob）和高层工具（子 agent、WebFetch、退出计划模式）。明明有 Bash，为什么还要单独的 Grep？MinusX 的解释是：使用越频繁的操作，越值得做成专用工具以提高准确率；罕见场景再让模型写 bash。</p>
+<p><strong>依据</strong>：<span class="pill accent">社区·运行时</span> MinusX（2025-08，工具列表来自抓包）。<span class="pill ok">官方</span> 工具文档按文件、搜索、执行、Web、代码智能五类组织；《Writing effective tools for agents》（2025-09-11）讲的"少而精、语义化返回、可执行的错误信息"在这里都有体现。</p>
+<p><strong>细节</strong>：工具描述本身就是提示词，而且很长。抓包看到的工具定义写满了"什么时候用、什么时候别用"，还带正反例（比如"用绝对路径，别 cd"）。一篇社区分析<span class="pill warn">社区·推断</span> 统计，仅 Bash 工具的说明就约 6,500 token，大部分是一份反模式清单。</p>
+<p><strong>提示词不是一个字符串</strong>：<a href="https://github.com/Piebald-AI/claude-code-system-prompts" target="_blank" rel="noopener">Piebald-AI/claude-code-system-prompts</a><span class="pill accent">GitHub 仓库 · 从公开 npm 包提取</span> 在每个版本发布后用脚本从编译产物里提取提示词。它的结论是：系统提示由大量按环境和配置条件拼接的片段组成；内置工具各有自己的描述，Explore、Plan 等内置子 agent 各有自己的系统提示；压缩、生成 CLAUDE.md、生成会话标题等辅助功能也各有提示词。合计 500 多段文本，而且几乎每个版本都在变（它维护的变更记录覆盖 v2.0.14 以来的 343 个版本）。启示：<strong>提示词是需要版本化、逐版本 diff 的工程资产</strong>（第 13、14 章）。本课程不转载这些提示词原文。</p>
+<p><strong>编辑策略</strong>：一个基于公开源码的分析仓库（how-claude-code-works，见第 5 节）<span class="pill warn">泄露源码 · 单一来源</span> 总结了编辑工具的设计：用"查找并替换"而不是整文件重写，要求被替换的片段在文件里唯一，并且要求编辑前先读过该文件。唯一性约束和先读后改，都是在防模型凭记忆"幻觉式"地改错位置。</p>
+<p><strong>对应</strong>：<a href="ch03-structured-tools.html">第 3 章</a></p>
+
+<h3>4.3 任务清单外置并反复复述</h3>
+<p><strong>它怎么做</strong>：模型用一个工具维护自己的任务清单，UI 把它显示成勾选列表。之后每次调用工具，清单的当前状态都会以 system reminder 的形式回灌进上下文。</p>
+<p><strong>依据</strong>：<span class="pill accent">社区·运行时</span> claude-code-reverse 的运行时日志显示，早期版本把清单写成 <code>~/.claude/todos/</code> 下的 JSON，并经"system reminder"回灌；MinusX 也看到了这类提醒。<span class="pill ok">官方</span> 2026 年的 hooks 文档里已经有 TaskCreated / TaskCompleted 事件，说明任务清单已经演进为正式的任务工具。具体形态随版本变化，但"外置 + 复述"这个思路没变。</p>
+<p><strong>为什么有效</strong>：这正是 Manus 说的"复述 todo 对抗目标漂移"（第 5 章）。和让另一个模型做计划、再交给执行者相比，模型自己维护的清单可以中途增删，不会出现交接时信息丢失的问题。</p>
+<p><strong>对应</strong>：<a href="ch05-context-engineering.html">第 5 章</a> · <a href="ch12-long-running.html">第 12 章</a></p>
+
+<h3>4.4 上下文管理是一条管线，而不是一个动作</h3>
+<p><strong>它怎么做</strong>（<span class="pill ok">官方</span>）：</p>
+<ul>
+  <li><strong>少装</strong>：MCP 工具定义默认延迟加载，只有工具名和服务说明占上下文，用到时再经工具搜索取回；Skills 只装描述，正文在调用时才展开。</li>
+  <li><strong>按需取</strong>：代码搜索用 Grep/Glob 这类"像人一样搜"的方式，而不是向量检索（MinusX：<em>LLM search >>> RAG</em>）。</li>
+  <li><strong>可观察</strong>：<code>/context</code> 命令能看到上下文都被什么占着。</li>
+  <li><strong>压缩</strong>：接近上限时自动压缩，可以用 Compact Instructions 指定保留什么；压缩反复失败时停下报错，不无限重试。</li>
+</ul>
+<p><span class="pill warn">社区·推断</span> 那篇基于公开源码的分析还提到两点：系统提示由十几个片段拼成，中间有一个"缓存边界"，之前的内容跨轮稳定、可以命中提示缓存，之后才放会话相关的动态内容；上下文管理分为预算、局部压缩、全量压缩三层。这两点和第 2 章"静态在前、易变在后"的原则一致。how-claude-code-works 仓库（同样基于公开源码）把压缩描述成"4 级渐进式压缩"，Dibia 说是 3 层：两者切分口径不同，结论一致，即<strong>先用便宜的手段，最后才动用模型做全量摘要</strong>。</p>
+<p><strong>对应</strong>：<a href="ch02-llm-fundamentals.html">第 2 章</a> · <a href="ch05-context-engineering.html">第 5 章</a> · <a href="ch07-retrieval.html">第 7 章</a></p>
+
+<h3>4.5 子 agent：用来隔离上下文，而不是分角色</h3>
+<p><strong>它怎么做</strong>（<span class="pill ok">官方</span>）：每个子 agent 有自己的上下文窗口、系统提示、工具权限和独立的权限设置；默认从零开始，fork 则带着当前对话的副本出发；fork 不能再 fork；不给它子 agent 工具，它就不能继续派生。官方最佳实践也直说了代价：每个子 agent 都单独发请求，token 照算；从零开始的子 agent 还得重新收集主对话已有的上下文，有时反而更慢。</p>
+<p><strong>依据</strong>：<span class="pill accent">社区·运行时</span> claude-trace 早期抓到的子 agent 工具描述写着"每次调用无状态""只能回一条最终报告""所以你的任务描述要非常详细，并说清要它返回什么"，而且当时只给它只读工具。这几条至今仍是写子 agent 提示词的好规范。</p>
+<p><strong>为什么有效</strong>：搜索过程中读过、又被排除的文件，会产生大量和最终结论无关的"脏上下文"。子 agent 把这些隔离在自己的窗口里，主上下文只收下结论。</p>
+<p><strong>对应</strong>：<a href="ch05-context-engineering.html">第 5 章</a> · <a href="ch11-protocols.html">第 11 章</a></p>
+
+<h3>4.6 权限：规则、模式、分类器、沙箱四层叠加</h3>
+<p><strong>它怎么做</strong>（<span class="pill ok">官方</span>）：权限模式定基线，规则叠在上面——deny 规则在包括 bypassPermissions 在内的所有模式下都生效；ask 规则在任何模式下都不会被自动批准；关键路径的 rm 等少数操作永远要问。沙箱则从环境层面兜底：文件隔离加网络隔离，两者缺一不可。官方原话：没有网络隔离，被攻破的 agent 能把 SSH 密钥传出去；没有文件隔离，它能逃出沙箱拿到网络。</p>
+<p>两份基于公开源码的分析（Dibia 文章、how-claude-code-works 仓库）<span class="pill warn">泄露源码</span> 都提到，权限与命令安全是代码量最集中的地方之一：Bash 工具的绝大部分代码是安全校验（解析命令结构、识别注入与混淆、判断哪些命令是只读的），仓库把它归纳为"7 层纵深防御"。具体层数和实现属于内部细节，可学的是方向：<strong>越接近攻击面的工具，越要把校验做成确定性代码</strong>。</p>
+<p>下面的模拟器按官方"权限模式"文档的对照表实现。选一个模式和一类动作，看它会被怎样处理：</p>
+
+<div class="widget" id="permsim">
+  <div class="w-title">权限模式 × 动作 决策模拟器</div>
+  <div class="sim-grid">
+    <label>权限模式<select id="pmMode">
+      <option value="default">default（manual）：大多数动作先问</option>
+      <option value="acceptEdits">acceptEdits：自动接受文件编辑</option>
+      <option value="plan">plan：只探索、出方案</option>
+      <option value="auto" selected>auto：分类器代替你审批</option>
+      <option value="dontAsk">dontAsk：只跑预先批准的</option>
+      <option value="bypassPermissions">bypassPermissions：全部放行</option>
+    </select></label>
+    <label>动作<select id="pmAct">
+      <option value="read">读工作目录内的文件</option>
+      <option value="edit">编辑项目内的源文件</option>
+      <option value="fs">mkdir / mv 等常见文件命令</option>
+      <option value="shell" selected>运行没有规则覆盖的 shell 命令</option>
+      <option value="web">抓取网页</option>
+      <option value="allowRule">命中 allow 规则的命令（如 npm test）</option>
+      <option value="askRule">命中 ask 规则的工具</option>
+      <option value="denyRule">命中 deny 规则的工具</option>
+      <option value="rm">删除关键路径（如 rm -rf 家目录）</option>
+    </select></label>
+  </div>
+  <label style="display:block;margin-top:10px"><input type="checkbox" id="pmSandbox"> 开启 Bash 沙箱（文件 + 网络隔离）</label>
+  <div class="sim-result" id="pmOut"></div>
+  <p style="font-size:12.5px;color:var(--muted);margin:8px 0 0">规则依据 code.claude.com/docs 的 Permission modes 与 Sandboxing 页面（核实于 2026-11）。这里做了简化，实际行为以你所用版本的文档为准。</p>
+</div>
+
+<p><strong>对应</strong>：<a href="ch08-hitl-autonomy.html">第 8 章</a> · <a href="ch09-security.html">第 9 章</a></p>
+
+<h3>4.7 auto mode：用一个"看不见说辞"的分类器替代人工审批</h3>
+<p>这是 2026 年最值得精读的一篇 agent 安全工程文章（<span class="pill ok">官方</span>，How we built Claude Code auto mode，2026-03-25）。要点：</p>
+<ul>
+  <li><strong>动机是审批疲劳</strong>：用户实际上会批准约 93% 的权限提示，批得越多看得越不仔细。这个数字在《How we contain Claude》（2026-05-25）里再次出现。</li>
+  <li><strong>两层防御</strong>：输入层，一个服务端的提示注入探针扫描工具输出，可疑时在上下文里加警告；输出层，一个对话记录分类器在每个动作执行前审查。</li>
+  <li><strong>三级过滤</strong>：一级是内置的只读工具白名单和用户的 allow 规则（进入 auto 模式时会丢掉"放行任意代码执行"的宽泛规则，比如放行所有 python）；二级是项目目录内的文件编辑，直接放行，因为有版本控制兜底；只有剩下真正有风险的动作才进入三级，交给分类器。</li>
+  <li><strong>分类器看不到说辞</strong>：它只看用户消息和工具调用本身，去掉了 agent 自己的文字和工具结果。去掉文字，是为了不让 agent 用"用户之前默许了"之类的理由说服它；去掉工具结果，是主要的防注入手段。代价是分不清某个参数是查来的还是编的。</li>
+  <li><strong>两阶段</strong>：先用一个快速的单 token 判断，倾向拦截；被拦下的再用带推理的第二阶段复核。真实流量上误拦率从 8.5% 降到 0.4%，代价是在 52 个真实"越权"样本上漏放了 17%。文章把它称为"诚实的数字"，并明确说它不能替代对高风险基础设施的人工审查。</li>
+</ul>
+<p><strong>为什么值得学</strong>：它示范了一个安全组件该怎么<strong>带着评测上线</strong>——三个数据集、两项指标、按阶段拆开报告、直说漏放率。这正是第 13 章要求的做法。</p>
+<p><strong>对应</strong>：<a href="ch08-hitl-autonomy.html">第 8 章</a> · <a href="ch09-security.html">第 9 章</a> · <a href="ch13-evals.html">第 13 章</a></p>
+
+<h3>4.8 Hooks：给概率系统装上确定性的扳机</h3>
+<p><strong>它怎么做</strong>（<span class="pill ok">官方</span>）：几十个生命周期事件，分为每会话、每轮、每次工具调用三种节奏。退出码 0 表示放行，并应用输出的 JSON；<strong>退出码 2 表示阻断</strong>，stderr 作为理由；其他退出码只是非阻断错误，动作照常进行。所以"出错就 exit 1"拦不住任何东西，这是最常见的坑。Stop hook 能阻止 agent 停下，PreToolUse hook 能拒绝或改写工具调用。</p>
+<pre data-title=".claude/hooks/no-env.sh（示意：拦截读取 .env）"><code class="lang-bash">
+#!/bin/bash
+# PreToolUse 钩子：输入是 stdin 上的 JSON，Read 的 file_path 已被展开为绝对路径
+FILE=$(jq -r '.tool_input.file_path // empty')
+case "$FILE" in
+  */.env|*/.env.*)
+    echo "禁止读取环境变量文件：$FILE" >&2
+    exit 2   # 2 才会阻断；exit 1 只是"非阻断错误"，读取照样发生
+    ;;
+esac
+exit 0
+</code></pre>
+<p>注意这个钩子只挂在 Read 工具上，模型照样可以用 <code>cat .env</code> 绕过去。这正是官方把 hooks、deny 规则和沙箱分成不同层的原因：<strong>hook 管"在哪个时刻做什么确定性动作"，真正的访问边界要靠规则和沙箱</strong>。</p>
+<p><strong>对应</strong>：<a href="ch12-long-running.html">第 12 章</a> · <a href="ch10-durable-execution.html">第 10 章</a></p>
+
+<h3>4.9 CLAUDE.md 与 Skills：分层、按需的指令</h3>
+<p><strong>它怎么做</strong>（<span class="pill ok">官方</span>）：CLAUDE.md 有组织策略、用户、项目、本地等多个层级，每次会话都会载入，适合放"从代码里推断不出来"的约定；它还能读 AGENTS.md。Skills 是带 SKILL.md 的文件夹，会话开始只载入描述，被调用时才展开正文和附带文件，也就是三级渐进披露。auto memory 是 agent 自己写的笔记，启动时只载入开头一部分。</p>
+<p><strong>依据</strong>：<span class="pill accent">社区·运行时</span> MinusX 说有没有 claude.md 效果"天差地别"。<span class="pill ok">官方</span> 最佳实践的总前提是：上下文窗口填得很快，而且越满效果越差。所以常驻的指令要短，长的流程放进按需展开的 Skill。</p>
+<p><strong>对应</strong>：<a href="ch05-context-engineering.html">第 5 章</a> · <a href="ch06-memory.html">第 6 章</a> · <a href="ch11-protocols.html">第 11 章</a></p>
+
+<h3>4.10 headless 与 SDK：同一个循环，换个外壳</h3>
+<p><strong>它怎么做</strong>（<span class="pill ok">官方</span>）：<code>claude -p</code> 以无交互方式运行同一个 agentic loop；<code>--output-format</code> 支持 text、json（含结果、会话 ID 与元数据）和 stream-json（逐行 JSON 事件）；<code>--json-schema</code> 约束结构化输出；<code>--allowedTools</code> 预先批准工具；<code>--bare</code> 跳过 hooks、Skills、插件、MCP、记忆和 CLAUDE.md 的自动发现，让脚本运行可复现。Agent SDK 则是它的库形态。官方文档强调：终端、IDE、网页、CI 背后是同一个循环。</p>
+<p><strong>为什么重要</strong>：要编排编码 agent，应该走这条程序化的路，而不是去读终端画面。第 12 章和跟练项目 P7 用的就是它。</p>
+<p><strong>对应</strong>：<a href="ch12-long-running.html">第 12 章</a> · <a href="p7-coding-harness.html">P7</a></p>
+
+<h2>5 · 社区分析一览</h2>
+<table class="survey">
+<tr><th>分析</th><th>类型</th><th>作者 · 日期</th><th>方法</th><th>核心结论</th><th>可信度</th></tr>
+<tr><td><a href="https://minusx.ai/blog/decoding-claude-code" target="_blank" rel="noopener">What makes Claude Code so damn good</a></td><td>文章</td><td>vivek（MinusX）· 2025-08-21</td><td>拦截并记录网络请求，分析提示词与工具定义</td><td>保持简单：一个主循环、最多一个分支；大量使用小模型；claude.md；用 LLM 搜索代替 RAG；工具分层；让模型自己管理任务清单；写出决策算法，不要堆一锅"要/不要"</td><td><span class="pill accent">运行时</span> 提示词原文可信，但属于 2025 年中的版本；"过半调用走小模型"是他们自己日志的统计，单一来源</td></tr>
+<tr><td><a href="https://simonwillison.net/2025/Jun/2/claude-trace/" target="_blank" rel="noopener">claude-trace</a>（Simon Willison 的介绍）</td><td>运行时工具</td><td>Mario Zechner 开发 · 2025-06-02 介绍</td><td>给 Node 的 fetch 打补丁，记录自己会话的请求与响应，生成 HTML 报告</td><td>子 agent 被设计成一次调用、无状态、只回一份报告，并鼓励并发派出；Anthropic 选择不公开提示词，抓到的提示词是"缺失的说明书"</td><td><span class="pill accent">运行时</span> 观察的是你自己的真实请求，可信度高；内容随版本变化</td></tr>
+<tr><td><a href="https://github.com/Yuyz0112/claude-code-reverse" target="_blank" rel="noopener">claude-code-reverse（v2）</a></td><td>GitHub 仓库</td><td>Yuyz0112 · 2025-02 创建，v2 于 2025-07；约 2.5k 星</td><td>运行时请求日志 + 可视化工具；作者明确放弃了 v1 的"让 LLM 读混淆代码"做法</td><td>小模型用于配额检查、话题检测和摘要；任务清单写成 JSON 并经 system reminder 回灌；子 agent 把"脏上下文"隔离在子窗口里；压缩把上下文合成一段文本作为下一段对话的起点</td><td><span class="pill accent">运行时</span> 可信；作者提到依据 sourcemap 恢复源码的仓库已被下架</td></tr>
+<tr><td><a href="https://blog.promptlayer.com/claude-code-behind-the-scenes-of-the-master-agent-loop/" target="_blank" rel="noopener">Behind-the-scenes of the master agent loop</a></td><td>文章</td><td>Jonathan Pedoeem（PromptLayer）· 2025-08-29</td><td>综合社区逆向资料的二手综述</td><td>单线程主循环加一个可插话的异步队列；规则式搜索而不是向量库；用 Markdown 文件而不是数据库做记忆</td><td><span class="pill warn">推断</span> "nO/h2A"等内部代号来自对混淆代码的逆向；"约 92% 时触发压缩""同一时刻最多一个子 agent 分支"都是单一来源，后者与现行官方文档不符</td></tr>
+<tr><td><a href="https://vrungta.substack.com/p/claude-code-architecture-reverse" target="_blank" rel="noopener">Claude Code Architecture (Reverse Engineered)</a></td><td>文章</td><td>Vikash Rungta · 2026-02-17</td><td>运行时记录、~/.claude 下的文件、压力测试，加公开文档</td><td>"笨循环 + 原语工具"；上下文是最稀缺的资源；分层记忆；声明式扩展（.md / .json 而不是代码）；harness 应随模型变强而变薄</td><td><span class="pill warn">推断</span> 框架性总结很有价值；"约 50% 时自动压缩"与官方"接近上限时"不符</td></tr>
+<tr><td><a href="https://newsletter.victordibia.com/p/inside-claude-code" target="_blank" rel="noopener">Inside Claude Code</a></td><td>文章</td><td>Victor Dibia · 2026-04-06</td><td><strong>基于 2026-03-31 随 npm 包意外公开的源码</strong>。本课程只转述结论，不收录任何代码</td><td>循环约 1,700 行，其余约 51 万行是 harness；提示词约 6 万 token；上下文管理分三层；每条自动恢复路径都要有熔断（缺一个重试上限，曾让 1,279 个会话各自连续压缩失败 50 次以上，每天浪费约 25 万次 API 调用）；权限与安全代码约占 7.5%</td><td><span class="pill warn">泄露源码</span> 数字只反映那一个版本；来源性质特殊，结论可参考，细节不宜引用</td></tr>
+<tr><td><a href="https://github.com/shareAI-lab/learn-claude-code" target="_blank" rel="noopener">learn-claude-code</a></td><td>GitHub 仓库</td><td>shareAI-lab · 2025-06 创建，持续更新；约 8.1 万星，MIT</td><td>clean-room 教学实现：从零重写一个受 Claude Code 启发的 harness，分 17 节（曾用名 analysis_claude_code）</td><td>agent 产品 = 模型 + harness；把 Claude Code 拆成循环、工具、按需 Skills、压缩、子 agent、任务系统、worktree、权限、hooks、记忆、MCP 等可独立学习的部件</td><td><span class="pill ok">教学实现</span> 代码是自己写的，不代表官方内部实现；作为"怎么搭"的跟练材料价值最高</td></tr>
+<tr><td><a href="https://github.com/Piebald-AI/claude-code-system-prompts" target="_blank" rel="noopener">claude-code-system-prompts</a></td><td>GitHub 仓库</td><td>Piebald-AI · 2025-11 创建，每个版本发布后几分钟内更新；约 1.3 万星，MIT</td><td>用脚本从公开发布的 npm 包（编译产物）中提取提示词，并维护跨版本的变更记录</td><td>系统提示由 500 多段按条件拼接的文本组成；内置子 agent 与辅助功能各有提示词；几乎每个版本都在变</td><td><span class="pill accent">运行时</span> 文本来自官方发布的安装包，准确但属于 Anthropic 的内容；本课程只引用结论、不转载</td></tr>
+<tr><td><a href="https://windy3f3f3f3f.github.io/how-claude-code-works/" target="_blank" rel="noopener">how-claude-code-works</a>（分析文档站）</td><td>GitHub 仓库</td><td>Windy3f3f3f3f · 2026-03-31 创建；约 3.9k 星，MIT</td><td><strong>基于 2026-03-31 意外公开的源码快照</strong>；快照之后的新功能用字符串分析和抓包继续跟踪。仓库只含分析文档，声明不分发源码</td><td>主循环的故障恢复；4 级渐进式压缩；7 层纵深防御；查找替换式编辑与先读后改；带文件锁和依赖的任务系统；auto mode 的两段式分类器</td><td><span class="pill warn">泄露源码</span> 体系完整，但细节对应的是特定版本；与官方文档一致的部分可信，独有的数字按单一来源对待</td></tr>
+<tr><td>liuup/claude-code-analysis（不提供链接）</td><td>GitHub 仓库</td><td>liuup · 2026-03-31 创建；约 4.1k 星，无许可证</td><td><strong>基于泄露源码的静态阅读</strong>；仓库内直接附带了源码压缩包，因此本课程不链接</td><td>统一执行内核、分层记忆、基于 MCP 和 Skills 的扩展、本地沙箱与工具权限；数据外流点集中在模型交互、本地持久化和外部组件通信</td><td><span class="pill danger">托管泄露源码</span> 结论与其他来源一致，没有独有的新结论</td></tr>
+</table>
+<p style="font-size:13px;color:var(--muted)">星标数查询于 2026-11-25。表中仓库按影响力（星标）与内容质量挑选；托管泄露源码的仓库只列名字，不给链接。</p>
+
+<div class="callout danger"><b>社区说法与官方的冲突</b>
+<ul>
+  <li><strong>压缩时机</strong>："约 92% 触发"（PromptLayer）和"约 50% 触发"（Rungta）互相矛盾。官方只说"接近上限时"，并提供手动 <code>/compact</code> 和 Compact Instructions。以官方为准，阈值属于实现细节，会随版本变化。</li>
+  <li><strong>子 agent 并发</strong>：2025 年的分析说"最多一个分支"。官方现在支持后台运行的子 agent 和 fork，最佳实践还专门讨论了"子 agent 的成本"。</li>
+  <li><strong>提示词规模</strong>：MinusX（2025-08）抓到的系统提示约 2,800 token、工具定义约 9,400 token；2026-04 的分析给出的是系统提示约 1.9 万 token。这不是谁错了，而是<strong>同一个产品在 8 个月里的变化</strong>。Piebald 的变更记录显示提示词几乎每个版本都在变。引用这类数字时一定要带上日期和版本号。</li>
+</ul></div>
+
+<h2>6 · 值得借鉴 / 不宜照搬</h2>
+<div class="tabs">
+<div class="tab-panel" data-label="值得借鉴">
+<ul>
+  <li><strong>笨循环 + 厚 harness</strong>：主循环保持简单，工程投入放在工具安全、上下文预算、错误恢复和权限上。</li>
+  <li><strong>每条自动恢复路径都要有上限</strong>：官方的"压缩反复失败就停下报错"，和社区分析提到的那次事故，讲的是同一件事。</li>
+  <li><strong>安全靠环境，不只靠模型</strong>：《How we contain Claude》把防御分成环境、模型、外部内容三部分，并说明凭据从不进入沙箱。</li>
+  <li><strong>分类器只看动作，不看说辞</strong>：任何"让模型审另一个模型"的设计，都应该去掉被审方的自我辩护。</li>
+  <li><strong>任务清单外置 + 复述</strong>、<strong>子 agent 隔离脏上下文</strong>、<strong>常驻指令短、长流程按需展开</strong>。</li>
+  <li><strong>安全组件带着评测上线</strong>：报误拦率和漏放率，按阶段拆开，直说不足。</li>
+</ul>
+</div>
+<div class="tab-panel" data-label="不宜照搬">
+<ul>
+  <li><strong>长提示词和大量 IMPORTANT</strong>：Claude Code 的提示词很长，但它背后有海量遥测和评测在支撑每一条。小团队照搬这种写法，只会得到第 5 章说的"if-else 式提示词"。MinusX 自己也提醒：要写决策算法，别堆一锅"要/不要"。</li>
+  <li><strong>"大部分动作可以放行"</strong>：编码 agent 的动作大多在本地，有快照和 git 可以回滚。替你对外发消息的 agent，发出去的东西撤不回来，审批基线必须更严（第 8 章）。</li>
+  <li><strong>"不用向量检索"</strong>：代码结构化、术语稳定，grep 很好用。聊天记录、中文文档、同义表述多的语料，往往还是需要混合检索（第 7 章）。</li>
+  <li><strong>"笨循环就够了"</strong>：这个前提是模型足够强。换成较弱的模型时，往往需要更多脚手架，比如显式的计划步骤和更严格的工具约束。</li>
+</ul>
+</div>
+</div>
+
+<h2>7 · 对照复盘</h2>
+<p>把 Claude Code 的做法和两个真实项目放在一起看，差距最大的几处是：</p>
+<table>
+<tr><th>复盘条目</th><th>项目里的做法</th><th>Claude Code 的对应做法</th></tr>
+<tr><td><a href="review.html#f-D8">D8</a> 权限请求由另一个 LLM 代按</td><td>话题里的 agent 判断"安全且在授权范围内"就替编码 agent 按下确认</td><td>auto mode 用的是专门训练和评测过的分类器，看不到说辞，有公开的漏放率；deny 规则和关键路径在任何模式下都不放</td></tr>
+<tr><td><a href="review.html#f-D9">D9</a> 三要素集中在一个 agent</td><td>编码 agent 同时能读私有文档、查库、推代码，没有设置权限模式</td><td>沙箱同时做文件隔离和网络隔离，网络只经代理访问白名单域名；凭据不进沙箱</td></tr>
+<tr><td><a href="review.html#f-D6">D6</a> 驾驭交互式终端</td><td>读屏幕、读会话文件、读进程环境来猜状态</td><td>官方提供 <code>claude -p</code> 的 stream-json 事件流、会话 ID 与 resume，以及 Agent SDK</td></tr>
+<tr><td><a href="review.html#f-N17">N17</a> 工具面太宽</td><td>45 个工具每轮全量下发</td><td>MCP 工具定义默认延迟加载，经工具搜索按需取回；Skills 只常驻描述</td></tr>
+<tr><td><a href="review.html#f-N2">N2</a> 提示词成了 if-else</td><td>误判一次就加一条规则</td><td>同样有长提示词，但每条都有大规模遥测和评测支撑。没有这些支撑，就不该走这条路</td></tr>
+<tr><td><a href="review.html#f-N4">N4</a> 先改提示词、后补评测</td><td>87 个改提示词的提交里只有 17 个附了回放数据</td><td>auto mode 上线前，在三个数据集上按阶段报告了误拦率和漏放率</td></tr>
+</table>
+
+<h2>8 · 读文档练习</h2>
+<details><summary>练习 1：为什么 deny 规则在 bypassPermissions 下仍然生效，而 allow 规则反而没有作用？</summary>
+<p>去读 Permission modes 页面"Available modes"表格下面的说明。要点：bypassPermissions 本来就放行一切，allow 规则自然多余；deny 规则代表"无论如何都不许"的硬边界，必须独立于模式存在。这是"放权"和"边界"两件事分开配置的范例，对照第 8 章的信任矩阵。</p></details>
+<details><summary>练习 2：auto mode 的分类器为什么要去掉 agent 自己的文字和工具结果？代价是什么？</summary>
+<p>读 auto mode 文章"Design decisions"一节。去掉文字，是为了防止 agent 说服分类器；去掉工具结果，是主要的防注入手段。代价是分不清某个参数（比如作业 ID）是查来的还是编的。文章还报告了对比实验：保留这些内容反而让"越权"测试集上的表现变差。</p></details>
+<details><summary>练习 3：用运行时工具观察一次压缩</summary>
+<p>用 claude-trace 记录一次会话：先让它读几个大文件，再执行 <code>/compact</code>，对比压缩前后发出的请求，看系统提示、消息列表和那段摘要。这是合规、可复现的研究方法：观察的是你自己的流量，不涉及任何泄露的源码。</p></details>
+<details><summary>练习 4：写一个 PreToolUse 钩子，并说出它挡不住什么</summary>
+<p>照 4.8 节的示意写一个钩子，然后试着用 Bash 的 <code>cat</code> 绕过它。答案：钩子只挂在 Read 上，挡不住 shell。要真正封住，需要 deny 规则加上沙箱的文件隔离。读 Hooks 页面的"Exit code output"表，确认 exit 1 只是非阻断错误。</p></details>
+<details><summary>练习 5：对比两篇相隔 8 个月的分析</summary>
+<p>MinusX（2025-08）和 Dibia（2026-04）给出的提示词规模差了好几倍。请解释为什么不能说其中一篇错了，并总结引用闭源产品分析时应该记录哪些元数据：日期、版本、方法、来源性质。</p></details>
+
+<details><summary>练习 6：用 clean-room 实现对照本章</summary>
+<p>克隆 learn-claude-code，依次读 s01（循环）、s06（子 agent）、s08（上下文压缩）、s03/s04（权限与 hooks），每读完一节回到本章对应的 4.1、4.5、4.4、4.6/4.8，写下"教学实现省略了什么、生产实现多了什么"。例如：教学版的压缩通常只有一级，生产版是从便宜手段到全量摘要的多级管线，还要给反复失败的压缩加上限。</p></details>
+
+<div class="quiz" data-answer="3">
+<p class="q">你给 Claude Code 写了一个 PreToolUse hook，检测到危险命令时 <code>exit 1</code>。实际会发生什么？</p>
+<ol>
+  <li>命令被阻断，stderr 作为理由告诉模型</li>
+  <li>整个会话中止</li>
+  <li>记为非阻断错误，命令照常执行</li>
+  <li>转入询问用户</li>
+</ol>
+<div class="explain">官方 hooks 文档的规定：只有退出码 2 才是阻断，其他非零退出码一律是非阻断错误，动作继续进行。要阻断，就用 exit 2，或者输出带 <code>permissionDecision: "deny"</code> 的 JSON。</div>
+</div>
+
+<div class="quiz" data-answer="2">
+<p class="q">auto mode 的对话记录分类器审查一个动作时，能看到哪些内容？</p>
+<ol>
+  <li>完整对话：用户消息、agent 的推理与说明、工具结果</li>
+  <li>用户消息和 agent 的工具调用本身，去掉了 agent 的文字和工具结果</li>
+  <li>只有工具调用本身</li>
+  <li>只有工具结果</li>
+</ol>
+<div class="explain">只看工具调用会失去"用户想要什么"这个锚点，连用户明确要求的动作也会被拦；加上 agent 的文字，它又可能被说服；加上工具结果，又给了提示注入可乘之机。官方最终选了"用户消息 + 工具调用"，并给出了对比实验的结论。</div>
+</div>
+
+<div class="takeaways"><b>本章要点</b>
+<ul>
+  <li>Claude Code 的核心是一个简单的单线程循环，工程量集中在 harness：工具安全、上下文管线、错误恢复、权限。</li>
+  <li>上下文要"少装、按需取、可观察、会压缩"；子 agent 用来隔离脏上下文，不是用来分角色。</li>
+  <li>安全分四层叠加：规则、模式、分类器、沙箱；hook 是确定性的扳机，不是访问边界。</li>
+  <li>auto mode 示范了"让模型审模型"的正确姿势：只看动作不看说辞，带着评测上线。</li>
+  <li>引用闭源产品的分析时，要标出日期和来源性质；与官方冲突时以官方为准。</li>
+</ul></div>
+
+<h2>参考资料</h2>
+<ul class="refs">
+  <li><a href="https://code.claude.com/docs/en/how-claude-code-works" target="_blank" rel="noopener">How Claude Code works</a> <span class="src">官方文档 · agentic loop、会话、上下文、压缩、检查点与权限概览</span></li>
+  <li><a href="https://code.claude.com/docs/en/permission-modes" target="_blank" rel="noopener">Choose a permission mode</a> <span class="src">官方文档 · 六种模式与不会被自动批准的动作</span></li>
+  <li><a href="https://code.claude.com/docs/en/hooks" target="_blank" rel="noopener">Hooks reference</a> <span class="src">官方文档 · 生命周期事件与退出码语义</span></li>
+  <li><a href="https://code.claude.com/docs/en/sub-agents" target="_blank" rel="noopener">Subagents</a> · <a href="https://code.claude.com/docs/en/skills" target="_blank" rel="noopener">Skills</a> · <a href="https://code.claude.com/docs/en/memory" target="_blank" rel="noopener">Memory</a> · <a href="https://code.claude.com/docs/en/headless" target="_blank" rel="noopener">Headless</a> · <a href="https://code.claude.com/docs/en/best-practices" target="_blank" rel="noopener">Best practices</a> <span class="src">官方文档</span></li>
+  <li><a href="https://www.anthropic.com/engineering/claude-code-auto-mode" target="_blank" rel="noopener">How we built Claude Code auto mode</a> <span class="src">Anthropic · 2026-03-25</span></li>
+  <li><a href="https://www.anthropic.com/engineering/claude-code-sandboxing" target="_blank" rel="noopener">Beyond permission prompts: making Claude Code more secure and autonomous</a> <span class="src">Anthropic · 2025-10-20 · 内部使用中权限提示减少 84%</span></li>
+  <li><a href="https://www.anthropic.com/engineering/how-we-contain-claude" target="_blank" rel="noopener">How we contain Claude across products</a> <span class="src">Anthropic · 2026-05-25 · 三类风险、三个防御层面</span></li>
+  <li><a href="https://www.anthropic.com/engineering/writing-tools-for-agents" target="_blank" rel="noopener">Writing effective tools for agents — with agents</a> <span class="src">Anthropic · 2025-09-11</span></li>
+  <li><a href="https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents" target="_blank" rel="noopener">Effective context engineering for AI agents</a> <span class="src">Anthropic · 2025-09-29</span></li>
+  <li><a href="https://www.anthropic.com/engineering/effective-harnesses-for-long-running-agents" target="_blank" rel="noopener">Effective harnesses for long-running agents</a> <span class="src">Anthropic · 2025-11-26</span></li>
+  <li><a href="https://minusx.ai/blog/decoding-claude-code" target="_blank" rel="noopener">What makes Claude Code so damn good</a> <span class="src">MinusX · 2025-08-21 · 社区·运行时</span></li>
+  <li><a href="https://simonwillison.net/2025/Jun/2/claude-trace/" target="_blank" rel="noopener">claude-trace</a> <span class="src">Simon Willison · 2025-06-02 · 介绍 Mario Zechner 的运行时抓取工具</span></li>
+  <li><a href="https://github.com/Yuyz0112/claude-code-reverse" target="_blank" rel="noopener">claude-code-reverse</a> <span class="src">Yuyz0112 · 2025-07 · 社区·运行时</span></li>
+  <li><a href="https://blog.promptlayer.com/claude-code-behind-the-scenes-of-the-master-agent-loop/" target="_blank" rel="noopener">Claude Code: Behind-the-scenes of the master agent loop</a> <span class="src">PromptLayer · 2025-08-29 · 社区·推断</span></li>
+  <li><a href="https://vrungta.substack.com/p/claude-code-architecture-reverse" target="_blank" rel="noopener">Claude Code Architecture (Reverse Engineered)</a> <span class="src">Vikash Rungta · 2026-02-17 · 社区·推断</span></li>
+  <li><a href="https://github.com/shareAI-lab/learn-claude-code" target="_blank" rel="noopener">shareAI-lab/learn-claude-code</a> <span class="src">GitHub · clean-room 教学实现，17 节</span></li>
+  <li><a href="https://github.com/Piebald-AI/claude-code-system-prompts" target="_blank" rel="noopener">Piebald-AI/claude-code-system-prompts</a> <span class="src">GitHub · 从公开 npm 包提取的提示词与跨版本变更记录</span></li>
+  <li><a href="https://windy3f3f3f3f.github.io/how-claude-code-works/" target="_blank" rel="noopener">How Claude Code Works（分析文档站）</a> <span class="src">Windy3f3f3f3f · 基于意外公开的源码快照，仅转述结论</span></li>
+  <li><a href="https://newsletter.victordibia.com/p/inside-claude-code" target="_blank" rel="noopener">Inside Claude Code</a> <span class="src">Victor Dibia · 2026-04-06 · 基于意外公开的源码，仅转述结论</span></li>
+</ul>
+</article>
+
+<script>
+window.addEventListener('DOMContentLoaded', () => {
+  // 依据官方 Permission modes 表格与"不会被自动批准的动作"清单做的简化映射
+  const A = { allow: ['allow', '直接执行'], ask: ['ask', '先问你'], deny: ['deny', '拒绝'], review: ['review', '交给分类器审查'], none: ['deny', '不执行'] };
+  const M = {
+    default: { read: 'allow', edit: 'ask', fs: 'ask', shell: 'ask', web: 'ask', allowRule: 'allow', askRule: 'ask', denyRule: 'deny', rm: 'ask' },
+    acceptEdits: { read: 'allow', edit: 'allow', fs: 'allow', shell: 'ask', web: 'ask', allowRule: 'allow', askRule: 'ask', denyRule: 'deny', rm: 'ask' },
+    plan: { read: 'allow', edit: 'none', fs: 'none', shell: 'review', web: 'review', allowRule: 'allow', askRule: 'ask', denyRule: 'deny', rm: 'ask' },
+    auto: { read: 'allow', edit: 'allow', fs: 'review', shell: 'review', web: 'review', allowRule: 'allow', askRule: 'ask', denyRule: 'deny', rm: 'ask' },
+    dontAsk: { read: 'allow', edit: 'deny', fs: 'deny', shell: 'deny', web: 'deny', allowRule: 'allow', askRule: 'deny', denyRule: 'deny', rm: 'deny' },
+    bypassPermissions: { read: 'allow', edit: 'allow', fs: 'allow', shell: 'allow', web: 'allow', allowRule: 'allow', askRule: 'ask', denyRule: 'deny', rm: 'ask' },
+  };
+  const WHY = {
+    read: '读工作目录内的文件在所有模式下都不需要审批。',
+    edit: { default: 'manual 模式下编辑文件前会先问。', acceptEdits: 'acceptEdits 的意义就是自动接受文件编辑。', plan: 'plan 模式只探索、出方案，不改源文件；方案批准后才动手。', auto: 'auto 模式把项目目录内的编辑直接放行（不调分类器），因为有版本控制和快照兜底。', dontAsk: 'dontAsk 下凡是需要询问的都直接拒绝，除非预先批准了该工具。', bypassPermissions: 'bypassPermissions 放行一切，只应在隔离的容器或虚拟机里用。' },
+    fs: { default: 'manual 模式下会先问。', acceptEdits: 'acceptEdits 会放行 mkdir、touch、mv、cp 等常见文件命令。', plan: 'plan 模式不做修改。', auto: '会修改文件系统的 shell 命令属于有风险的动作，进入分类器审查。', dontAsk: '没有预先批准就拒绝。', bypassPermissions: '全部放行。' },
+    shell: { default: '没有规则覆盖的命令会先问。', acceptEdits: 'acceptEdits 只放行文件编辑和常见文件命令，其他命令仍然先问。', plan: 'plan 模式下只有分类器认可的命令才能运行（需要 auto 模式可用）。', auto: 'shell 命令进入第三级，由分类器审查：先走快速过滤，被拦下的再用推理复核。', dontAsk: '没有预先批准就拒绝，适合锁死的 CI。', bypassPermissions: '全部放行。' },
+    web: { default: '联网前会先问。', acceptEdits: '联网前仍然先问。', plan: '由分类器判断。', auto: '网页抓取进入分类器审查。', dontAsk: '没有预先批准就拒绝。', bypassPermissions: '全部放行。' },
+    allowRule: '命中 allow 规则就直接执行（在 bypassPermissions 下 allow 规则没有作用，因为本来就全部放行）。注意：进入 auto 模式时，像"放行所有 python"这类宽泛规则会被丢弃。',
+    askRule: '显式的 ask 规则在任何模式下都不会被自动批准；dontAsk 模式下需要询问的一律拒绝。',
+    denyRule: 'deny 规则在所有模式下都生效，包括 bypassPermissions。这是与模式无关的硬边界。',
+    rm: '对关键路径的 rm / rmdir 在任何模式下都不会被自动批准，allow 规则和 PreToolUse hook 的"允许"也不行（bypassPermissions 下可以手动关掉这个提示）。',
+  };
+  const mode = document.getElementById('pmMode');
+  const act = document.getElementById('pmAct');
+  const sb = document.getElementById('pmSandbox');
+  const out = document.getElementById('pmOut');
+  const render = () => {
+    let r = M[mode.value][act.value];
+    let why = typeof WHY[act.value] === 'string' ? WHY[act.value] : WHY[act.value][mode.value];
+    if (sb.checked && act.value === 'shell' && (mode.value === 'default' || mode.value === 'acceptEdits')) {
+      r = 'allow';
+      why = '开启沙箱并允许沙箱内自动执行后，命令在操作系统级的文件与网络隔离里直接运行（官方内部数据：权限提示减少 84%）；一旦要访问沙箱外的路径或未批准的域名，才会通知你。';
+    } else if (sb.checked && (act.value === 'shell' || act.value === 'fs')) {
+      why += ' 另外，即使命令被放行，在沙箱里它也碰不到边界之外的文件和网络。';
+    }
+    const [cls, label] = A[r];
+    out.className = 'sim-result ' + cls;
+    out.innerHTML = `<b>${label}</b>${why}`;
+  };
+  [mode, act, sb].forEach((x) => x.addEventListener('change', render));
+  render();
+});
+</script>
+</body>
+</html>

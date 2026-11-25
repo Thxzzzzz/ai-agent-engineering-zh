@@ -1,0 +1,364 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SWE-agent · AI Agent 工程</title>
+<meta name="description" content="研读 SWE-agent 与 mini-swe-agent：Agent-Computer Interface（ACI）的设计——窗口化查看、限量搜索、编辑即校验、提交前复查，以及一年后为什么只剩 bash。">
+<link rel="stylesheet" href="assets/css/course.css">
+<script src="assets/js/manifest.js"></script>
+<script defer src="assets/js/course.js"></script>
+<style>
+  .aci-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; margin: 8px 0; }
+  .aci-grid button.on, .aci-iface button.on { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .aci-iface { display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0 4px; }
+  .aci-obs { font: 12.5px/1.55 var(--mono); background: var(--code-bg); color: var(--code-text); border-radius: 8px; padding: 12px 14px; white-space: pre-wrap; word-break: break-word; max-height: 320px; overflow: auto; margin-top: 10px; }
+  .aci-meta { display: flex; flex-wrap: wrap; gap: 18px; margin-top: 10px; }
+</style>
+</head>
+<body data-page="case-swe-agent">
+<article id="content">
+<div class="eyebrow">第六部分 · 名作研读</div>
+<h1>SWE-agent 与 mini-swe-agent：为 agent 设计接口</h1>
+<p class="lead">2024 年，SWE-agent 提出了一个影响深远的观点：<strong>agent 是一类新的"用户"，它需要专门为它设计的界面</strong>。一年后，同一个团队写出了只用 bash、agent 类不到两百行的 mini-swe-agent，并建议大家改用它。把这两个仓库放在一起读，能同时学到"接口怎么设计"和"脚手架什么时候该拆"。</p>
+<div class="meta"><span>约 40 分钟</span><span>前置：第 3、4、12 章</span><span>研读版本：SWE-agent @ 3ea751c（2026-07-16）· mini-swe-agent @ 04d809c（2026-09-03）</span></div>
+
+<div class="goals"><b>学完你能</b>
+<ul>
+  <li>用 ACI（Agent-Computer Interface）的视角审视自己的工具：agent 看到的观察是否简洁、可定位、可行动</li>
+  <li>说出 SWE-agent 的几项接口设计：窗口化查看、限量搜索、编辑即校验、交互命令拦截、提交前复查</li>
+  <li>读懂 mini-swe-agent 的完整循环，理解"只剩 bash"背后保留了哪些关键约束</li>
+  <li>判断自己系统里哪些脚手架已经"不再承重"，可以拆掉</li>
+</ul></div>
+
+<h2>1 · 速览</h2>
+<div class="cards">
+  <div class="card"><span class="tag">SWE-agent</span><b>SWE-agent/SWE-agent</b><small>Python · MIT · 研读版本 3ea751c（2026-07-16）。核心包 sweagent/ 约 1.1 万行，工具以"bundle"形式放在 tools/ 下，由一个 YAML 配置文件组装。</small></div>
+  <div class="card"><span class="tag">mini-swe-agent</span><b>SWE-agent/mini-swe-agent</b><small>Python · MIT · 研读版本 04d809c（2026-09-03，v2）。agent 类 <code>agents/default.py</code> 共 190 行，去掉空行、注释和文档字符串后 158 行。</small></div>
+  <div class="card"><span class="tag">论文</span><b>SWE-agent: Agent-Computer Interfaces Enable Automated Software Engineering</b><small>John Yang 等，arXiv 2024-05-06。</small></div>
+  <div class="card"><span class="tag">一句话定位</span><b>接口设计的教科书</b><small>SWE-agent 讲"为 agent 设计界面"，mini-swe-agent 讲"模型变强后界面可以缩到多小"。</small></div>
+</div>
+
+<div class="callout warn"><b>作者自己的建议</b>
+<p>研读版本的 SWE-agent README 顶部写着：团队目前的主要精力在 mini-swe-agent 上，它"已经取代了 SWE-agent，性能相当，却简单得多"，建议今后改用 mini-swe-agent。所以本章读 SWE-agent 是为了理解 ACI 的设计思想，读 mini-swe-agent 是为了看今天的最佳实践。</p></div>
+
+<h2>2 · 为什么读它</h2>
+<p>第 3 章讲工具设计时有几条原则：工具要少而精、返回要限量、错误信息要告诉模型下一步该怎么做。这些原则听起来像常识，但很少有项目像 SWE-agent 这样，<strong>把它们当作研究问题</strong>，做成可配置的部件，再用基准测试证明它们有效。</p>
+<p>更难得的是后半段故事。mini-swe-agent 的 README 写道：2024 年他们非常重视工具和专门的界面，但"一年后，随着模型能力提升，很多东西已经完全不需要了"。这正是第 12 章引用 Anthropic 的那句话："拆掉不再承重的组件"。同一个团队亲手做了这次拆除，而且把前后两个版本都开源了，这是很少见的学习材料。</p>
+
+<h2>3 · ACI：agent 是一类新的用户</h2>
+<p>论文摘要的核心论证只有三句：</p>
+<ul>
+  <li>人类做软件工程时会借助 IDE 这样强大的工具；LM agent 是"一类新的终端用户，有自己的需求和能力"，同样应该有专门为它打造的界面。</li>
+  <li>SWE-agent 的定制 ACI 显著增强了 agent 创建和编辑代码、浏览整个仓库、执行测试与程序的能力。</li>
+  <li>在 SWE-bench 和 HumanEvalFix 上分别取得 12.5% 和 87.7% 的 pass@1（2024 年发表时的最佳成绩），远超此前的非交互式方法。</li>
+</ul>
+<p>把"给人用的界面"直接给 agent 用，会出什么问题？人看一个 1200 行的文件，会滚动、会用目录跳转，会选择性地看；agent 用 <code>cat</code> 打开它，1200 行就全部进了上下文。人搜索得到 2000 条结果会换个关键词；agent 可能把 2000 条都读一遍。人用 vim 编辑，agent 一打开 vim 就卡死了。ACI 要解决的就是这类"界面与使用者不匹配"的问题。</p>
+
+<h2>4 · 两个仓库的架构对照</h2>
+<figure>
+<div class="diagram">
+<svg viewBox="0 0 760 360" width="760" role="img" aria-label="SWE-agent 与 mini-swe-agent 架构对照">
+  <text class="tb" x="190" y="26" text-anchor="middle">SWE-agent（2024）</text>
+  <text class="tb" x="570" y="26" text-anchor="middle">mini-swe-agent v2（2025–）</text>
+  <path class="line dash" d="M380 14 L380 350"/>
+
+  <rect class="box a" x="40" y="44" width="300" height="50" rx="10"/>
+  <text class="t" x="190" y="66" text-anchor="middle">DefaultAgent（agents.py）</text>
+  <text class="ts" x="190" y="84" text-anchor="middle">解析 · 重问（最多 3 次）· 提交复查</text>
+  <rect class="box g" x="40" y="108" width="140" height="50" rx="8"/>
+  <text class="t" x="110" y="130" text-anchor="middle">历史处理器</text>
+  <text class="ts" x="110" y="148" text-anchor="middle">省略旧观察 · 缓存标记</text>
+  <rect class="box v" x="200" y="108" width="140" height="50" rx="8"/>
+  <text class="t" x="270" y="130" text-anchor="middle">模型适配</text>
+  <text class="ts" x="270" y="148" text-anchor="middle">function calling</text>
+  <rect class="box b" x="40" y="172" width="300" height="96" rx="10"/>
+  <text class="t" x="190" y="194" text-anchor="middle">工具 bundle（tools/）</text>
+  <text class="ts" x="190" y="214" text-anchor="middle">windowed：open · goto · scroll</text>
+  <text class="ts" x="190" y="232" text-anchor="middle">search：search_dir · find_file</text>
+  <text class="ts" x="190" y="250" text-anchor="middle">edit（lint 校验）· submit（复查）</text>
+  <rect class="box w" x="40" y="282" width="300" height="50" rx="10"/>
+  <text class="t" x="190" y="304" text-anchor="middle">SWE-ReX 部署</text>
+  <text class="ts" x="190" y="322" text-anchor="middle">Docker 等沙箱里的有状态 shell</text>
+
+  <rect class="box a" x="420" y="44" width="300" height="50" rx="10"/>
+  <text class="t" x="570" y="66" text-anchor="middle">DefaultAgent（default.py，190 行）</text>
+  <text class="ts" x="570" y="84" text-anchor="middle">线性消息 · 步数/费用/时间上限</text>
+  <rect class="box v" x="420" y="108" width="300" height="50" rx="8"/>
+  <text class="t" x="570" y="130" text-anchor="middle">模型：唯一的 bash 工具</text>
+  <text class="ts" x="570" y="148" text-anchor="middle">另有纯文本解析的变体</text>
+  <rect class="box b" x="420" y="172" width="300" height="96" rx="10"/>
+  <text class="t" x="570" y="194" text-anchor="middle">观察模板（config/default.yaml）</text>
+  <text class="ts" x="570" y="214" text-anchor="middle">超 1 万字符：警告 + 首尾各 5000</text>
+  <text class="ts" x="570" y="232" text-anchor="middle">格式错误模板 · 连续 3 次即退出</text>
+  <text class="ts" x="570" y="250" text-anchor="middle">首行暗号即提交</text>
+  <rect class="box w" x="420" y="282" width="300" height="50" rx="10"/>
+  <text class="t" x="570" y="304" text-anchor="middle">Environment.execute()</text>
+  <text class="ts" x="570" y="322" text-anchor="middle">每步一个独立子进程 · 超时杀进程组</text>
+
+  <path class="line" d="M190 94 L190 108"/><path class="line" d="M190 158 L190 172"/><path class="line" d="M190 268 L190 282"/>
+  <path class="line" d="M570 94 L570 108"/><path class="line" d="M570 158 L570 172"/><path class="line" d="M570 268 L570 282"/>
+</svg>
+</div>
+<figcaption>图 C4-1 左边的"界面"由专门的工具承担；右边只有 bash，界面缩成了一个观察模板。</figcaption>
+</figure>
+
+<h2>5 · 一次请求的旅程：mini-swe-agent 的完整循环</h2>
+<p>mini-swe-agent 的循环短到可以在一个动画里讲完。每一步都对应 <code>agents/default.py</code> 或 <code>environments/local.py</code> 里的真实代码。</p>
+
+<figure class="anim" data-dim>
+<div class="diagram">
+<svg viewBox="0 0 760 300" width="760" role="img" aria-label="mini-swe-agent 的循环">
+  <g data-k="run"><rect class="box a" x="20" y="30" width="150" height="58" rx="10"/><text class="t" x="95" y="54" text-anchor="middle">run()</text><text class="ts" x="95" y="74" text-anchor="middle">渲染两条初始消息</text></g>
+  <g data-k="query"><rect class="box v" x="210" y="30" width="160" height="58" rx="10"/><text class="t" x="290" y="54" text-anchor="middle">query()</text><text class="ts" x="290" y="74" text-anchor="middle">先查上限，再问模型</text></g>
+  <g data-k="exec"><rect class="box b" x="410" y="30" width="160" height="58" rx="10"/><text class="t" x="490" y="54" text-anchor="middle">execute_actions()</text><text class="ts" x="490" y="74" text-anchor="middle">env.execute(命令)</text></g>
+  <g data-k="sub"><rect class="box w" x="610" y="30" width="130" height="58" rx="10"/><text class="t" x="675" y="54" text-anchor="middle">子进程</text><text class="ts" x="675" y="74" text-anchor="middle">shell=True · 超时</text></g>
+  <g data-k="obs"><rect class="box g" x="410" y="140" width="160" height="58" rx="10"/><text class="t" x="490" y="164" text-anchor="middle">观察模板</text><text class="ts" x="490" y="184" text-anchor="middle">returncode · 输出/截断</text></g>
+  <g data-k="msgs"><rect class="box m" x="20" y="140" width="180" height="58" rx="10"/><text class="t" x="110" y="164" text-anchor="middle">self.messages</text><text class="ts" x="110" y="184" text-anchor="middle">线性追加 · 每步落盘</text></g>
+  <g data-k="fmt"><rect class="box r" x="210" y="232" width="160" height="52" rx="10"/><text class="t" x="290" y="254" text-anchor="middle">FormatError</text><text class="ts" x="290" y="272" text-anchor="middle">回灌格式错误模板</text></g>
+  <g data-k="exit"><rect class="box g" x="610" y="232" width="130" height="52" rx="10"/><text class="t" x="675" y="254" text-anchor="middle">exit 消息</text><text class="ts" x="675" y="272" text-anchor="middle">Submitted / 超限</text></g>
+  <g data-k="e1"><path class="line a" d="M170 59 L210 59" marker-end="url(#arr-a)"/></g>
+  <g data-k="e2"><path class="line b" d="M370 59 L410 59" marker-end="url(#arr-b)"/><path class="line b" d="M570 59 L610 59" marker-end="url(#arr-b)"/></g>
+  <g data-k="e3"><path class="line g" d="M675 88 L675 110 L490 110 L490 140" marker-end="url(#arr-g)"/></g>
+  <g data-k="e4"><path class="line g" d="M410 169 L200 169" marker-end="url(#arr-g)"/></g>
+  <g data-k="e5"><path class="line r" d="M290 88 L290 232" marker-end="url(#arr-r)"/></g>
+  <g data-k="e6"><path class="line g" d="M675 88 L675 232" marker-end="url(#arr-g)"/></g>
+</svg>
+</div>
+<ol class="anim-steps">
+  <li data-show="run msgs e1" data-hl="run msgs">它总共只有两条初始消息：系统模板和任务模板，用 Jinja2 渲染，变量缺失会直接报错（<code>StrictUndefined</code>）。之后进入 <code>while True</code>，每一轮就是 <code>step() = execute_actions(query())</code>。</li>
+  <li data-show="query" data-hl="query e1"><code>query()</code> 先检查上限：步数（<code>step_limit</code>）、费用（<code>cost_limit</code>，默认 3.0 美元）、墙钟时间。超了就抛出携带 exit 消息的异常。然后调用模型，把回复追加到 <code>self.messages</code>。</li>
+  <li data-show="exec sub e2" data-hl="exec sub e2">回复里的动作交给 <code>env.execute()</code>。本地环境用 <code>Popen(shell=True)</code> 起一个<strong>新的子进程</strong>，默认超时 30 秒；超时会杀掉整个进程组，避免留下孤儿进程。每一步都是独立进程，没有常驻的 shell 会话。</li>
+  <li data-show="obs e3 e4" data-hl="obs e3 e4">输出套进观察模板：先给 <code>returncode</code>；输出不到 1 万字符就原样给出，超过了就先给一段警告，告诉模型该改用 head、tail、sed 或更精确的搜索，再给首尾各 5000 字符和被省略的字符数。观察追加进消息列表。</li>
+  <li data-show="fmt e5" data-hl="fmt e5">如果回复里没有工具调用、调用了未知工具或参数不合法（纯文本变体则要求恰好一个 bash 代码块），就抛 <code>FormatError</code>，把格式错误模板作为一条消息回灌；连续 3 次格式错误就以 <code>RepeatedFormatError</code> 退出。回复被截断（<code>finish_reason</code> 为 length）时，模板会专门提醒"简短一点"。</li>
+  <li data-show="exit e6" data-hl="exit e6">怎么结束？命令输出的第一行是 <code>COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT</code> 且返回码为 0，环境就抛出 <code>Submitted</code>，后面的输出就是提交内容。循环看到最后一条消息的角色是 <code>exit</code> 就停下。</li>
+  <li data-hl="msgs">贯穿始终：每一步都在 <code>finally</code> 里把完整轨迹写到文件。因为历史是线性的，"轨迹"和"送给模型的消息"是同一个东西，调试和拿去做微调都很方便。</li>
+</ol>
+<figcaption>图 C4-2 mini-swe-agent 的控制流：上限、格式错误和提交都是"携带一条消息的异常"，循环只看最后一条消息的角色。</figcaption>
+</figure>
+
+<h2>6 · 关键设计拆解</h2>
+
+<h3>6.1 窗口化查看：给 agent 一个"屏幕"</h3>
+<p><strong>它怎么做</strong>：SWE-agent 的 <code>windowed</code> 工具包提供 <code>open</code>、<code>goto</code>、<code>scroll_up</code>、<code>scroll_down</code>、<code>create</code>。打开文件后只显示一个窗口（示例配置里 <code>WINDOW: 100</code> 行，翻页时重叠 <code>OVERLAP: 2</code> 行），并带上定位信息：</p>
+<pre data-title="窗口输出的格式（据 windowed_file.py 的 get_window_text 整理，示意）"><code>
+[File: src/report/export.py (1200 lines total)]
+(40 more lines above)
+41:def export_monthly(rows, dept=None):
+42:    ...
+(1060 more lines below)
+</code></pre>
+<p>"当前打开的是哪个文件、窗口在哪"由工具自己保存在状态里（配置里的 <code>state_command: "_state"</code>），后续的 <code>edit</code> 不需要模型再传文件路径。</p>
+<p><strong>源码</strong>：<a href="https://github.com/SWE-agent/SWE-agent/blob/3ea751c087f32b16e039a2233dd6eefecef325d5/tools/windowed/config.yaml" target="_blank" rel="noopener">tools/windowed/config.yaml</a>、<a href="https://github.com/SWE-agent/SWE-agent/blob/3ea751c087f32b16e039a2233dd6eefecef325d5/tools/windowed/lib/windowed_file.py#L150" target="_blank" rel="noopener">windowed_file.py:150</a>、<a href="https://github.com/SWE-agent/SWE-agent/blob/3ea751c087f32b16e039a2233dd6eefecef325d5/config/coding_challenge.yaml#L81" target="_blank" rel="noopener">config/coding_challenge.yaml:81</a>。</p>
+<p><strong>为什么这样设计</strong>：整份文件进上下文会挤占注意力（第 5 章的 context rot），而只给一段代码又会让 agent 迷失方向。状态行和"上面还有多少行、下面还有多少行"让它始终知道自己在哪。注意：研读版本的默认配置已经改用 <code>edit_anthropic</code> 编辑器（类似 str_replace 的编辑方式，注释说明其文档字符串取自 OpenHands），窗口化工具保留在其他配置里。</p>
+<p><strong>对应章节</strong>：<a href="ch03-structured-tools.html">第 3 章</a>（工具返回的分页与截断）、<a href="ch05-context-engineering.html">第 5 章</a>。</p>
+
+<h3>6.2 限量搜索：结果太多就拒绝，并告诉它怎么办</h3>
+<p><strong>它怎么做</strong>：<code>search_dir</code> 不返回匹配行，只返回"哪些文件、各命中几次"；命中的文件超过 100 个，就直接拒绝，输出 <code>More than N files matched … Please narrow your search.</code>。</p>
+<p><strong>源码</strong>：<a href="https://github.com/SWE-agent/SWE-agent/blob/3ea751c087f32b16e039a2233dd6eefecef325d5/tools/search/bin/search_dir#L29" target="_blank" rel="noopener">tools/search/bin/search_dir:29</a>。</p>
+<p><strong>为什么这样设计</strong>：一次宽泛的搜索可能返回上千行，既浪费 token，又把真正有用的结果淹没。返回"文件 + 命中数"让 agent 先定位、再打开；超限时给出明确的下一步（缩小范围），而不是默默截断。这和 Anthropic《Writing effective tools for agents》说的"限量、分页，并给出可执行的错误信息"完全一致。</p>
+
+<h3>6.3 编辑即校验：语法错了就不落盘</h3>
+<p><strong>它怎么做</strong>：<code>windowed_edit_linting</code> 的 <code>edit</code> 命令先对原文件跑一遍 flake8，执行编辑后再跑一遍，<strong>只比较本次编辑新引入的错误</strong>。有新错误就撤销编辑，并把这段提示回给模型：</p>
+<pre data-title="摘自 tools/windowed_edit_linting/bin/edit（MIT，节选）"><code>
+Your proposed edit has introduced new syntax error(s). Please read this error message carefully and then retry editing the file.
+
+ERRORS:
+{errors}
+
+This is how your edit would have looked if applied
+...
+This is the original code before your edit
+...
+Your changes have NOT been applied. Please fix your edit command and try again.
+DO NOT re-run the same failed edit command. Running it again will lead to the same error.
+</code></pre>
+<p><strong>源码</strong>：<a href="https://github.com/SWE-agent/SWE-agent/blob/3ea751c087f32b16e039a2233dd6eefecef325d5/tools/windowed_edit_linting/bin/edit#L27" target="_blank" rel="noopener">edit:27</a>（提示模板）、<a href="https://github.com/SWE-agent/SWE-agent/blob/3ea751c087f32b16e039a2233dd6eefecef325d5/tools/windowed_edit_linting/bin/edit#L94" target="_blank" rel="noopener">edit:94</a>（前后两次 lint 与撤销）。</p>
+<p><strong>为什么这样设计</strong>：这是第 3 章"防呆设计"（poka-yoke）的典型例子：不是在提示词里叮嘱"注意缩进"，而是让工具本身拒绝坏的结果。错误信息同时给出"改了会怎样"和"原来是怎样"，模型不用再打开一次文件；最后一句"不要重复执行同一条失败的命令"，直接针对第 4 章说的绕圈问题。只报"新增"错误也很关键：老代码里本来就有的告警不该算到这次编辑头上。</p>
+
+<h3>6.4 护栏：交互命令黑名单、重问上限、提交前复查</h3>
+<p><strong>它怎么做</strong>：</p>
+<ul>
+  <li><strong>交互命令黑名单</strong>：以 <code>vim</code>、<code>vi</code>、<code>emacs</code>、<code>nano</code>、<code>less</code>、<code>tail -f</code>、<code>gdb</code>、<code>make</code> 等开头的命令会被拦下；单独一个 <code>python</code>、<code>bash</code>、<code>sh</code> 这类会进入交互模式的命令也会被拦下。</li>
+  <li><strong>重问</strong>：格式错误或被拦截的命令不会执行，agent 会带着错误信息重新询问模型，默认最多 3 次（<code>max_requeries</code>）。</li>
+  <li><strong>提交前复查</strong>：默认配置启用的 <code>review_on_submit_m</code> 让第一次 <code>submit</code> 不真正提交，而是把完整 diff 和一份复查清单回灌给模型：重跑复现脚本、删掉复现脚本、还原被改动的测试文件。复查阶段走完后再次 <code>submit</code> 才算数。</li>
+</ul>
+<p><strong>源码</strong>：<a href="https://github.com/SWE-agent/SWE-agent/blob/3ea751c087f32b16e039a2233dd6eefecef325d5/sweagent/tools/tools.py#L37" target="_blank" rel="noopener">sweagent/tools/tools.py:37</a>、<a href="https://github.com/SWE-agent/SWE-agent/blob/3ea751c087f32b16e039a2233dd6eefecef325d5/sweagent/agent/agents.py#L1062" target="_blank" rel="noopener">agents.py:1062</a>、<a href="https://github.com/SWE-agent/SWE-agent/blob/3ea751c087f32b16e039a2233dd6eefecef325d5/tools/review_on_submit_m/bin/submit" target="_blank" rel="noopener">review_on_submit_m/bin/submit</a>、<a href="https://github.com/SWE-agent/SWE-agent/blob/3ea751c087f32b16e039a2233dd6eefecef325d5/config/default.yaml#L41" target="_blank" rel="noopener">config/default.yaml:41</a>。</p>
+<p><strong>为什么这样设计</strong>：交互命令会让 agent 卡在一个永远等不到输入的进程里，必须在执行前就挡住。"提交前复查"是对付第 12 章"过早宣布完成"的一种低成本做法：不需要另一个评估模型，只需要在 agent 自认为完成的那一刻，逼它对照 diff 再看一眼。</p>
+<p><strong>对应章节</strong>：<a href="ch04-agent-loop.html">第 4 章</a>（错误回灌与停止条件）、<a href="ch12-long-running.html">第 12 章</a>。</p>
+
+<h3>6.5 历史处理器：在发给模型之前修剪历史</h3>
+<p><strong>它怎么做</strong>：SWE-agent 在每次调用模型前，把历史交给一串可配置的处理器。<code>LastNObservations</code> 只保留最近 n 条观察，更早的替换成 "Old environment output: (n lines omitted)"，注释说明论文里用的是 n=5。<code>ClosedWindowHistoryProcessor</code> 跟踪每个文件最后一次显示的窗口，把过时的窗口替换成一行摘要。研读版本的默认配置只启用了 <code>cache_control</code>（给最后 2 条消息打缓存标记）。</p>
+<p><strong>源码</strong>：<a href="https://github.com/SWE-agent/SWE-agent/blob/3ea751c087f32b16e039a2233dd6eefecef325d5/sweagent/agent/history_processors.py#L85" target="_blank" rel="noopener">history_processors.py:85</a>、<a href="https://github.com/SWE-agent/SWE-agent/blob/3ea751c087f32b16e039a2233dd6eefecef325d5/sweagent/agent/history_processors.py#L215" target="_blank" rel="noopener">:215</a>、<a href="https://github.com/SWE-agent/SWE-agent/blob/3ea751c087f32b16e039a2233dd6eefecef325d5/config/default.yaml#L67" target="_blank" rel="noopener">config/default.yaml:67</a>。</p>
+<p><strong>为什么这样设计</strong>：这是第 5 章上下文工程的早期形态。值得注意的是默认配置的变化：修剪历史会改变消息前缀、破坏提示缓存（第 2 章）；模型上下文变长、缓存变便宜之后，"不修剪 + 打缓存标记"成了更划算的默认值。</p>
+
+<h3>6.6 mini-swe-agent：只剩 bash，但约束还在</h3>
+<p><strong>它怎么做</strong>：README 把设计总结成三点：除了 bash 没有任何工具；历史完全线性，每一步只往消息里追加；每个动作都用一个独立的子进程执行，而不是维持一个有状态的 shell 会话。默认的模型类通过 tool calling 暴露唯一一个 <code>bash</code> 工具，另有用正则从回复里解析 bash 代码块的纯文本变体，可以配合不支持 tool calling 的模型。</p>
+<pre data-title="摘自 mini-swe-agent src/minisweagent/agents/default.py（MIT）"><code class="lang-py">
+def step(self) -&gt; list[dict]:
+    """Query the LM, execute actions."""
+    return self.execute_actions(self.query())
+
+def execute_actions(self, message: dict) -&gt; list[dict]:
+    """Execute actions in message, add observation messages, return them."""
+    outputs = [self.env.execute(action) for action in message.get("extra", {}).get("actions", [])]
+    return self.add_messages(*self.model.format_observation_messages(message, outputs, self.get_template_vars()))
+</code></pre>
+<p><strong>源码</strong>：<a href="https://github.com/SWE-agent/mini-swe-agent/blob/04d809ceab9df28f9adaed044884180159172930/src/minisweagent/agents/default.py#L88" target="_blank" rel="noopener">agents/default.py:88</a>（run）、<a href="https://github.com/SWE-agent/mini-swe-agent/blob/04d809ceab9df28f9adaed044884180159172930/src/minisweagent/agents/default.py#L130" target="_blank" rel="noopener">:130</a>（query 与上限）、<a href="https://github.com/SWE-agent/mini-swe-agent/blob/04d809ceab9df28f9adaed044884180159172930/src/minisweagent/environments/local.py#L24" target="_blank" rel="noopener">environments/local.py:24</a>、<a href="https://github.com/SWE-agent/mini-swe-agent/blob/04d809ceab9df28f9adaed044884180159172930/src/minisweagent/environments/local.py#L45" target="_blank" rel="noopener">:45</a>（提交暗号）、<a href="https://github.com/SWE-agent/mini-swe-agent/blob/04d809ceab9df28f9adaed044884180159172930/src/minisweagent/config/default.yaml#L114" target="_blank" rel="noopener">config/default.yaml:114</a>（观察模板）、<a href="https://github.com/SWE-agent/mini-swe-agent/blob/04d809ceab9df28f9adaed044884180159172930/src/minisweagent/models/utils/actions_toolcall.py#L11" target="_blank" rel="noopener">actions_toolcall.py:11</a>（唯一的 bash 工具）。</p>
+<p><strong>为什么这样设计</strong>：独立子进程让沙箱化几乎零成本，README 说"把 <code>subprocess.run</code> 换成 <code>docker exec</code> 就行"，也让并行扩展变得容易；线性历史让轨迹即消息，调试和微调都简单。但请注意，<strong>ACI 并没有消失，而是缩进了观察模板里</strong>：长输出的警告与首尾截断、格式错误的纠正提示、连续错误上限、步数与费用上限、超时杀进程组，这些都是界面设计。被拆掉的是"专门的工具"，留下的是"给 agent 的反馈要简洁、可行动"这条原则。</p>
+
+<div class="callout tip"><b>关于基准成绩</b>
+<p>mini-swe-agent 的 README 称它在 SWE-bench Verified 上得分超过 74%。读这类数字时记住第 13 章的提醒：OpenAI 在 2026-02 宣布不再报告 SWE-bench Verified，理由是题目缺陷和训练数据污染。项目自报的分数可以用来说明"简单的 agent 也能做得很好"，但不宜拿来做精确比较。</p></div>
+
+<h2>7 · 交互：同一件事，三种界面</h2>
+<p>选一个场景，再切换界面，看 agent 实际会收到什么样的观察。输出格式取自三个项目的源码，内容是示意；token 数是按字符粗略估算的。</p>
+<div class="widget" id="aci">
+  <div class="w-title">观察对比器</div>
+  <div style="font-size:13px;color:var(--muted)">场景</div>
+  <div class="aci-grid" data-scn></div>
+  <div style="font-size:13px;color:var(--muted)">界面</div>
+  <div class="aci-iface" data-iface></div>
+  <div class="aci-obs" data-obs></div>
+  <div class="aci-meta"><span class="stat"><b data-tok>0</b><small>进入上下文的 token（粗估）</small></span><span class="stat"><b data-verdict>—</b><small>对 agent 是否友好</small></span></div>
+  <div class="w-out" data-why></div>
+</div>
+
+<h2>8 · 值得借鉴 / 不宜照搬</h2>
+<table>
+<tr><th>值得借鉴</th><th>不宜照搬</th></tr>
+<tr><td>把"agent 收到的观察"当作产品界面来设计：有定位信息、有限量、出错时给出下一步。</td><td>专门的查看、滚动工具。对今天的强模型，bash 加一个好的观察模板往往就够了，工具越多越容易选错。</td></tr>
+<tr><td>工具层面的防呆：编辑后自动校验，失败就撤销，只报新增的问题。</td><td>flake8 只适用于 Python。换语言要换校验器，校验太慢会拖慢每一步。</td></tr>
+<tr><td>提交前复查：在 agent 认为完成的那一刻，逼它对照 diff 和清单再看一遍。</td><td>两阶段提交对开放式任务可能变成走过场。验收最好有可执行的检查（测试、端到端验证）。</td></tr>
+<tr><td>mini 的极简控制流：上限、格式错误、提交都是携带消息的异常；轨迹即消息，每步落盘。</td><td>每步独立子进程意味着没有持久的 shell 状态（<code>cd</code>、环境变量不会保留），需要在命令里写全。</td></tr>
+<tr><td>交互命令黑名单与超时杀进程组：防止 agent 卡死、防止孤儿进程。</td><td>黑名单按前缀匹配，容易被绕过，只能防误操作，不能当安全边界（安全见第 9 章）。</td></tr>
+</table>
+
+<h2>9 · 对照复盘</h2>
+<ul>
+  <li><a href="review.html#f-N17">N17 · 助手工具面太宽</a>：niuma 的对话助手每轮下发 45 个工具。mini-swe-agent 只有一个 bash 工具，SWE-agent 的工具也按 bundle 组合、按需启用。工具越少，模型越不容易选错，规则也越短。</li>
+  <li><a href="review.html#f-D4">D4 · 让模型搬运 ID</a>：SWE-agent 的 <code>edit</code> 不需要模型传文件路径，"当前打开的文件"由工具自己保存在状态里。这和"把 task_id 绑定到会话、不出现在 schema 里"是同一个思路。</li>
+  <li><a href="review.html#f-D5">D5 · "完成"由模型用自由文本宣布</a>：SWE-agent 用提交前复查拦一次；mini-swe-agent 要求"首行暗号 + 返回码为 0"这个确定的格式才算提交。两者都比"读一段自述就判定完成"可靠。</li>
+  <li><a href="review.html#f-D6">D6 · 驾驭交互式终端</a>：mini-swe-agent 明确放弃了有状态的 shell 会话，每步一个独立子进程，结果和返回码都是结构化的。驾驭一个交互式终端，恰恰是它刻意绕开的难题。</li>
+</ul>
+
+<h2>10 · 读码练习</h2>
+<details><summary>1. mini-swe-agent 的 <code>run()</code> 怎么知道该停了？列出所有可能的退出原因。</summary>
+<p>循环在最后一条消息的角色是 <code>exit</code> 时停止。exit 消息可能来自：<code>Submitted</code>（环境识别到提交暗号）、<code>LimitsExceeded</code>（步数或费用）、<code>TimeExceeded</code>（墙钟时间）、<code>RepeatedFormatError</code>（连续格式错误），以及未捕获异常时的 <code>handle_uncaught_exception</code>（之后会重新抛出）。去看 <a href="https://github.com/SWE-agent/mini-swe-agent/blob/04d809ceab9df28f9adaed044884180159172930/src/minisweagent/agents/default.py#L88" target="_blank" rel="noopener">default.py:88–124</a> 与 <a href="https://github.com/SWE-agent/mini-swe-agent/blob/04d809ceab9df28f9adaed044884180159172930/src/minisweagent/environments/local.py#L45" target="_blank" rel="noopener">local.py:45</a>。</p></details>
+<details><summary>2. 格式错误那次调用已经花了钱，费用是怎么记账的？</summary>
+<p><code>FormatError</code> 被捕获时，代码从异常携带的消息里取出 <code>extra.cost</code> 加到 <code>self.cost</code> 上，注释写着"这次调用在解析失败前已经计费，query() 没机会记账"。这是第 14 章"成本记账不能漏掉失败调用"的一个具体例子。去看 <a href="https://github.com/SWE-agent/mini-swe-agent/blob/04d809ceab9df28f9adaed044884180159172930/src/minisweagent/agents/default.py#L100" target="_blank" rel="noopener">default.py:100</a>。</p></details>
+<details><summary>3. 为什么 SWE-agent 的 lint 编辑只报"新增"错误？如果报全部错误会怎样？</summary>
+<p>很多仓库本来就有 lint 告警。如果全部报出来，agent 每次编辑都会"失败"，可能会去修与任务无关的老问题，甚至陷入循环。代码先算编辑前的错误，再用 <code>format_flake8_output(…, previous_errors_string=…)</code> 只保留新增部分。去看 <a href="https://github.com/SWE-agent/SWE-agent/blob/3ea751c087f32b16e039a2233dd6eefecef325d5/tools/windowed_edit_linting/bin/edit#L94" target="_blank" rel="noopener">edit:94–118</a>。</p></details>
+<details><summary>4. mini-swe-agent 的超时处理为什么要用 <code>start_new_session</code> 和 <code>os.killpg</code>？</summary>
+<p>命令用 <code>shell=True</code> 执行，真正干活的可能是 shell 派生出的子进程。只杀 shell 会让子进程变成孤儿继续运行。用新会话启动、超时后杀掉整个进程组，才能清理干净。函数注释原文是"kills the whole process group on timeout so no children are orphaned"。去看 <a href="https://github.com/SWE-agent/mini-swe-agent/blob/04d809ceab9df28f9adaed044884180159172930/src/minisweagent/environments/local.py#L72" target="_blank" rel="noopener">local.py:72</a>。</p></details>
+
+<div class="quiz" data-answer="3">
+<p class="q">mini-swe-agent 只有一个 bash 工具。下面哪种说法最准确？</p>
+<ol>
+  <li>它完全放弃了 ACI 的思想</li>
+  <li>它依赖模型自己处理过长的输出</li>
+  <li>专门的工具被拆掉了，但 ACI 的原则保留在观察模板和运行约束里：长输出警告与首尾截断、格式错误纠正、上限、超时</li>
+  <li>它只能用于支持 tool calling 的模型</li>
+</ol>
+<div class="explain">拆掉的是不再承重的工具，留下的是"给 agent 的反馈要简洁、可行动"。另外它还有用正则解析文本的变体，不依赖 tool calling。</div>
+</div>
+
+<div class="quiz" data-answer="2">
+<p class="q">你的 agent 经常执行 <code>grep -rn "data" .</code>，然后被几千行输出淹没。按本章的思路，最好的改法是？</p>
+<ol>
+  <li>在系统提示里加一句"搜索时要精确"</li>
+  <li>在工具或观察层限量：只返回文件和命中数，或者超过阈值就截断并明确告诉它怎么缩小范围</li>
+  <li>换一个上下文更长的模型</li>
+  <li>禁止使用 grep</li>
+</ol>
+<div class="explain">提示词里的叮嘱会被稀释，界面层的约束每次都生效。SWE-agent 的 <code>search_dir</code> 和 mini 的观察模板，用的都是这个办法。</div>
+</div>
+
+<div class="takeaways"><b>本章要点</b>
+<ul>
+  <li>ACI：agent 是一类新的用户，需要为它设计的界面；论文报告定制 ACI 在 SWE-bench 上取得 12.5% 的 pass@1（2024 年的最佳成绩）。</li>
+  <li>SWE-agent 的几项设计：窗口化查看并带定位信息、限量搜索、编辑即校验、交互命令黑名单、提交前复查、历史处理器。</li>
+  <li>mini-swe-agent：只有 bash、线性历史、每步独立子进程，agent 类 190 行；作者建议用它取代 SWE-agent。</li>
+  <li>"拆掉不再承重的组件"不等于"不要界面"：ACI 缩进了观察模板和运行约束里。</li>
+  <li>工具层的约束比提示词里的叮嘱可靠：能在界面上拦住的错误，就不要指望模型自觉。</li>
+</ul></div>
+
+<h2>参考资料</h2>
+<ul class="refs">
+  <li><a href="https://github.com/SWE-agent/SWE-agent/tree/3ea751c087f32b16e039a2233dd6eefecef325d5" target="_blank" rel="noopener">SWE-agent/SWE-agent @ 3ea751c</a> <span class="src">研读版本 · 2026-07-16 · MIT</span></li>
+  <li><a href="https://github.com/SWE-agent/mini-swe-agent/tree/04d809ceab9df28f9adaed044884180159172930" target="_blank" rel="noopener">SWE-agent/mini-swe-agent @ 04d809c</a> <span class="src">研读版本 · 2026-09-03 · MIT</span></li>
+  <li><a href="https://arxiv.org/abs/2405.15793" target="_blank" rel="noopener">SWE-agent: Agent-Computer Interfaces Enable Automated Software Engineering</a> <span class="src">John Yang 等 · arXiv 2024-05-06</span></li>
+  <li><a href="https://mini-swe-agent.com/latest/faq/" target="_blank" rel="noopener">mini-swe-agent FAQ</a> <span class="src">官方文档 · 与 SWE-agent 的区别、为什么不用 shell 会话</span></li>
+  <li><a href="https://www.anthropic.com/engineering/writing-tools-for-agents" target="_blank" rel="noopener">Writing effective tools for agents — with agents</a> <span class="src">Anthropic · 2025-09-11 · 工具返回的限量与可执行的错误信息</span></li>
+  <li><a href="https://openai.com/index/why-we-no-longer-evaluate-swe-bench-verified/" target="_blank" rel="noopener">Why we no longer evaluate SWE-bench Verified</a> <span class="src">OpenAI · 2026-02-23</span></li>
+</ul>
+</article>
+
+<script>
+window.addEventListener('DOMContentLoaded', () => {
+  const lines = (n, f) => Array.from({ length: n }, (_, i) => f(i + 1)).join('\n');
+  const fileLine = (i) => (i === 41 ? 'def export_monthly(rows, dept=None):' : i === 42 ? '    filtered = [r for r in rows if dept is None or r.dept == dept]' : `    # 第 ${i} 行代码 …`);
+  const bigFile = lines(1200, (i) => fileLine(i));
+  const SCN = {
+    view: {
+      label: '查看一个 1200 行的文件',
+      raw: { cmd: '$ cat src/report/export.py', out: bigFile, verdict: '差', why: '1200 行全部进入上下文。真正相关的只有第 41–42 行，其余都在稀释注意力（第 5 章 context rot）。' },
+      aci: { cmd: 'open "src/report/export.py" 41', out: '[File: src/report/export.py (1200 lines total)]\n(40 more lines above)\n' + lines(100, (i) => `${i + 40}:${fileLine(i + 40)}`) + '\n(1060 more lines below)', verdict: '好', why: '只给一个 100 行的窗口，并告诉它上面、下面各还有多少行。后续 edit 不必再传路径。' },
+      mini: { cmd: '$ cat src/report/export.py', out: null, verdict: '可以', why: '输出超过 1 万字符，模板先警告并建议用 head、tail、sed，只保留首尾各 5000 字符。模型下一步通常会改用 sed -n 30,60p。' },
+    },
+    search: {
+      label: '全仓库搜索一个常见词',
+      raw: { cmd: '$ grep -rn "data" .', out: lines(400, (i) => `./src/m${i % 37}/file${i}.py:${(i * 7) % 300}:    data = load(${i})`) + '\n…（实际共 2300 行）', verdict: '差', why: '几千行匹配结果直接进上下文，真正的线索被淹没。' },
+      aci: { cmd: 'search_dir "data"', out: 'More than 312 files matched for "data" in /repo. Please narrow your search.', verdict: '好', why: '超过 100 个文件就拒绝，并明确告诉它下一步：缩小范围。（这里的文件数是示意）' },
+      mini: { cmd: '$ grep -rn "data" .', out: null, verdict: '可以', why: '超长输出被截成首尾两段，并附一段警告，提示用更精确的搜索或重定向到文件再查。' },
+    },
+    edit: {
+      label: '一次引入语法错误的编辑',
+      raw: { cmd: "$ sed -i '42s/.*/    filtered = [r for r in rows if/' src/report/export.py", out: '', verdict: '差', why: '命令成功、返回码 0、没有任何输出。语法错误要等到后面跑测试时才暴露，那时 agent 已经忘了是哪一步弄坏的。' },
+      aci: { cmd: 'edit 42:42\n    filtered = [r for r in rows if\nend_of_edit', out: 'Your proposed edit has introduced new syntax error(s). Please read this error message carefully and then retry editing the file.\n\nERRORS:\n- E999 SyntaxError: invalid syntax\n\nThis is how your edit would have looked if applied\n…\nThis is the original code before your edit\n…\nYour changes have NOT been applied. Please fix your edit command and try again.\nDO NOT re-run the same failed edit command. Running it again will lead to the same error.', verdict: '好', why: '编辑被撤销，错误、修改后的样子、原来的样子一次给全，还提醒不要重复同一条失败命令。' },
+      mini: { cmd: "$ sed -i '42s/.*/    filtered = [r for r in rows if/' src/report/export.py", out: '<returncode>0</returncode>\n<output>\n</output>', verdict: '一般', why: '没有自动校验。好在返回码和空输出是结构化的；强模型通常会主动跑 python -c "import …" 或测试来验证，但这依赖模型自觉。' },
+    },
+    vim: {
+      label: '执行一个交互式命令',
+      raw: { cmd: '$ vim src/report/export.py', out: '（进程一直等待键盘输入……agent 卡住，直到外部超时）', verdict: '差', why: '交互式程序永远等不到输入，整个 agent 被卡住。' },
+      aci: { cmd: 'vim src/report/export.py', out: '（命令以 vim 开头，命中黑名单，不会执行；agent 带着错误信息重新询问模型，最多 3 次。示意）', verdict: '好', why: '执行前就拦下。重问时模型会改用 open/edit 等非交互方式。' },
+      mini: { cmd: '$ vim src/report/export.py', out: '<exception>An error occurred while executing the command: Command \'vim src/report/export.py\' timed out after 30 seconds</exception>\n<returncode>-1</returncode>\n<output>\n</output>', verdict: '可以', why: '默认 30 秒超时，杀掉整个进程组，再把异常作为观察回灌。代价是白等了 30 秒。（异常文字为示意）' },
+    },
+  };
+  const IFACE = { raw: '原始 shell', aci: 'SWE-agent ACI', mini: 'mini-swe-agent' };
+  const box = document.getElementById('aci');
+  const scnBox = box.querySelector('[data-scn]');
+  const ifBox = box.querySelector('[data-iface]');
+  const obs = box.querySelector('[data-obs]');
+  let scn = 'view';
+  let iface = 'raw';
+  const miniObs = (out) => {
+    if (out.length < 10000) return `<returncode>0</returncode>\n<output>\n${out}\n</output>`;
+    return `<returncode>0</returncode>\n<warning>\nThe output of your last command was too long.\nPlease try a different command that produces less output.\nIf you're looking at a file you can try use head, tail or sed to view a smaller number of lines selectively.\n…\n</warning>\n<output_head>\n${out.slice(0, 5000)}\n</output_head>\n<elided_chars>\n${out.length - 10000} characters elided\n</elided_chars>\n<output_tail>\n${out.slice(-5000)}\n</output_tail>`;
+  };
+  const render = () => {
+    const s = SCN[scn];
+    const v = s[iface];
+    const text = iface === 'mini' && v.out === null ? miniObs(s.raw.out) : v.out;
+    const shown = text.length > 6000 ? text.slice(0, 3000) + '\n\n……（为了页面性能，这里只显示前 3000 个字符；agent 实际收到全部内容）' : text;
+    obs.textContent = `${v.cmd}\n\n${shown}`;
+    box.querySelector('[data-tok]').textContent = '≈ ' + Math.max(1, Math.round(text.length / 3.5)).toLocaleString();
+    box.querySelector('[data-verdict]').textContent = v.verdict;
+    box.querySelector('[data-why]').textContent = v.why;
+    scnBox.querySelectorAll('button').forEach((b) => b.classList.toggle('on', b.dataset.k === scn));
+    ifBox.querySelectorAll('button').forEach((b) => b.classList.toggle('on', b.dataset.k === iface));
+  };
+  for (const [k, s] of Object.entries(SCN)) {
+    const b = Course.el('button', { type: 'button', class: 'btn small', text: s.label, 'data-k': k });
+    b.addEventListener('click', () => ((scn = k), render()));
+    scnBox.append(b);
+  }
+  for (const [k, label] of Object.entries(IFACE)) {
+    const b = Course.el('button', { type: 'button', class: 'btn small', text: label, 'data-k': k });
+    b.addEventListener('click', () => ((iface = k), render()));
+    ifBox.append(b);
+  }
+  render();
+});
+</script>
+</body>
+</html>

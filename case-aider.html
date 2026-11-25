@@ -1,0 +1,451 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Aider · AI Agent 工程</title>
+<meta name="description" content="研读 Aider 源码：用 tree-sitter 与 PageRank 构建按 token 预算装填的 repo map，用编辑格式让模型输出文本补丁、由代码确定性应用，再用 git、lint 与测试闭环。">
+<link rel="stylesheet" href="assets/css/course.css">
+<script src="assets/js/manifest.js"></script>
+<script defer src="assets/js/course.js"></script>
+<style>
+  .rm-files { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 4px 12px; font-size: 13.5px; }
+  .rm-files label { display: flex; gap: 6px; align-items: center; }
+  .rm-files code { font-size: 12.5px; }
+  .rm-table { width: 100%; font-size: 13px; border-collapse: collapse; margin-top: 8px; }
+  .rm-table td, .rm-table th { padding: 4px 8px; border-bottom: 1px solid var(--border); text-align: left; }
+  .rm-table tr.cut td { color: var(--muted); text-decoration: line-through; }
+  .rm-table tr.cutline td { border-bottom: 2px dashed var(--danger); }
+  .rm-bar { display: inline-block; height: 8px; background: var(--accent); border-radius: 4px; vertical-align: middle; }
+</style>
+</head>
+<body data-page="case-aider">
+<article id="content">
+<div class="eyebrow">第六部分 · 名作研读</div>
+<h1>Aider：repo map 与编辑格式</h1>
+<p class="lead">Aider 是最早一批被广泛使用的终端编码助手。它几乎不靠"让模型自己调工具去找代码"，而是由代码在每一轮把仓库的结构摘要按 token 预算装进上下文，让模型用文本写出修改，再由代码确定性地应用、提交、跑 lint 和测试。读它，是学"不靠 agent 自主也能把上下文工程做到极致"的最好教材。</p>
+<div class="meta"><span>约 40 分钟</span><span>前置：第 3、5 章</span><span>研读版本：5dc9490（2026-05-22）</span></div>
+
+<div class="goals"><b>学完你能</b>
+<ul>
+  <li>讲清 repo map 怎样用 tree-sitter 抽取定义与引用、用 PageRank 排序、再用二分法装进 token 预算</li>
+  <li>说出"让模型输出文本补丁、由代码确定性应用"的编辑格式思路，以及 Aider 为什么宁可失败也不做模糊匹配</li>
+  <li>理解 git 自动提交、/undo 的安全检查、lint/测试回灌与反思上限如何构成一个可逆、有上限的闭环</li>
+  <li>能在自己的系统里复用"按预算装填上下文""稳定内容在前""弱模型做杂活"这几条做法</li>
+</ul></div>
+
+<h2>1 · 速览</h2>
+<div class="cards">
+  <div class="card"><span class="tag">仓库</span><b>Aider-AI/aider</b><small><a href="https://github.com/Aider-AI/aider" target="_blank" rel="noopener">github.com/Aider-AI/aider</a></small></div>
+  <div class="card"><span class="tag">语言 · 许可证</span><b>Python · Apache-2.0</b><small>见仓库根目录 LICENSE.txt</small></div>
+  <div class="card"><span class="tag">研读版本</span><b>5dc9490（2026-05-22）</b><small>本页所有源码链接都固定到这个提交，包版本号为 0.86.3.dev</small></div>
+  <div class="card"><span class="tag">规模</span><b>aider/ 包 80 个 .py，约 2.0 万行</b><small>核心是 coders/base_coder.py（2485 行）与 repomap.py（867 行）</small></div>
+  <div class="card"><span class="tag">一句话定位</span><b>终端里的结对编程助手</b><small>你指定要改的文件，它把仓库结构摘要和这些文件一起交给模型，再把模型写的修改应用并提交到 git</small></div>
+</div>
+
+<div class="callout note"><b>引用说明</b>
+<p>本页的源码片段都很短，引用自 Aider（Apache-2.0），并注明文件与行号。标"简化示意"的代码是为了讲清思路重新写的，不是原文。</p></div>
+
+<h2>2 · 为什么读它</h2>
+<p>很多人一提编码 agent，就想到"模型自己 grep、自己读文件、自己决定下一步"。Aider 走的是另一条路：<strong>上下文由代码决定，动作由代码执行，模型只负责"想清楚要改什么、写出来"</strong>。这让它在几个方面成了教科书：</p>
+<ul>
+  <li><strong>上下文工程</strong>（第 5 章）：repo map 是"按 token 预算挑选最相关信息"的一个完整、可读的实现，有排序、有预算、有缓存。</li>
+  <li><strong>结构化输出的另一种答案</strong>（第 3 章）：它不用 JSON，而是让模型输出它最熟悉的文本格式（SEARCH/REPLACE 块、unified diff 等），再由代码严格解析。</li>
+  <li><strong>可逆与闭环</strong>（第 10 章）：每次修改都是一个 git 提交，lint 和测试的错误回灌给模型，回灌次数有上限。</li>
+  <li><strong>模型分工</strong>（第 1、14 章）：architect 模式用一个模型想方案、另一个模型改代码；提交说明、历史摘要交给便宜的弱模型（weak model）。</li>
+</ul>
+<p>它也有明显的边界：没有通用的工具调用循环，很多步骤要用户在终端里确认。正因为简单，每个设计决定都看得很清楚。</p>
+
+<h2>3 · 架构总览</h2>
+<figure>
+<div class="diagram">
+<svg viewBox="0 0 760 360" width="760" role="img" aria-label="Aider 架构总览">
+  <rect class="box a" x="280" y="140" width="200" height="76" rx="12"/>
+  <text class="tb" x="380" y="170" text-anchor="middle">Coder（base_coder.py）</text>
+  <text class="ts" x="380" y="192" text-anchor="middle">run_one → send_message</text>
+  <text class="ts" x="380" y="207" text-anchor="middle">反思循环（最多 3 次）</text>
+
+  <rect class="box v" x="20" y="20" width="200" height="66" rx="10"/>
+  <text class="tb" x="120" y="46" text-anchor="middle">RepoMap（repomap.py）</text>
+  <text class="ts" x="120" y="68" text-anchor="middle">tree-sitter 标签 + PageRank</text>
+
+  <rect class="box m" x="20" y="140" width="200" height="76" rx="10"/>
+  <text class="tb" x="120" y="166" text-anchor="middle">ChatChunks</text>
+  <text class="ts" x="120" y="186" text-anchor="middle">system · 示例 · 只读文件 · map</text>
+  <text class="ts" x="120" y="202" text-anchor="middle">历史 · 聊天文件 · 本轮 · 提醒</text>
+
+  <rect class="box b" x="280" y="20" width="200" height="66" rx="10"/>
+  <text class="tb" x="380" y="46" text-anchor="middle">LLM（经 litellm）</text>
+  <text class="ts" x="380" y="68" text-anchor="middle">主模型 · 弱模型 · 编辑器模型</text>
+
+  <rect class="box w" x="540" y="20" width="200" height="66" rx="10"/>
+  <text class="tb" x="640" y="46" text-anchor="middle">编辑格式解析与应用</text>
+  <text class="ts" x="640" y="68" text-anchor="middle">diff / whole / udiff / patch</text>
+
+  <rect class="box g" x="540" y="140" width="200" height="76" rx="10"/>
+  <text class="tb" x="640" y="166" text-anchor="middle">GitRepo（repo.py）</text>
+  <text class="ts" x="640" y="186" text-anchor="middle">自动提交 · 署名 · /undo</text>
+  <text class="ts" x="640" y="202" text-anchor="middle">提交说明由弱模型写</text>
+
+  <rect class="box r" x="540" y="264" width="200" height="66" rx="10"/>
+  <text class="tb" x="640" y="290" text-anchor="middle">Linter / 测试命令</text>
+  <text class="ts" x="640" y="312" text-anchor="middle">错误作为下一轮输入</text>
+
+  <rect class="box m" x="280" y="264" width="200" height="66" rx="10"/>
+  <text class="tb" x="380" y="290" text-anchor="middle">ChatSummary（history.py）</text>
+  <text class="ts" x="380" y="312" text-anchor="middle">历史过长时后台摘要</text>
+
+  <path class="line" d="M120 86 V140" marker-end="url(#arr)"/>
+  <path class="line" d="M220 178 H280" marker-end="url(#arr)"/>
+  <path class="line b" d="M380 140 V86" marker-end="url(#arr-b)"/>
+  <path class="line b" d="M480 53 H540" marker-end="url(#arr-b)"/>
+  <path class="line" d="M640 86 V140" marker-end="url(#arr)"/>
+  <path class="line" d="M640 216 V264" marker-end="url(#arr)"/>
+  <path class="line r dash" d="M540 297 C500 297 500 216 480 205" marker-end="url(#arr-r)"/>
+  <path class="line" d="M380 216 V264" marker-end="url(#arr)"/>
+</svg>
+</div>
+<figcaption>图 A-1 Aider 的主要部件。Coder 是中枢：组装上下文、调用模型、应用修改、提交、跑 lint/测试，失败就把错误当作下一条消息回灌。</figcaption>
+</figure>
+
+<h2>4 · 一次请求的旅程</h2>
+<p>以"给月报导出加按部门筛选"为例，用户已用 <code>/add</code> 把 <code>reports/builder.py</code> 加进聊天。点"下一步"看这条消息在源码里走过哪些地方。</p>
+
+<figure class="anim" data-dim>
+<div class="diagram">
+<svg viewBox="0 0 760 300" width="760" role="img" aria-label="一次请求在 Aider 中的流程">
+  <g data-k="s1"><rect class="box" x="10" y="20" width="135" height="56" rx="8"/><text class="t" x="77" y="44" text-anchor="middle">① 用户消息</text><text class="ts" x="77" y="64" text-anchor="middle">run_one</text></g>
+  <g data-k="s2"><rect class="box m" x="165" y="20" width="135" height="56" rx="8"/><text class="t" x="232" y="44" text-anchor="middle">② 组装分块</text><text class="ts" x="232" y="64" text-anchor="middle">format_chat_chunks</text></g>
+  <g data-k="s3"><rect class="box v" x="320" y="20" width="135" height="56" rx="8"/><text class="t" x="387" y="44" text-anchor="middle">③ repo map</text><text class="ts" x="387" y="64" text-anchor="middle">get_repo_map</text></g>
+  <g data-k="s4"><rect class="box b" x="475" y="20" width="135" height="56" rx="8"/><text class="t" x="542" y="44" text-anchor="middle">④ 调用模型</text><text class="ts" x="542" y="64" text-anchor="middle">send（重试/续写）</text></g>
+  <g data-k="s5"><rect class="box" x="630" y="20" width="120" height="56" rx="8"/><text class="t" x="690" y="44" text-anchor="middle">⑤ 提到新文件？</text><text class="ts" x="690" y="64" text-anchor="middle">问用户再重发</text></g>
+  <g data-k="s6"><rect class="box w" x="630" y="130" width="120" height="56" rx="8"/><text class="t" x="690" y="154" text-anchor="middle">⑥ 应用修改</text><text class="ts" x="690" y="174" text-anchor="middle">apply_updates</text></g>
+  <g data-k="s7"><rect class="box g" x="475" y="130" width="135" height="56" rx="8"/><text class="t" x="542" y="154" text-anchor="middle">⑦ 自动提交</text><text class="ts" x="542" y="174" text-anchor="middle">auto_commit</text></g>
+  <g data-k="s8"><rect class="box r" x="320" y="130" width="135" height="56" rx="8"/><text class="t" x="387" y="154" text-anchor="middle">⑧ lint / 测试</text><text class="ts" x="387" y="174" text-anchor="middle">lint_edited</text></g>
+  <g data-k="s9"><rect class="box a" x="165" y="130" width="135" height="56" rx="8"/><text class="t" x="232" y="154" text-anchor="middle">⑨ 反思</text><text class="ts" x="232" y="174" text-anchor="middle">reflected_message</text></g>
+  <g data-k="s10"><rect class="box m" x="165" y="230" width="290" height="50" rx="8"/><text class="t" x="310" y="252" text-anchor="middle">⑩ 收尾：本轮并入历史，过长就后台摘要</text><text class="ts" x="310" y="270" text-anchor="middle">move_back_cur_messages → summarize_start</text></g>
+  <g data-k="e1"><path class="line" d="M145 48 H165" marker-end="url(#arr)"/></g>
+  <g data-k="e2"><path class="line" d="M300 48 H320" marker-end="url(#arr)"/></g>
+  <g data-k="e3"><path class="line" d="M455 48 H475" marker-end="url(#arr)"/></g>
+  <g data-k="e4"><path class="line" d="M610 48 H630" marker-end="url(#arr)"/></g>
+  <g data-k="e5"><path class="line" d="M690 76 V130" marker-end="url(#arr)"/></g>
+  <g data-k="e6"><path class="line" d="M630 158 H610" marker-end="url(#arr)"/></g>
+  <g data-k="e7"><path class="line" d="M475 158 H455" marker-end="url(#arr)"/></g>
+  <g data-k="e8"><path class="line r" d="M320 158 H300" marker-end="url(#arr-r)"/></g>
+  <g data-k="e9"><path class="line r dash" d="M190 130 C170 104 110 104 90 77" marker-end="url(#arr-r)"/></g>
+  <g data-k="e10"><path class="line" d="M387 186 V230" marker-end="url(#arr)"/></g>
+</svg>
+</div>
+<ol class="anim-steps">
+  <li data-show="s1" data-hl="s1"><code>Coder.run_one</code>（<a href="https://github.com/Aider-AI/aider/blob/5dc9490bb35f9729ef2c95d00a19ccd30c26339c/aider/coders/base_coder.py#L924" target="_blank" rel="noopener">base_coder.py#L924</a>）收到消息，进入一个 <code>while message</code> 循环：每次调用 <code>send_message</code>，如果这一轮产生了 <code>reflected_message</code>（需要再来一轮的理由），就把它当作下一条消息继续。</li>
+  <li data-show="s2 e1" data-hl="s2 e1"><code>format_chat_chunks</code>（<a href="https://github.com/Aider-AI/aider/blob/5dc9490bb35f9729ef2c95d00a19ccd30c26339c/aider/coders/base_coder.py#L1226" target="_blank" rel="noopener">#L1226</a>）把上下文拼成固定顺序的分块：系统提示、示例、只读文件、repo map、历史、聊天中的文件、本轮消息、提醒（<a href="https://github.com/Aider-AI/aider/blob/5dc9490bb35f9729ef2c95d00a19ccd30c26339c/aider/coders/chat_chunks.py#L16" target="_blank" rel="noopener">chat_chunks.py#L16</a>）。顺序就是缓存策略：越稳定越靠前。</li>
+  <li data-show="s3 e2" data-hl="s3 e2"><code>RepoMap.get_repo_map</code>（<a href="https://github.com/Aider-AI/aider/blob/5dc9490bb35f9729ef2c95d00a19ccd30c26339c/aider/repomap.py#L103" target="_blank" rel="noopener">repomap.py#L103</a>）为"不在聊天里的文件"生成结构摘要：以聊天文件和你提到的标识符为中心排序，只保留装得进预算的那些定义。第 5 节细讲。</li>
+  <li data-show="s4 e3" data-hl="s4 e3"><code>send_message</code>（<a href="https://github.com/Aider-AI/aider/blob/5dc9490bb35f9729ef2c95d00a19ccd30c26339c/aider/coders/base_coder.py#L1419" target="_blank" rel="noopener">#L1419</a>）先估算 token 是否超出窗口（超了会提示用户 /drop），再调用模型：可重试的错误指数退避；输出被长度截断时，若模型支持预填充（prefill），就把已输出部分作为 assistant 前缀让它接着写。</li>
+  <li data-show="s5 e4" data-hl="s5 e4">如果模型的回复里提到了仓库里存在、但还不在聊天中的文件名，<code>check_for_file_mentions</code>（<a href="https://github.com/Aider-AI/aider/blob/5dc9490bb35f9729ef2c95d00a19ccd30c26339c/aider/coders/base_coder.py#L1761" target="_blank" rel="noopener">#L1761</a>）会逐个问用户要不要加入；加了就生成一条反思消息，带着新文件重来一轮。这是"按需取上下文"由人把关的版本。</li>
+  <li data-show="s6 e5" data-hl="s6 e5"><code>apply_updates</code>（<a href="https://github.com/Aider-AI/aider/blob/5dc9490bb35f9729ef2c95d00a19ccd30c26339c/aider/coders/base_coder.py#L2296" target="_blank" rel="noopener">#L2296</a>）从回复里解析出修改（get_edits）、先试运行（dry run）、再真正写盘。模型没按格式写，或者 SEARCH 块对不上文件，异常信息就成为反思消息。</li>
+  <li data-show="s7 e6" data-hl="s7 e6"><code>auto_commit</code>（<a href="https://github.com/Aider-AI/aider/blob/5dc9490bb35f9729ef2c95d00a19ccd30c26339c/aider/coders/base_coder.py#L2375" target="_blank" rel="noopener">#L2375</a>）把这次修改提交到 git。提交说明优先用弱模型生成，提交的作者名默认带"(aider)"标记。之后要撤销，只需 <code>/undo</code>。</li>
+  <li data-show="s8 e7" data-hl="s8 e7">默认开启自动 lint（<code>--auto-lint</code> 默认 True），自动测试默认关闭（<code>--auto-test</code> 默认 False）。有错误时问用户"要不要尝试修复"，同意就把错误文本作为反思消息（<a href="https://github.com/Aider-AI/aider/blob/5dc9490bb35f9729ef2c95d00a19ccd30c26339c/aider/coders/base_coder.py#L1599" target="_blank" rel="noopener">#L1599–1623</a>）。</li>
+  <li data-show="s9 e8 e9" data-hl="s9 e8 e9">回到第 ① 步的循环：有反思消息就再发一轮，但最多 <code>max_reflections = 3</code> 次（<a href="https://github.com/Aider-AI/aider/blob/5dc9490bb35f9729ef2c95d00a19ccd30c26339c/aider/coders/base_coder.py#L101" target="_blank" rel="noopener">#L101</a>），超过就提示并停下。这就是第 4 章说的"停止条件"。</li>
+  <li data-show="s10 e10" data-hl="s10 e10">本轮消息并入历史（done_messages）。如果历史超出预算，<code>summarize_start</code> 在后台线程里用弱模型做摘要，下一轮组装上下文前再取回结果（<a href="https://github.com/Aider-AI/aider/blob/5dc9490bb35f9729ef2c95d00a19ccd30c26339c/aider/coders/base_coder.py#L1002" target="_blank" rel="noopener">#L1002–1034</a>）。</li>
+</ol>
+<figcaption>图 A-2 一次请求的完整路径。红色虚线是反思回路：格式错误、SEARCH 不匹配、lint/测试失败，都会变成下一轮的输入。</figcaption>
+</figure>
+
+<h2>5 · 关键设计一：repo map</h2>
+<p>问题：仓库有几百个文件，上下文装不下；只给模型聊天里的那一两个文件，它又不知道别处有什么函数可用、谁在调用它要改的函数。Aider 的回答是给其余文件做一份"地图"：只列出最相关的类和函数签名，并严格控制在 token 预算里。</p>
+
+<h3>5.1 抽取：tree-sitter 标签</h3>
+<p><code>get_tags_raw</code>（<a href="https://github.com/Aider-AI/aider/blob/5dc9490bb35f9729ef2c95d00a19ccd30c26339c/aider/repomap.py#L279" target="_blank" rel="noopener">repomap.py#L279</a>）用 tree-sitter 解析文件，再用每种语言的查询文件（如 <code>aider/queries/tree-sitter-language-pack/python-tags.scm</code>）抓出两类节点：<code>name.definition.*</code>（定义）和 <code>name.reference.*</code>（引用），得到 <code>Tag(rel_fname, fname, line, name, kind)</code>。有的语言的查询只给定义不给引用，就用 Pygments 的词法分析补上引用。</p>
+<p>解析结果按文件的修改时间（mtime）缓存在仓库下的 <code>.aider.tags.cache.v*</code> 目录里（diskcache，底层是 SQLite），文件没变就不重新解析（<a href="https://github.com/Aider-AI/aider/blob/5dc9490bb35f9729ef2c95d00a19ccd30c26339c/aider/repomap.py#L233" target="_blank" rel="noopener">get_tags #L233</a>）。</p>
+
+<h3>5.2 排序：带个性化的 PageRank</h3>
+<p><code>get_ranked_tags</code>（<a href="https://github.com/Aider-AI/aider/blob/5dc9490bb35f9729ef2c95d00a19ccd30c26339c/aider/repomap.py#L365" target="_blank" rel="noopener">#L365</a>）把文件当节点：文件 A 引用了 B 定义的标识符，就连一条 A→B 的边。边的权重是一组经验系数：</p>
+<pre data-title="aider/repomap.py#L487-514（节选，Apache-2.0）"><code class="lang-py">
+mul = 1.0
+if ident in mentioned_idents:
+    mul *= 10
+if (is_snake or is_kebab or is_camel) and len(ident) &gt;= 8:
+    mul *= 10
+if ident.startswith("_"):
+    mul *= 0.1
+if len(defines[ident]) &gt; 5:
+    mul *= 0.1
+for referencer, num_refs in Counter(references[ident]).items():
+    for definer in definers:
+        use_mul = mul
+        if referencer in chat_rel_fnames:
+            use_mul *= 50
+        num_refs = math.sqrt(num_refs)
+        G.add_edge(referencer, definer, weight=use_mul * num_refs, ident=ident)
+</code></pre>
+<p>每条规则背后都是一个朴素的判断：你在对话里提到的名字更重要（×10）；又长又带下划线或驼峰的名字更可能是有意义的业务函数，而不是 <code>get</code>、<code>run</code> 这类泛用词（×10）；私有的、到处都有定义的名字不重要（×0.1）；<strong>聊天里的文件引用的东西</strong>最重要（×50）；引用次数开平方，免得高频的琐碎名字压过一切。</p>
+<p>然后用 networkx 的 PageRank 算每个文件的分数，聊天文件和你提到的文件得到"个性化"权重（personalization），相当于随机游走总是从它们出发。最后把每个文件的分数按出边权重分给它引用的那些定义，得到"（文件，标识符）"的排名。聊天里的文件本身不进地图，因为它们的全文已经在上下文里了。</p>
+
+<h3>5.3 装填：二分法逼近 token 预算</h3>
+<p>排好序之后，还要决定取前多少个。<code>get_ranked_tags_map_uncached</code>（<a href="https://github.com/Aider-AI/aider/blob/5dc9490bb35f9729ef2c95d00a19ccd30c26339c/aider/repomap.py#L629" target="_blank" rel="noopener">#L629</a>）用二分法试不同的数量，每次把候选渲染成树状文本（用 grep-ast 的 TreeContext 只显示定义所在行和必要的上层结构），数一下 token；落在预算 15% 误差以内就停。数 token 时，长文本只按行抽样约 1/100 再按比例放大（<a href="https://github.com/Aider-AI/aider/blob/5dc9490bb35f9729ef2c95d00a19ccd30c26339c/aider/repomap.py#L89" target="_blank" rel="noopener">token_count #L89</a>），在"准"和"快"之间取了平衡。</p>
+<p>预算从哪来：<code>get_repo_map_tokens</code>（<a href="https://github.com/Aider-AI/aider/blob/5dc9490bb35f9729ef2c95d00a19ccd30c26339c/aider/models.py#L782" target="_blank" rel="noopener">models.py#L782</a>）默认取模型最大输入的 1/8，再夹在 1024 到 4096 之间；用户也可以用 <code>--map-tokens</code> 指定。聊天里还没有任何文件时，预算放大 8 倍（<code>map_mul_no_files=8</code>），但不超过"窗口减 4096"，因为这时模型最需要全局视野。</p>
+
+<div class="widget" id="rm">
+<div class="w-title">迷你 repo map：排序与预算截断（简化示意）</div>
+<p style="font-size:14px;margin:0 0 8px">一个 8 个文件的小仓库。勾选"已加入聊天的文件"和"你提到的标识符"，拖动预算，看排名和截断线怎么变。权重规则照搬上面的源码（×10、×50、×0.1、开平方、个性化 PageRank），token 数按每个定义约 12 个、每个文件名约 6 个估算。</p>
+<div><b style="font-size:13px">已加入聊天的文件</b><div class="rm-files" id="rmChat"></div></div>
+<div style="margin-top:8px"><b style="font-size:13px">你在消息里提到的标识符</b><div class="rm-files" id="rmIdent"></div></div>
+<div class="w-row"><label>repo map 预算：<b id="rmBudgetV"></b> tokens<input type="range" id="rmBudget" min="30" max="200" step="10" value="80"></label></div>
+<table class="rm-table"><thead><tr><th>#</th><th>文件 : 定义</th><th>分数</th><th>累计 tokens</th></tr></thead><tbody id="rmOut"></tbody></table>
+<div class="w-out" id="rmNote"></div>
+</div>
+
+<div class="callout tip"><b>对照第 5 章</b>
+<p>repo map 是"上下文预算"思想的一个完整实现：<strong>先定预算，再按相关性排序，最后按预算截断</strong>，而且预算、排序、截断三件事都在代码里，可测、可调。只按"最近 N 条""最多 N 个"截断的系统，做不到"长的少放、短的多放"。</p></div>
+
+<h2>6 · 关键设计二：编辑格式</h2>
+<p>让模型改代码，最直接的办法是让它输出整个新文件（whole 格式）：简单，但文件一大就既慢又贵，还容易在不相关的地方"顺手"改错。Aider 设计了一组<strong>编辑格式</strong>（edit format），每种对应一个 Coder 子类（<code>aider/coders/</code>），由模型配置表决定默认用哪种：</p>
+<table>
+<tr><th>格式</th><th>Coder 类</th><th>模型写什么</th></tr>
+<tr><td><code>diff</code></td><td>EditBlockCoder</td><td>SEARCH/REPLACE 块：先原样抄出要替换的几行，再写替换后的内容</td></tr>
+<tr><td><code>diff-fenced</code></td><td>EditBlockFencedCoder</td><td>同上，但文件名写在代码围栏里面，适配部分模型的习惯</td></tr>
+<tr><td><code>udiff</code></td><td>UnifiedDiffCoder</td><td>类似 <code>diff -U0</code> 的统一差异格式</td></tr>
+<tr><td><code>whole</code></td><td>WholeFileCoder</td><td>整个文件的新内容</td></tr>
+<tr><td><code>patch</code></td><td>PatchCoder</td><td>一种带上下文的补丁格式</td></tr>
+<tr><td><code>architect</code></td><td>ArchitectCoder</td><td>只写方案，再交给编辑器模型用 <code>editor-diff</code> 等格式落地</td></tr>
+</table>
+<p>在研读版本的模型配置表 <code>aider/resources/model-settings.yml</code> 里，显式写了 <code>edit_format</code> 的 333 项中，<code>diff</code> 占 289 项，<code>diff-fenced</code> 35 项，<code>whole</code> 和 <code>udiff</code> 各 4 项，<code>architect</code> 1 项。SEARCH/REPLACE 是事实上的主力格式。</p>
+
+<h3>6.1 宁可失败，也不错改</h3>
+<p>SEARCH/REPLACE 的风险在于模型抄的"原文"可能和文件有出入。<code>replace_most_similar_chunk</code>（<a href="https://github.com/Aider-AI/aider/blob/5dc9490bb35f9729ef2c95d00a19ccd30c26339c/aider/coders/editblock_coder.py#L157" target="_blank" rel="noopener">editblock_coder.py#L157</a>）按从严到宽的顺序尝试：完全匹配、只差前导空白、去掉多余的首行空行、处理模型用 <code>...</code> 省略的部分。值得注意的是函数最后一段：</p>
+<pre data-title="aider/coders/editblock_coder.py#L183-187（节选，Apache-2.0）"><code class="lang-py">
+    return
+    # Try fuzzy matching
+    res = replace_closest_edit_distance(whole_lines, part, part_lines, replace_lines)
+    if res:
+        return res
+</code></pre>
+<p>按编辑距离做模糊匹配的代码还在，但被一行 <code>return</code> 挡在了前面，实际不会执行。这是一个很有代表性的取舍：<strong>匹配不上就明确失败，把失败原因清楚地告诉模型，比"猜一个最像的地方改掉"安全得多</strong>。</p>
+<p>失败时 <code>apply_edits</code>（<a href="https://github.com/Aider-AI/aider/blob/5dc9490bb35f9729ef2c95d00a19ccd30c26339c/aider/coders/editblock_coder.py#L41" target="_blank" rel="noopener">#L41</a>）构造的错误信息是第 3 章"可执行的错误信息"的范例：哪个块没匹配上；文件里最相似的几行（"Did you mean to match some of these actual lines"）；如果替换内容其实已经在文件里了，提醒"你确定还需要这个块吗"；其余成功的块已经应用，"不要重发，只重写失败的那几个"。这段文字原样成为反思消息，模型下一轮只需修正失败的部分。</p>
+
+<h3>6.2 architect：把"想"和"写"拆开</h3>
+<p><code>ArchitectCoder.reply_completed</code>（<a href="https://github.com/Aider-AI/aider/blob/5dc9490bb35f9729ef2c95d00a19ccd30c26339c/aider/coders/architect_coder.py#L11" target="_blank" rel="noopener">architect_coder.py#L11</a>）在主模型写完方案后，经用户确认，新建一个编辑器 Coder：用 <code>editor_model</code> 和 <code>editor_edit_format</code>，关掉 repo map（<code>map_tokens=0</code>），清空历史，只把方案文本作为输入。这就是第 1 章的提示链（prompt chaining）加模型路由：擅长推理的模型负责规划，擅长按格式输出的模型负责落地，两个阶段的上下文互不污染。</p>
+
+<h2>7 · 关键设计三：git 作为安全网</h2>
+<p>让 AI 直接改你的工作区，最大的顾虑是"改坏了怎么办"。Aider 的答案是把每次修改都变成一个独立的 git 提交：</p>
+<ul>
+  <li><strong>先提交你的脏改动</strong>：要编辑的文件如果有你未提交的修改，<code>dirty_commit</code>（<a href="https://github.com/Aider-AI/aider/blob/5dc9490bb35f9729ef2c95d00a19ccd30c26339c/aider/coders/base_coder.py#L2411" target="_blank" rel="noopener">#L2411</a>）会先单独提交，保证 AI 的修改和你的修改分在不同提交里。</li>
+  <li><strong>自动提交、可识别</strong>：<code>--auto-commits</code> 默认开启；提交说明由 <code>commit_message_models()</code> 返回的模型列表依次尝试，弱模型排在第一位（<a href="https://github.com/Aider-AI/aider/blob/5dc9490bb35f9729ef2c95d00a19ccd30c26339c/aider/models.py#L622" target="_blank" rel="noopener">models.py#L622</a>）；作者名默认标"(aider)"（<a href="https://github.com/Aider-AI/aider/blob/5dc9490bb35f9729ef2c95d00a19ccd30c26339c/aider/repo.py#L131" target="_blank" rel="noopener">repo.py#L131</a> 的说明列出了几种署名组合）。</li>
+  <li><strong>/undo 有三道检查</strong>（<a href="https://github.com/Aider-AI/aider/blob/5dc9490bb35f9729ef2c95d00a19ccd30c26339c/aider/commands.py#L560" target="_blank" rel="noopener">commands.py#L560</a>）：最后一个提交必须是本次会话里 Aider 自己做的（记在 <code>aider_commit_hashes</code> 里），否则拒绝；已经推送到 origin 的不撤；涉及的文件有未提交改动的不撤。</li>
+</ul>
+<p>这是第 10 章"可逆"和第 8 章"撤回"在单机工具上的落地：<strong>撤销只作用于自己确定做过的事，碰到已经对外生效（已推送）或会丢别人工作（有脏改动）的情况，宁可拒绝</strong>。</p>
+
+<h2>8 · 关键设计四：反馈回路与上下文维护</h2>
+<h3>8.1 lint 与测试回灌</h3>
+<p><code>Linter.lint</code>（<a href="https://github.com/Aider-AI/aider/blob/5dc9490bb35f9729ef2c95d00a19ccd30c26339c/aider/linter.py#L82" target="_blank" rel="noopener">linter.py#L82</a>）按语言选检查方式：用户配置了 lint 命令就用它；Python 默认组合编译检查和 flake8 的一小组致命错误（<code>E9,F821,F823,…</code>，只抓语法错误和未定义名字这类"肯定是错"的问题）；其他语言用 tree-sitter 找语法错误。错误输出后面会附上出错行周围的代码结构（tree_context），让模型知道错在哪个函数里。</p>
+<p>这里的设计要点是：<strong>回灌的信号是客观的、确定性的</strong>。模型说"改好了"不算数，编译器和测试说了才算。这正是第 12 章"不信 agent 自述，读客观进度"的同一思想。</p>
+
+<h3>8.2 历史摘要</h3>
+<p><code>ChatSummary</code>（<a href="https://github.com/Aider-AI/aider/blob/5dc9490bb35f9729ef2c95d00a19ccd30c26339c/aider/history.py#L7" target="_blank" rel="noopener">history.py#L7</a>）在历史超过预算时触发。预算是模型最大输入的 1/16，夹在 1024 到 8192 之间（<a href="https://github.com/Aider-AI/aider/blob/5dc9490bb35f9729ef2c95d00a19ccd30c26339c/aider/models.py#L358" target="_blank" rel="noopener">models.py#L358</a>）。做法：保留最近约一半预算的消息原文（尾部），把更早的部分交给模型摘要（先试弱模型，失败再用主模型），切分点保证落在 assistant 消息之后；摘要加尾部还超预算就递归，最多 3 层。摘要在后台线程里做，不阻塞用户。</p>
+
+<h3>8.3 为提示缓存排好顺序</h3>
+<p>回头看 <code>ChatChunks.all_messages</code> 的顺序：系统提示和示例在最前，只读文件和 repo map 其次，然后才是会增长的历史、会被编辑的聊天文件、本轮消息。<code>add_cache_control_headers</code>（<a href="https://github.com/Aider-AI/aider/blob/5dc9490bb35f9729ef2c95d00a19ccd30c26339c/aider/coders/chat_chunks.py#L28" target="_blank" rel="noopener">#L28</a>）在示例（或系统提示）、repo map（或只读文件）、聊天文件这三处末尾打上缓存断点。开启缓存预热时，<code>warm_cache</code>（<a href="https://github.com/Aider-AI/aider/blob/5dc9490bb35f9729ef2c95d00a19ccd30c26339c/aider/coders/base_coder.py#L1340" target="_blank" rel="noopener">#L1340</a>）会每隔约 5 分钟（<code>5 * 60 - 5</code> 秒）发一次 <code>max_tokens=1</code> 的请求，让缓存在用户思考时不过期。这是第 2 章"稳定在前、易变在后"的标准做法。</p>
+
+<div class="quiz" data-answer="3">
+<p class="q">Aider 的 SEARCH/REPLACE 块匹配不上文件时，最终会怎么做？</p>
+<ol>
+  <li>用编辑距离找最相似的段落替换掉</li>
+  <li>改用 whole 格式重写整个文件</li>
+  <li>不修改这一块，把"哪块没匹配上、文件里最像的几行、成功的块不要重发"写成错误信息回灌给模型</li>
+  <li>直接放弃整轮修改并回滚所有文件</li>
+</ol>
+<div class="explain">模糊匹配的代码虽然还在，但被一行 <code>return</code> 挡住了。失败的块不改，已经成功的块照常应用，错误信息成为下一轮的反思消息，并受 <code>max_reflections = 3</code> 的上限约束。这是"精确失败 + 可执行的错误信息"胜过"猜测性修复"的典型例子。</div>
+</div>
+
+<h2>9 · 值得借鉴 / 不宜照搬</h2>
+<table>
+<tr><th>值得借鉴</th><th>不宜照搬</th></tr>
+<tr><td><strong>按 token 预算装填上下文</strong>：排序与截断分离，用二分法逼近预算，抽样估算 token 数。</td><td><strong>权重是经验常数</strong>：×10、×50、×0.1 是为代码仓库调出来的，换到消息、文档等其他领域要用自己的评测重新校准。</td></tr>
+<tr><td><strong>稳定在前的分块顺序加缓存断点</strong>，必要时用预热保住缓存。</td><td><strong>依赖终端里的人工确认</strong>：加文件、修 lint、执行 shell 命令都在问用户。无人值守的系统要把这些确认换成策略和权限（第 8 章）。</td></tr>
+<tr><td><strong>文本补丁由代码确定性应用</strong>：模型写它熟悉的格式，解析严格、失败精确、错误可执行。</td><td><strong>没有通用的工具循环</strong>：开放任务（先查日志再决定改哪里）不适合这种"上下文由人指定"的模式。</td></tr>
+<tr><td><strong>每次修改都可逆</strong>：先隔离用户的脏改动，撤销只作用于自己做过且未推送的提交。</td><td><strong>自动提交到当前分支</strong>：团队仓库里通常要配合 worktree 或独立分支（第 12 章），否则提交历史会很杂。</td></tr>
+<tr><td><strong>弱模型做杂活</strong>：提交说明、历史摘要都先用便宜模型，失败再升级。</td><td><strong>反思靠人确认才触发</strong>：lint/测试失败要问"要不要修"，交互式场景合理，批处理场景要改成有上限的自动重试。</td></tr>
+</table>
+
+<h2>10 · 对照复盘</h2>
+<div class="callout case"><b>真实项目复盘</b>
+<ul>
+  <li><a href="review.html#f-N12">N12</a> · niuma 的上下文只按条数截断、没有 token 预算。Aider 的 repo map 和 ChatSummary 都是"先定预算、再排序、按预算截断"，预算还按模型窗口自动推算。</li>
+  <li><a href="review.html#f-N3">N3</a> · niuma 一次分析调用要同时输出十几个判断。architect 模式把"想方案"和"按格式写修改"拆给两次调用、两种格式，每一步都更容易做对。</li>
+  <li><a href="review.html#f-N11">N11</a> · 缓存和超时都是出了事才补。Aider 从分块顺序、缓存断点到预热，都把缓存当作设计的一部分。</li>
+  <li><a href="review.html#f-D5">D5</a> · devtask 的"完成"由模型用自由文本宣布。Aider 的闭环信号来自 lint 和测试命令的退出结果。</li>
+</ul></div>
+
+<h2>11 · 读码练习</h2>
+<details><summary>练习 1：聊天里还没有任何文件时，repo map 的预算怎么变？为什么这样设计？</summary>
+<p>看 <a href="https://github.com/Aider-AI/aider/blob/5dc9490bb35f9729ef2c95d00a19ccd30c26339c/aider/repomap.py#L120" target="_blank" rel="noopener">repomap.py#L120–132</a>：预算乘以 <code>map_mul_no_files</code>（默认 8），但不超过"窗口减 4096"。没有聊天文件时，模型还不知道该改哪里，最需要全局视野，而且此时上下文里没有大文件占空间。</p></details>
+<details><summary>练习 2：同一个标识符被同一个文件引用了 9 次，边的权重会放大几倍？为什么不直接乘 9？</summary>
+<p>看 <a href="https://github.com/Aider-AI/aider/blob/5dc9490bb35f9729ef2c95d00a19ccd30c26339c/aider/repomap.py#L511" target="_blank" rel="noopener">#L511–514</a>：<code>num_refs = math.sqrt(num_refs)</code>，所以是 3 倍。注释写着"scale down so high freq (low value) mentions don't dominate"：高频引用往往是 log、get 这类琐碎调用，开平方压制它们的影响。</p></details>
+<details><summary>练习 3：如果一次回复里有 3 个 SEARCH/REPLACE 块，其中 1 个匹配失败，文件最终是什么状态？下一轮模型会看到什么？</summary>
+<p>看 <a href="https://github.com/Aider-AI/aider/blob/5dc9490bb35f9729ef2c95d00a19ccd30c26339c/aider/coders/editblock_coder.py#L41" target="_blank" rel="noopener">editblock_coder.py#L41–124</a>：成功的 2 块已写盘，失败的 1 块未改；随后抛出 ValueError，<code>apply_updates</code> 把它记为反思消息。模型会看到失败块的原文、文件里最相似的行，以及"其余 2 块已应用，不要重发"。</p></details>
+<details><summary>练习 4：/undo 为什么要检查"最后一个提交是不是本会话里 Aider 做的"？去掉这个检查会出什么事？</summary>
+<p>看 <a href="https://github.com/Aider-AI/aider/blob/5dc9490bb35f9729ef2c95d00a19ccd30c26339c/aider/commands.py#L560" target="_blank" rel="noopener">commands.py#L560</a> 起的 <code>raw_cmd_undo</code>。没有这个检查，用户自己刚提交的工作也可能被当成 AI 的修改撤掉。撤回只应作用于"确定是自己做的"动作，这和第 8 章撤回自动代发的道理相同。</p></details>
+<details><summary>练习 5：把 ChatChunks 的顺序改成"历史放在 repo map 前面"，会对成本有什么影响？</summary>
+<p>看 <a href="https://github.com/Aider-AI/aider/blob/5dc9490bb35f9729ef2c95d00a19ccd30c26339c/aider/coders/chat_chunks.py#L16" target="_blank" rel="noopener">chat_chunks.py#L16–40</a>。历史每轮都在增长，放在前面会让后面的 repo map 和只读文件每轮都落在缓存前缀之外，缓存命中率大幅下降。前缀缓存的规则是：从第一个变化的位置起，后面全部失效（第 2 章）。</p></details>
+
+<div class="quiz" data-answer="2">
+<p class="q">repo map 的排序里，"聊天中的文件引用了某个定义"对应的边权重要乘 50。最能说明这个设计意图的是？</p>
+<ol>
+  <li>让聊天中的文件本身排在地图最前面</li>
+  <li>你正在改的文件所依赖的函数和类，最需要让模型看到签名</li>
+  <li>减少 PageRank 的迭代次数</li>
+  <li>保证地图里一定包含测试文件</li>
+</ol>
+<div class="explain">聊天中的文件本身不会出现在地图里（它们的全文已经在上下文中）。×50 让"被聊天文件引用的定义"大幅上升，模型改代码时最需要知道的，正是这些被调用者的签名。再配合个性化 PageRank，从聊天文件出发的"相关性"会沿着引用关系向外扩散。</div>
+</div>
+
+<div class="takeaways"><b>本章要点</b>
+<ul>
+  <li>repo map = tree-sitter 抽取定义与引用 + 带个性化的 PageRank 排序 + 二分法装填 token 预算，排序、预算、截断都在代码里。</li>
+  <li>编辑格式让模型输出熟悉的文本补丁，由代码严格解析与应用；匹配不上就精确失败、把可执行的错误信息回灌，而不是模糊地猜。</li>
+  <li>git 自动提交加上有检查的 /undo，把每次修改变得可逆；lint 和测试提供客观信号，反思最多 3 次。</li>
+  <li>分块顺序、缓存断点、预热，以及弱模型处理杂活，是成本工程的具体做法。</li>
+  <li>它的局限也同样清楚：经验权重需要校准，大量交互式确认不适合无人值守的场景。</li>
+</ul></div>
+
+<h2>参考资料</h2>
+<ul class="refs">
+  <li><a href="https://github.com/Aider-AI/aider/tree/5dc9490bb35f9729ef2c95d00a19ccd30c26339c" target="_blank" rel="noopener">Aider 源码（研读版本 5dc9490）</a> <span class="src">Apache-2.0 · 2026-05-22</span></li>
+  <li><a href="https://aider.chat/docs/repomap.html" target="_blank" rel="noopener">Repository map</a> <span class="src">Aider 官方文档</span></li>
+  <li><a href="https://aider.chat/2023/10/22/repomap.html" target="_blank" rel="noopener">Building a better repository map with tree sitter</a> <span class="src">Aider 博客 · 2023-10-22 · repo map 的设计动机</span></li>
+  <li><a href="https://aider.chat/docs/more/edit-formats.html" target="_blank" rel="noopener">Edit formats</a> <span class="src">Aider 官方文档</span></li>
+  <li><a href="https://aider.chat/2024/09/26/architect.html" target="_blank" rel="noopener">Separating code reasoning and editing</a> <span class="src">Aider 博客 · 2024-09-26 · architect/editor 模式</span></li>
+  <li><a href="https://aider.chat/docs/git.html" target="_blank" rel="noopener">Git integration</a> 与 <a href="https://aider.chat/docs/usage/lint-test.html" target="_blank" rel="noopener">Linting and testing</a> <span class="src">Aider 官方文档</span></li>
+</ul>
+</article>
+
+<script>
+window.addEventListener('DOMContentLoaded', () => {
+  // 一个 8 个文件的小仓库：每个文件定义了什么、引用了什么（引用可重复，表示多次调用）
+  const REPO = {
+    'api/routes.py': { def: ['export_report', 'list_reports'], ref: ['build_monthly_report', 'ReportFilter', 'check_permission', 'check_permission'] },
+    'reports/builder.py': { def: ['build_monthly_report', 'ReportFilter', '_format_row'], ref: ['query_rows', '_format_row', '_format_row', 'slugify'] },
+    'reports/query.py': { def: ['query_rows'], ref: ['get_connection'] },
+    'db/conn.py': { def: ['get_connection'], ref: [] },
+    'auth/perm.py': { def: ['check_permission'], ref: ['get_connection'] },
+    'utils/strings.py': { def: ['slugify'], ref: [] },
+    'cli/main.py': { def: ['main'], ref: ['export_report', 'slugify', 'slugify', 'slugify', 'slugify'] },
+    'tests/test_builder.py': { def: ['test_build_filter'], ref: ['build_monthly_report', 'ReportFilter', 'ReportFilter'] },
+  };
+  const FILES = Object.keys(REPO);
+  const IDENTS = ['build_monthly_report', 'check_permission', 'get_connection', 'slugify'];
+  const TOK_DEF = 12;
+  const TOK_FILE = 6;
+  const chat = new Set(['reports/builder.py']);
+  const mentioned = new Set();
+
+  const chatBox = document.getElementById('rmChat');
+  const identBox = document.getElementById('rmIdent');
+  const budget = document.getElementById('rmBudget');
+  const budgetV = document.getElementById('rmBudgetV');
+  const out = document.getElementById('rmOut');
+  const note = document.getElementById('rmNote');
+
+  const mkCheck = (box, set, name) => {
+    const cb = Course.el('input', { type: 'checkbox' });
+    cb.checked = set.has(name);
+    cb.addEventListener('change', () => {
+      if (cb.checked) set.add(name);
+      else set.delete(name);
+      render();
+    });
+    box.append(Course.el('label', {}, [cb, Course.el('code', { text: name })]));
+  };
+  FILES.forEach((f) => mkCheck(chatBox, chat, f));
+  IDENTS.forEach((i) => mkCheck(identBox, mentioned, i));
+  budget.addEventListener('input', render);
+
+  // 简化版：与 aider/repomap.py 的 get_ranked_tags 同样的建图与加权规则
+  function rank() {
+    const defines = {};
+    const refs = {};
+    for (const f of FILES) {
+      REPO[f].def.forEach((d) => (defines[d] = defines[d] || new Set()).add(f));
+      REPO[f].ref.forEach((r) => (refs[r] = refs[r] || []).push(f));
+    }
+    const edges = [];
+    for (const ident of Object.keys(defines)) {
+      if (!refs[ident]) {
+        defines[ident].forEach((d) => edges.push({ src: d, dst: d, w: 0.1, ident }));
+        continue;
+      }
+      let mul = 1;
+      const isSnake = ident.includes('_') && /[a-z]/i.test(ident);
+      const isCamel = /[A-Z]/.test(ident) && /[a-z]/.test(ident);
+      if (mentioned.has(ident)) mul *= 10;
+      if ((isSnake || isCamel) && ident.length >= 8) mul *= 10;
+      if (ident.startsWith('_')) mul *= 0.1;
+      if (defines[ident].size > 5) mul *= 0.1;
+      const counts = {};
+      refs[ident].forEach((r) => (counts[r] = (counts[r] || 0) + 1));
+      for (const [referencer, n] of Object.entries(counts)) {
+        for (const definer of defines[ident]) {
+          const useMul = chat.has(referencer) ? mul * 50 : mul;
+          edges.push({ src: referencer, dst: definer, w: useMul * Math.sqrt(n), ident });
+        }
+      }
+    }
+    // 个性化 PageRank：聊天文件各得 100/N 的个性化权重
+    const pers = {};
+    FILES.forEach((f) => { if (chat.has(f)) pers[f] = 100 / FILES.length; });
+    const persSum = Object.values(pers).reduce((a, b) => a + b, 0);
+    const p = (f) => (persSum > 0 ? (pers[f] || 0) / persSum : 1 / FILES.length);
+    const outW = {};
+    edges.forEach((e) => (outW[e.src] = (outW[e.src] || 0) + e.w));
+    let r = Object.fromEntries(FILES.map((f) => [f, 1 / FILES.length]));
+    for (let it = 0; it < 60; it++) {
+      const nr = Object.fromEntries(FILES.map((f) => [f, 0]));
+      let dangling = 0;
+      FILES.forEach((f) => { if (!outW[f]) dangling += r[f]; });
+      edges.forEach((e) => (nr[e.dst] += 0.85 * r[e.src] * (e.w / outW[e.src])));
+      FILES.forEach((f) => (nr[f] += 0.85 * dangling * p(f) + 0.15 * p(f)));
+      r = nr;
+    }
+    // 把文件分数按出边权重分给它引用的定义
+    const defRank = {};
+    edges.forEach((e) => {
+      const k = e.dst + ' : ' + e.ident;
+      defRank[k] = (defRank[k] || 0) + (r[e.src] * e.w) / outW[e.src];
+    });
+    return Object.entries(defRank)
+      .filter(([k]) => !chat.has(k.split(' : ')[0]))
+      .sort((a, b) => b[1] - a[1]);
+  }
+
+  function render() {
+    budgetV.textContent = budget.value;
+    const ranked = rank();
+    const limit = Number(budget.value);
+    let tokens = 0;
+    const seenFiles = new Set();
+    let cutAt = -1;
+    out.innerHTML = '';
+    const max = ranked.length ? ranked[0][1] : 1;
+    ranked.forEach(([k, score], i) => {
+      const file = k.split(' : ')[0];
+      const add = TOK_DEF + (seenFiles.has(file) ? 0 : TOK_FILE);
+      const fits = cutAt < 0 && tokens + add <= limit;
+      if (fits) {
+        tokens += add;
+        seenFiles.add(file);
+      } else if (cutAt < 0) {
+        cutAt = i;
+      }
+      const tr = Course.el('tr', { class: fits ? '' : 'cut' });
+      tr.innerHTML = `<td>${i + 1}</td><td><code>${k}</code></td><td><span class="rm-bar" style="width:${Math.max(2, (score / max) * 80)}px"></span> ${score >= 0.001 ? score.toFixed(3) : score.toExponential(1)}</td><td>${fits ? tokens : '—'}</td>`;
+      out.append(tr);
+    });
+    if (cutAt > 0) out.children[cutAt - 1].classList.add('cutline');
+    const chatList = [...chat].map((f) => `<code>${f}</code>`).join('、') || '（无）';
+    note.innerHTML = `聊天中的文件：${chatList}（它们自己不进地图）。装进预算的定义 ${cutAt < 0 ? ranked.length : cutAt} 个，约 ${tokens} tokens；红色虚线以下的被截掉。试试把 <code>auth/perm.py</code> 加进聊天，或者勾选提到 <code>slugify</code>，看排名如何变化。`;
+  }
+  render();
+});
+</script>
+</body>
+</html>

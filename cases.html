@@ -1,0 +1,285 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>名作研读 · AI Agent 工程</title>
+<meta name="description" content="怎么读一个成熟 agent 项目的源码：六问读码法、推荐路线，以及同一个工程问题在 9 个知名项目里分别去哪读。">
+<link rel="stylesheet" href="assets/css/course.css">
+<script src="assets/js/manifest.js"></script>
+<script defer src="assets/js/course.js"></script>
+<style>
+  .concerns { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
+  .concerns button { appearance: none; font: inherit; font-size: 13.5px; padding: 5px 12px; border-radius: 99px; border: 1px solid var(--border); background: var(--surface); color: var(--text); cursor: pointer; }
+  .concerns button.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .mx { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 10px; }
+  .mx .cell { border: 1px solid var(--border); border-radius: 9px; padding: 10px 12px; background: var(--bg); font-size: 14px; line-height: 1.6; }
+  .mx .cell b { display: block; margin-bottom: 2px; }
+  .mx .cell .src { display: block; margin-top: 6px; font-size: 12.5px; word-break: break-all; }
+  .mx .cell.none { color: var(--muted); }
+  .mx .cell .src a + a::before { content: " · "; color: var(--muted); }
+</style>
+</head>
+<body data-page="cases">
+<article id="content">
+<div class="eyebrow">第六部分 · 名作研读</div>
+<h1>名作研读：怎么读一个成熟 Agent 项目的源码</h1>
+<p class="lead">前面的章节告诉你"应该怎么做"，复盘告诉你"缺了知识会怎样"。这一部分补上第三块：看业界最成熟的那批 agent 项目<strong>实际是怎么做的</strong>。读懂它们的源码，是从"会写 agent"走向"能评判、能设计 agent 系统"最快的路。</p>
+<div class="meta"><span>约 20 分钟</span><span>前置：读完第 1–15 章更佳</span><span>9 个项目 · 全部固定到具体提交</span></div>
+
+<div class="goals"><b>学完你能</b>
+<ul>
+  <li>用"六问读码法"在一两个小时内摸清一个陌生 agent 仓库的骨架</li>
+  <li>对同一个工程问题（循环、工具、上下文、权限、恢复、记忆），说出 9 个项目各自的做法与取舍</li>
+  <li>按自己的目标选择研读路线，而不是从头到尾硬读</li>
+</ul></div>
+
+<h2>1 · 为什么要读成熟项目的源码</h2>
+<p>博客和论文讲的是作者<em>想让你看到的</em>设计。源码里才有那些没人写进文章的东西：防御性的边界检查、被注释掉的旧方案、为某个线上事故加的特判、注释与实现的不一致。这些恰恰是高级工程师的判断力来源。</p>
+<p>这一部分的 9 篇研读有三条共同约定：</p>
+<ul>
+  <li><strong>固定版本</strong>：每篇都钉在一个具体提交上（2026 年 5–11 月），文中每条源码链接都带完整的提交号和行号，项目以后怎么改都不会失效。</li>
+  <li><strong>说法可核实</strong>：关于代码的每一句话都在克隆下来的源码里核对过；核对不了的不写，或者明确标"示意"。</li>
+  <li><strong>对照课程</strong>：每个关键设计都链回对应的章节；与复盘里的问题相关时，也链到复盘条目。</li>
+</ul>
+
+<div class="callout deep"><b>研读中顺带发现的"成熟项目也会有的问题"</b>
+<p>这些都写进了对应篇目的读码练习里，值得专门留意：Letta 的压缩阈值函数注释说按模型区分 90% 和 100%，实现对所有模型都返回 0.9 倍窗口；Aider 的编辑格式里有一段模糊匹配被一行 <code>return</code> 提前关掉了；mini-swe-agent 自称"约 100 行"，实测核心类 190 行（去掉空行、注释和文档字符串后 158 行）。<strong>读源码时，注释和 README 都只是线索，以代码为准。</strong></p></div>
+
+<h2>2 · 六问读码法</h2>
+<p>面对一个陌生的 agent 仓库，不要从目录树第一个文件开始读。带着下面六个问题去找答案，每个问题对应课程的一章：</p>
+<figure class="anim" data-dim>
+<div class="diagram">
+<svg viewBox="0 0 760 300" width="760" role="img" aria-label="六问读码法">
+  <g data-k="q0"><rect class="box m" x="290" y="120" width="180" height="60" rx="12"/><text class="tb" x="380" y="146" text-anchor="middle">陌生仓库</text><text class="ts" x="380" y="166" text-anchor="middle">README · AGENTS.md · 入口</text></g>
+  <g data-k="q1"><rect class="box a" x="40" y="20" width="200" height="60" rx="10"/><text class="tb" x="140" y="45" text-anchor="middle">① 循环在哪</text><text class="ts" x="140" y="66" text-anchor="middle">第 4 章 · 停止条件、步数上限</text></g>
+  <g data-k="q2"><rect class="box b" x="280" y="20" width="200" height="60" rx="10"/><text class="tb" x="380" y="45" text-anchor="middle">② 工具怎么执行</text><text class="ts" x="380" y="66" text-anchor="middle">第 3 章 · 注册、校验、回灌</text></g>
+  <g data-k="q3"><rect class="box v" x="520" y="20" width="200" height="60" rx="10"/><text class="tb" x="620" y="45" text-anchor="middle">③ 上下文怎么组装</text><text class="ts" x="620" y="66" text-anchor="middle">第 5 章 · 预算、压缩、顺序</text></g>
+  <g data-k="q4"><rect class="box r" x="40" y="220" width="200" height="60" rx="10"/><text class="tb" x="140" y="245" text-anchor="middle">④ 谁能批准什么</text><text class="ts" x="140" y="266" text-anchor="middle">第 8、9 章 · 审批、沙箱</text></g>
+  <g data-k="q5"><rect class="box g" x="280" y="220" width="200" height="60" rx="10"/><text class="tb" x="380" y="245" text-anchor="middle">⑤ 崩了怎么恢复</text><text class="ts" x="380" y="266" text-anchor="middle">第 10 章 · 状态、事件、检查点</text></g>
+  <g data-k="q6"><rect class="box w" x="520" y="220" width="200" height="60" rx="10"/><text class="tb" x="620" y="245" text-anchor="middle">⑥ 记住了什么</text><text class="ts" x="620" y="266" text-anchor="middle">第 6 章 · 项目说明、记忆</text></g>
+  <g data-k="q1"><path class="line a" d="M320 120 L190 80" marker-end="url(#arr-a)"/></g>
+  <g data-k="q2"><path class="line b" d="M380 120 L380 80" marker-end="url(#arr-b)"/></g>
+  <g data-k="q3"><path class="line" d="M440 120 L570 80" marker-end="url(#arr)"/></g>
+  <g data-k="q4"><path class="line r" d="M320 180 L190 220" marker-end="url(#arr-r)"/></g>
+  <g data-k="q5"><path class="line g" d="M380 180 L380 220" marker-end="url(#arr-g)"/></g>
+  <g data-k="q6"><path class="line" d="M440 180 L570 220" marker-end="url(#arr)"/></g>
+</svg>
+</div>
+<ol class="anim-steps">
+  <li data-show="q0" data-hl="q0">先读 README、AGENTS.md（或 CLAUDE.md、GEMINI.md）、贡献指南，再找入口：CLI 的 main、SDK 的公开类。<strong>记下提交号</strong>，之后所有笔记都相对这个版本。</li>
+  <li data-show="q1" data-hl="q1">① 找循环：搜 <code>loop</code>、<code>step</code>、<code>turn</code>、<code>run</code>。看清三件事：一轮做什么、什么时候停、步数或预算的上限在哪。</li>
+  <li data-show="q2" data-hl="q2">② 找工具执行：工具怎么注册、参数谁来校验、执行失败怎么回灌给模型、并发调用怎么处理。</li>
+  <li data-show="q3" data-hl="q3">③ 找上下文组装：系统提示从哪几块拼成、顺序如何（关系到缓存命中）、什么时候压缩、压缩时保留什么。</li>
+  <li data-show="q4" data-hl="q4">④ 找权限：哪些动作要人批准、规则写在哪、有没有沙箱、无人值守时"需要询问"会被怎样处理。</li>
+  <li data-show="q5" data-hl="q5">⑤ 找恢复：状态存在哪（内存、文件、数据库、事件日志）、进程崩溃后从哪继续、副作用会不会重复。</li>
+  <li data-show="q6" data-hl="q6">⑥ 找记忆：项目说明文件怎么加载、跨会话记住什么、谁来写、写错了怎么改。最后读测试：测试会告诉你作者最担心哪里出错。</li>
+</ol>
+<figcaption>六问读码法：每个问题对应一章，回答完六个问题，仓库的骨架就清楚了。</figcaption>
+</figure>
+
+<div class="callout tip"><b>几个省时间的习惯</b>
+<ul>
+  <li><strong>先读测试再读实现</strong>：测试的名字往往就是一份行为规格。</li>
+  <li><strong>用提交历史找"为什么"</strong>：对一个奇怪的判断执行 <code>git log -L</code> 或 <code>git blame</code>，常能找到对应的事故或 issue。</li>
+  <li><strong>只读不跑</strong>：陌生仓库是不可信代码，研读阶段只用 grep 和阅读器，不执行它的安装脚本。</li>
+  <li><strong>画一张自己的图</strong>：读完六问，凭记忆画出数据流图，再回去对照源码。画不出来的地方就是没读懂的地方。</li>
+</ul></div>
+
+<h2>3 · 同一个问题，九种做法</h2>
+<p>选一个问题，看 9 个项目分别怎么做、去哪个文件读。源码链接都固定在各篇研读的版本上。标"—"的格子表示<strong>研读页没有展开这一点</strong>，不代表项目没有这个能力。</p>
+<div class="widget">
+  <div class="w-title">读码对照矩阵</div>
+  <div class="concerns" id="concerns"></div>
+  <div class="mx" id="mx"></div>
+</div>
+
+<h2>4 · 九个项目一览</h2>
+<table>
+<tr><th>项目</th><th>研读版本</th><th>一句话定位</th><th>最值得读的地方</th></tr>
+<tr><td><a href="case-claude-code.html">Claude Code</a></td><td>闭源 · 官方文档与社区分析（2026-11）</td><td>单线程主循环 + 丰富的确定性扩展点</td><td>hooks、权限模式、子 agent 的上下文隔离</td></tr>
+<tr><td><a href="case-codex.html">Codex CLI</a></td><td>9f3cb25 · 2026-11-25 · Apache-2.0</td><td>Rust 实现的编码 agent，审批与沙箱分离</td><td>三层防线、无人值守时"询问即拒绝"</td></tr>
+<tr><td><a href="case-gemini-cli.html">Gemini CLI</a></td><td>08e9a20 · 2026-11-24 · Apache-2.0</td><td>TypeScript monorepo，策略引擎 + 压缩服务</td><td>分层优先级策略、失败也被设计进去的压缩、循环检测</td></tr>
+<tr><td><a href="case-openhands.html">OpenHands</a></td><td>software-agent-sdk 5f1430e · 2026-11-25 · MIT</td><td>一切皆事件：动作与观察写进可回放的事件日志</td><td>事件存储与状态重建、确认策略与安全分析器组合</td></tr>
+<tr><td><a href="case-swe-agent.html">SWE-agent</a></td><td>3ea751c · 2026-07-16；mini 04d809c · 2026-09-03 · MIT</td><td>为 agent 设计接口（ACI）；只用 bash 的极简版本</td><td>窗口化文件查看、编辑后 lint、历史折叠</td></tr>
+<tr><td><a href="case-aider.html">Aider</a></td><td>5dc9490 · 2026-05-22 · Apache-2.0</td><td>终端里的结对编程，按 token 预算排序的 repo map</td><td>PageRank 式排序、编辑格式、git 安全网</td></tr>
+<tr><td><a href="case-letta.html">Letta</a></td><td>archive 56ba9c2 · 2026-08-13 · Apache-2.0</td><td>MemGPT 的工程化：分层记忆、状态落库</td><td>记忆块、0.9 倍窗口压缩、sleep-time 分工</td></tr>
+<tr><td><a href="case-langgraph.html">LangGraph</a></td><td>f961053 · 2026-11-24 · MIT</td><td>Pregel 式超步执行 + 检查点</td><td>interrupt 与恢复时的节点重跑、durability 模式</td></tr>
+<tr><td><a href="case-goose.html">goose</a></td><td>8256b9a · 2026-11-25 · Apache-2.0</td><td>以 MCP 为骨架，扩展一律是 MCP server</td><td>有序可重入的 Operation 流水线、工具延迟加载</td></tr>
+</table>
+
+<h2>5 · 按目标选路线</h2>
+<div class="tabs">
+<div class="tab-panel" data-label="想做编码 agent 驾驭器">
+<ol>
+  <li><a href="case-claude-code.html">Claude Code</a>：先建立"单线程循环 + 确定性扩展点"的整体印象。</li>
+  <li><a href="case-codex.html">Codex CLI</a>：审批与沙箱的工程化做法，对照复盘 D8、D9。</li>
+  <li><a href="case-swe-agent.html">SWE-agent</a>：接口设计比 agent 复杂度更重要。</li>
+  <li><a href="case-openhands.html">OpenHands</a>：用事件流解决状态、回放与恢复，对照复盘 D6、D12。</li>
+</ol>
+</div>
+<div class="tab-panel" data-label="想做个人助理 / 长期运行的 agent">
+<ol>
+  <li><a href="case-letta.html">Letta</a>：分层记忆、状态落库、后台整理记忆。</li>
+  <li><a href="case-langgraph.html">LangGraph</a>：检查点、中断与持久执行，对照第 10 章。</li>
+  <li><a href="case-gemini-cli.html">Gemini CLI</a>：策略引擎与压缩服务，对照复盘 N12、N17。</li>
+  <li><a href="case-goose.html">goose</a>：用 MCP 统一扩展，工具面太宽时的延迟加载。</li>
+</ol>
+</div>
+<div class="tab-panel" data-label="想把上下文工程做扎实">
+<ol>
+  <li><a href="case-aider.html">Aider</a>：在 token 预算内挑出最相关的代码。</li>
+  <li><a href="case-gemini-cli.html">Gemini CLI</a>：压缩的触发、保留比例与失败处理。</li>
+  <li><a href="case-letta.html">Letta</a>：上下文窗口的分区与驱逐。</li>
+  <li><a href="case-claude-code.html">Claude Code</a>：CLAUDE.md、Skills 的渐进披露与子 agent 隔离。</li>
+</ol>
+</div>
+</div>
+
+<div class="quiz" data-answer="3">
+<p class="q">你在一个 agent 项目的源码里看到一段注释："阈值按模型区分，部分模型为 100%"，但函数体对所有模型都返回窗口的 0.9 倍。你应该怎么理解它的实际行为？</p>
+<ol>
+  <li>以注释为准，注释代表设计意图</li>
+  <li>以 README 为准</li>
+  <li>以代码为准：实际行为就是 0.9 倍；注释说明作者曾经或打算区分模型，值得去提交历史里找原因</li>
+  <li>两者都不可信，需要实际运行才能知道</li>
+</ol>
+<div class="explain">运行时只认代码。注释和 README 是理解意图的线索，和代码不一致时，往往说明有过一次改动没同步注释。这正是 Letta 研读页里的一道读码练习。</div>
+</div>
+
+<div class="takeaways"><b>本章要点</b>
+<ul>
+  <li>读源码要固定版本、只读不跑、带着问题读：循环、工具、上下文、权限、恢复、记忆。</li>
+  <li>同一个问题在 9 个项目里有完全不同的解法，比较它们才能看清取舍，而不是记住某一种写法。</li>
+  <li>注释和 README 只是线索，以代码为准；测试和提交历史能告诉你作者为什么这样写。</li>
+</ul></div>
+
+<h2>参考资料</h2>
+<ul class="refs">
+  <li><a href="https://code.claude.com/docs/en/agent-sdk/overview" target="_blank" rel="noopener">Claude Agent SDK 概览</a> <span class="src">Anthropic 官方文档</span></li>
+  <li><a href="https://github.com/openai/codex" target="_blank" rel="noopener">openai/codex</a> <span class="src">Apache-2.0</span></li>
+  <li><a href="https://github.com/google-gemini/gemini-cli" target="_blank" rel="noopener">google-gemini/gemini-cli</a> <span class="src">Apache-2.0</span></li>
+  <li><a href="https://github.com/OpenHands/software-agent-sdk" target="_blank" rel="noopener">OpenHands/software-agent-sdk</a> <span class="src">MIT</span></li>
+  <li><a href="https://github.com/SWE-agent/mini-swe-agent" target="_blank" rel="noopener">SWE-agent/mini-swe-agent</a> <span class="src">MIT</span></li>
+  <li><a href="https://github.com/Aider-AI/aider" target="_blank" rel="noopener">Aider-AI/aider</a> <span class="src">Apache-2.0</span></li>
+  <li><a href="https://github.com/letta-ai/letta" target="_blank" rel="noopener">letta-ai/letta</a> <span class="src">Apache-2.0</span></li>
+  <li><a href="https://github.com/langchain-ai/langgraph" target="_blank" rel="noopener">langchain-ai/langgraph</a> <span class="src">MIT</span></li>
+  <li><a href="https://github.com/aaif-goose/goose" target="_blank" rel="noopener">aaif-goose/goose</a> <span class="src">Apache-2.0</span></li>
+</ul>
+</article>
+
+<script>
+window.addEventListener('DOMContentLoaded', () => {
+  const R = {
+    codex: 'https://github.com/openai/codex/blob/9f3cb259535c72de6960cc837ac705a780c62995/',
+    gemini: 'https://github.com/google-gemini/gemini-cli/blob/08e9a20f749aefcbda38622ac757899c3d6216e0/',
+    oh: 'https://github.com/OpenHands/software-agent-sdk/blob/5f1430ebbec30747efe0d0e5e041fb7be36d782e/',
+    swe: 'https://github.com/SWE-agent/SWE-agent/blob/3ea751c087f32b16e039a2233dd6eefecef325d5/',
+    mini: 'https://github.com/SWE-agent/mini-swe-agent/blob/04d809ceab9df28f9adaed044884180159172930/',
+    aider: 'https://github.com/Aider-AI/aider/blob/5dc9490bb35f9729ef2c95d00a19ccd30c26339c/',
+    letta: 'https://github.com/letta-ai/letta/blob/56ba9c25552605eec89de8ed3dc6394b625c1993/',
+    lg: 'https://github.com/langchain-ai/langgraph/blob/f96105368f9e9385d4c9e38bffaa457aba17f095/',
+    goose: 'https://github.com/aaif-goose/goose/blob/8256b9ac9ffae7d19ef1db1f57e37f84c44915bd/',
+    cc: 'https://code.claude.com/docs/en/',
+  };
+  const CONCERNS = [
+    ['loop', '① 主循环'], ['tools', '② 工具与动作'], ['context', '③ 上下文与压缩'],
+    ['perm', '④ 权限与安全'], ['state', '⑤ 状态与恢复'], ['memory', '⑥ 记忆与项目说明'],
+  ];
+  // [项目名, 研读页, { 关注点: [说明, [[仓库键, 路径, 显示名], ...]] }]
+  const P = [
+    ['Claude Code', 'case-claude-code.html', {
+      loop: ['单线程主循环；官方把同一套 harness 以 Agent SDK 的形式开放', [['cc', 'agent-sdk/overview', 'Agent SDK 概览']]],
+      tools: ['内置工具 + MCP；子 agent 用独立上下文完成任务后只回传结果', [['cc', 'mcp', 'MCP'], ['cc', 'sub-agents', '子 agent']]],
+      context: ['CLAUDE.md 预加载，其余按需读取；Skills 渐进披露', [['cc', 'memory', '记忆与 CLAUDE.md'], ['cc', 'skills', 'Skills']]],
+      perm: ['权限规则与模式、沙箱；hooks 作为确定性的拦截点', [['cc', 'permissions', '权限'], ['cc', 'sandboxing', '沙箱'], ['cc', 'hooks', 'Hooks']]],
+      state: ['会话可 resume；headless 模式输出结构化事件', [['cc', 'headless', 'Headless']]],
+      memory: ['CLAUDE.md 分层加载与自动记忆', [['cc', 'memory', '记忆']]],
+    }],
+    ['Codex CLI', 'case-codex.html', {
+      loop: ['run_turn 主循环；Stop hook 可以要求继续一轮', [['codex', 'codex-rs/core/src/session/turn.rs', 'session/turn.rs']]],
+      tools: ['工具编排：先过审批与策略，再进沙箱执行，失败时按策略升级', [['codex', 'codex-rs/core/src/tools/orchestrator.rs', 'tools/orchestrator.rs']]],
+      context: ['自动压缩，压缩用专门的提示模板', [['codex', 'codex-rs/prompts/templates/compact/prompt.md', 'compact/prompt.md']]],
+      perm: ['审批策略与沙箱是两件事；危险命令单独识别', [['codex', 'codex-rs/core/src/tools/sandboxing.rs', 'tools/sandboxing.rs'], ['codex', 'codex-rs/shell-command/src/command_safety/is_dangerous_command.rs', 'is_dangerous_command.rs']]],
+      state: ['exec 无交互模式输出 JSON 事件流', [['codex', 'codex-rs/exec/src/exec_events.rs', 'exec_events.rs']]],
+      memory: ['AGENTS.md 按目录层级加载', [['codex', 'codex-rs/core/src/agents_md.rs', 'agents_md.rs']]],
+    }],
+    ['Gemini CLI', 'case-gemini-cli.html', {
+      loop: ['GeminiClient 驱动对话轮次；另有循环检测与"下一个该谁说"的检查', [['gemini', 'packages/core/src/core/client.ts', 'core/client.ts'], ['gemini', 'packages/core/src/services/loopDetectionService.ts', 'loopDetectionService.ts']]],
+      tools: ['调度器管理工具调用的状态（校验、等待确认、执行）', [['gemini', 'packages/core/src/scheduler/scheduler.ts', 'scheduler.ts'], ['gemini', 'packages/core/src/tools/tools.ts', 'tools.ts']]],
+      context: ['压缩服务：超过阈值触发，保留最近一段历史', [['gemini', 'packages/core/src/context/chatCompressionService.ts', 'chatCompressionService.ts']]],
+      perm: ['分层、按优先级合并规则的策略引擎', [['gemini', 'packages/core/src/policy/policy-engine.ts', 'policy-engine.ts']]],
+      state: ['检查点：编辑类工具进入等待批准时用 git 打快照', [['gemini', 'packages/core/src/services/gitService.ts', 'gitService.ts']]],
+      memory: ['GEMINI.md 的发现与按需加载', [['gemini', 'packages/core/src/utils/memoryDiscovery.ts', 'memoryDiscovery.ts']]],
+    }],
+    ['OpenHands', 'case-openhands.html', {
+      loop: ['Agent.step() 产出动作事件；会话对象驱动整个过程', [['oh', 'openhands-sdk/openhands/sdk/agent/agent.py', 'agent/agent.py'], ['oh', 'openhands-sdk/openhands/sdk/conversation/impl/local_conversation.py', 'local_conversation.py']]],
+      tools: ['动作与观察都是带类型的事件；执行发生在工作区里', [['oh', 'openhands-sdk/openhands/sdk/event/types.py', 'event/types.py'], ['oh', 'openhands-sdk/openhands/sdk/workspace/workspace.py', 'workspace.py']]],
+      context: null,
+      perm: ['确认策略 + 多个安全分析器的组合', [['oh', 'openhands-sdk/openhands/sdk/security/confirmation_policy.py', 'confirmation_policy.py'], ['oh', 'openhands-sdk/openhands/sdk/security/ensemble.py', 'security/ensemble.py']]],
+      state: ['事件写进事件存储，状态可以从事件重建', [['oh', 'openhands-sdk/openhands/sdk/conversation/event_store.py', 'event_store.py'], ['oh', 'openhands-sdk/openhands/sdk/conversation/state.py', 'conversation/state.py']]],
+      memory: null,
+    }],
+    ['SWE-agent', 'case-swe-agent.html', {
+      loop: ['mini 版只用 bash 的线性循环；完整版的 agent 主类', [['mini', 'src/minisweagent/agents/default.py', 'mini: agents/default.py'], ['swe', 'sweagent/agent/agents.py', 'agent/agents.py']]],
+      tools: ['以 bundle 组织的工具；窗口化查看文件、编辑后 lint', [['swe', 'sweagent/tools/tools.py', 'tools/tools.py'], ['swe', 'tools/windowed/lib/windowed_file.py', 'windowed_file.py']]],
+      context: ['历史处理器折叠旧的观察', [['swe', 'sweagent/agent/history_processors.py', 'history_processors.py']]],
+      perm: ['mini 版每一步都在独立子进程里执行', [['mini', 'src/minisweagent/environments/local.py', 'mini: environments/local.py']]],
+      state: null,
+      memory: null,
+    }],
+    ['Aider', 'case-aider.html', {
+      loop: ['Coder 基类负责一轮对话：组装、发送、应用编辑、反馈', [['aider', 'aider/coders/base_coder.py', 'base_coder.py']]],
+      tools: ['不用工具调用，而是解析模型输出的编辑块再确定性地应用', [['aider', 'aider/coders/editblock_coder.py', 'editblock_coder.py']]],
+      context: ['repo map 按 token 预算排序裁剪；按块组织消息以利缓存', [['aider', 'aider/repomap.py', 'repomap.py'], ['aider', 'aider/coders/chat_chunks.py', 'chat_chunks.py']]],
+      perm: ['git 作为安全网：每次修改自动提交，/undo 有三道检查', [['aider', 'aider/repo.py', 'repo.py'], ['aider', 'aider/commands.py', 'commands.py']]],
+      state: ['状态就是 git 历史', [['aider', 'aider/repo.py', 'repo.py']]],
+      memory: ['聊天历史过长时做摘要', [['aider', 'aider/history.py', 'history.py']]],
+    }],
+    ['Letta', 'case-letta.html', {
+      loop: ['LettaAgentV3 每一步后检查上下文是否需要压缩', [['letta', 'letta/agents/letta_agent_v3.py', 'letta_agent_v3.py']]],
+      tools: ['记忆编辑等基础工具，带防呆检查', [['letta', 'letta/functions/function_sets/base.py', 'function_sets/base.py']]],
+      context: ['0.9 倍窗口触发滑动窗口压缩', [['letta', 'letta/services/summarizer/summarizer_sliding_window.py', 'summarizer_sliding_window.py']]],
+      perm: null,
+      state: ['agent 状态落库，进程本身无状态', [['letta', 'letta/services/agent_manager.py', 'agent_manager.py']]],
+      memory: ['记忆块常驻上下文；sleep-time agent 在后台整理', [['letta', 'letta/schemas/memory.py', 'schemas/memory.py'], ['letta', 'letta/groups/sleeptime_multi_agent_v4.py', 'sleeptime_multi_agent_v4.py']]],
+    }],
+    ['LangGraph', 'case-langgraph.html', {
+      loop: ['PregelLoop 按超步推进：tick、写入、存检查点', [['lg', 'libs/langgraph/langgraph/pregel/_loop.py', 'pregel/_loop.py']]],
+      tools: null,
+      context: ['图的状态与 reducer 决定每个节点看到什么', [['lg', 'libs/langgraph/langgraph/graph/state.py', 'graph/state.py']]],
+      perm: ['interrupt() 暂停等人，Command(resume) 继续', [['lg', 'libs/langgraph/langgraph/types.py', 'types.py']]],
+      state: ['checkpointer 接口：每个超步后存检查点，按 thread_id 恢复', [['lg', 'libs/checkpoint/langgraph/checkpoint/base/__init__.py', 'checkpoint/base']]],
+      memory: null,
+    }],
+    ['goose', 'case-goose.html', {
+      loop: ['每轮先走一条有序、可重入的 Operation 流水线，最后才推理', [['goose', 'crates/goose/src/agents/state_machine_builder.rs', 'state_machine_builder.rs']]],
+      tools: ['一切扩展都是 MCP server，内置扩展也不例外', [['goose', 'crates/goose/src/agents/extension_manager/builtin.rs', 'builtin.rs'], ['goose', 'crates/goose/src/agents/extension_config.rs', 'extension_config.rs']]],
+      context: ['上下文 80% 时压缩；可选的工具延迟加载', [['goose', 'crates/goose/src/agents/services.rs', 'agents/services.rs']]],
+      perm: ['权限检查器，与其他检查器依次装配', [['goose', 'crates/goose/src/permission/permission_inspector.rs', 'permission_inspector.rs']]],
+      state: null,
+      memory: null,
+    }],
+  ];
+
+  const bar = document.getElementById('concerns');
+  const box = document.getElementById('mx');
+  const show = (key) => {
+    bar.querySelectorAll('button').forEach((b) => b.classList.toggle('on', b.dataset.k === key));
+    box.innerHTML = P.map(([name, page, m]) => {
+      const c = m[key];
+      if (!c) return `<div class="cell none"><b><a href="${page}">${name}</a></b>—</div>`;
+      const links = c[1].map(([r, p, label]) => `<a href="${R[r]}${p}" target="_blank" rel="noopener"><code>${label}</code></a>`).join('');
+      return `<div class="cell"><b><a href="${page}">${name}</a></b>${c[0]}<span class="src">${links}</span></div>`;
+    }).join('');
+  };
+  for (const [k, label] of CONCERNS) {
+    const b = Course.el('button', { type: 'button', text: label, 'data-k': k });
+    b.addEventListener('click', () => show(k));
+    bar.append(b);
+  }
+  show('loop');
+});
+</script>
+</body>
+</html>
