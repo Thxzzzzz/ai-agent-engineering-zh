@@ -1,0 +1,1118 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P6 评测流水线 · AI Agent 工程</title>
+<meta name="description" content="跟练项目 P6：为分诊管线和 agent 搭一条评测流水线——任务集、多次试验、代码 grader 与二元 LLM 判官、判官对齐、pass^k、基线对比与 CI 闸门。">
+<link rel="stylesheet" href="assets/css/course.css">
+<script src="assets/js/manifest.js"></script>
+<script defer src="assets/js/course.js"></script>
+<style>
+  .ea-case { border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; margin: 10px 0; background: var(--bg); }
+  .ea-case .ea-in { font-size: 13.5px; color: var(--muted); }
+  .ea-case .ea-out { font-size: 14.5px; margin: 6px 0; }
+  .ea-ctrl { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .ea-ctrl select { width: auto; min-width: 150px; }
+  .ea-case.right { border-color: var(--ok); }
+  .ea-case.wrong { border-color: var(--danger); }
+  .ea-note { display: none; font-size: 13.5px; margin-top: 6px; padding: 6px 10px; border-radius: 6px; background: var(--violet-soft); }
+  .ea-case.checked .ea-note { display: block; }
+  .rp-dots { font-family: var(--mono); letter-spacing: 2px; white-space: nowrap; }
+  .rp-dots .y { color: var(--ok); }
+  .rp-dots .n { color: var(--danger); }
+  .rp-stats { display: flex; flex-wrap: wrap; gap: 18px; margin: 10px 0; }
+</style>
+</head>
+<body data-page="p6">
+<article id="content">
+<div class="eyebrow">跟练项目 · P6</div>
+<h1>P6 · 评测流水线</h1>
+<p class="lead">"改了一句提示词，到底是变好还是变坏？"——没有评测，这个问题只能靠感觉。这个项目给 P2 的分诊管线和 P1 的 agent 搭一条完整的评测流水线，最后接进 CI，让回归无处藏身。</p>
+<div class="meta"><span>约 150 分钟</span><span>前置：P1、P2、第 13 章</span><span>含 1 个分步动画、2 个交互练习、1 道小测</span></div>
+
+<div class="goals"><b>做完你能</b>
+<ul>
+  <li>从真实失败出发做错误分析，把它们整理成失败模式和评测任务</li>
+  <li>写代码 grader 和"一个失败模式一个"的二元 LLM 判官，并用人工标注检验判官（TPR / TNR）</li>
+  <li>每个任务跑 k 次，区分 pass@k 与 pass^k，知道面向用户的系统该看哪个</li>
+  <li>生成带基线对比的报告，并把回归集接进 CI 作为合并闸门</li>
+</ul></div>
+
+<h2>1 · 成品是什么</h2>
+<p>一个 <code>evals/</code> 目录，加一条命令 <code>bun evals/cli.ts</code>。它读取任务集，对每个任务跑 k 次试验，先用代码判、再按需请判官判，输出报告和与基线的差异；在 CI 里，回归集没达标就不许合并。</p>
+
+<figure class="anim" data-dim>
+<div class="diagram">
+<svg viewBox="0 0 760 330" width="760" role="img" aria-label="评测流水线">
+  <g data-k="trace"><rect class="box m" x="20" y="30" width="130" height="60" rx="10"/><text class="tb" x="85" y="56" text-anchor="middle">线上 trace</text><text class="ts" x="85" y="76" text-anchor="middle">出错 · 被拒 · 被改</text></g>
+  <g data-k="ea"><rect class="box v" x="200" y="30" width="150" height="60" rx="10"/><text class="tb" x="275" y="56" text-anchor="middle">错误分析</text><text class="ts" x="275" y="76" text-anchor="middle">开放笔记 → 失败模式</text></g>
+  <g data-k="tasks"><rect class="box a" x="400" y="30" width="150" height="60" rx="10"/><text class="tb" x="475" y="56" text-anchor="middle">tasks.jsonl</text><text class="ts" x="475" y="76" text-anchor="middle">回归集 · 能力集</text></g>
+  <g data-k="runner"><rect class="box b" x="400" y="140" width="150" height="60" rx="10"/><text class="tb" x="475" y="166" text-anchor="middle">runner</text><text class="ts" x="475" y="186" text-anchor="middle">每任务 k 次 · 干净环境</text></g>
+  <g data-k="code"><rect class="box g" x="600" y="110" width="140" height="44" rx="8"/><text class="t" x="670" y="137" text-anchor="middle">代码 grader</text></g>
+  <g data-k="judge"><rect class="box v" x="600" y="186" width="140" height="44" rx="8"/><text class="t" x="670" y="213" text-anchor="middle">二元 LLM 判官</text></g>
+  <g data-k="align"><rect class="box w" x="600" y="262" width="140" height="50" rx="8"/><text class="t" x="670" y="284" text-anchor="middle">判官对齐</text><text class="ts" x="670" y="302" text-anchor="middle">人工标注 → TPR/TNR</text></g>
+  <g data-k="report"><rect class="box a" x="200" y="140" width="150" height="60" rx="10"/><text class="tb" x="275" y="166" text-anchor="middle">报告</text><text class="ts" x="275" y="186" text-anchor="middle">pass^k · 失败模式 · 基线</text></g>
+  <g data-k="ci"><rect class="box r" x="20" y="140" width="130" height="60" rx="10"/><text class="tb" x="85" y="166" text-anchor="middle">CI 闸门</text><text class="ts" x="85" y="186" text-anchor="middle">回归集近 100%</text></g>
+  <g data-k="e1"><path class="line" d="M150 60 H200" marker-end="url(#arr)"/></g>
+  <g data-k="e2"><path class="line" d="M350 60 H400" marker-end="url(#arr)"/></g>
+  <g data-k="e3"><path class="line a" d="M475 90 V140" marker-end="url(#arr-a)"/></g>
+  <g data-k="e4"><path class="line g" d="M550 160 C575 160 575 132 600 132" marker-end="url(#arr-g)"/><path class="line" d="M550 180 C575 180 575 208 600 208" marker-end="url(#arr)"/></g>
+  <g data-k="e5"><path class="line b dash" d="M670 230 V262" marker-end="url(#arr-b)"/></g>
+  <g data-k="e6"><path class="line" d="M400 170 H350" marker-end="url(#arr)"/></g>
+  <g data-k="e7"><path class="line r" d="M200 170 H150" marker-end="url(#arr-r)"/></g>
+</svg>
+</div>
+<ol class="anim-steps">
+  <li data-show="trace" data-hl="trace">起点永远是<strong>真实失败</strong>：运行时报错的、被用户拒绝或改写的输出。官方建议从 20–50 个这样的任务起步就够了，不必一开始就追求规模。</li>
+  <li data-show="ea e1" data-hl="ea e1">错误分析：逐条读 trace，先写自由笔记（开放编码），再把笔记归成几类失败模式（轴向编码）。读到不再出现新类型为止。</li>
+  <li data-show="tasks e2" data-hl="tasks e2">把样本变成任务：输入、能用代码判的期望字段、要请判官检查的失败模式、参考答案。新任务先进<strong>能力集</strong>，稳定通过后"毕业"进<strong>回归集</strong>。</li>
+  <li data-show="runner e3" data-hl="runner e3">runner 对每个任务跑 k 次，每次都重建环境，限制并发以免打爆速率限制。模型有随机性，跑一次的结果说明不了问题。</li>
+  <li data-show="code judge e4" data-hl="code judge e4">先用代码 grader：快、便宜、可复现。只有代码判不了的（"有没有乱承诺"）才交给判官；每个判官只查一种失败，只答通过 / 失败 / 无法判断。</li>
+  <li data-show="align e5" data-hl="align e5">判官本身也要被评测：拿人工标注算它和人的一致程度。判官把真失败判成通过（放过问题）是最危险的错误。</li>
+  <li data-show="report e6" data-hl="report e6">报告给出 pass@1、pass^k、按失败模式的计数，并逐任务和基线比：一个任务坏了、另一个变好时平均分不变，只有逐任务对比才看得出回归。</li>
+  <li data-show="ci e7" data-hl="ci e7">CI 只跑回归集：通过率低于阈值、或出现一次都没过的任务，就拒绝合并。能力集定期跑，用来衡量进步。</li>
+</ol>
+<figcaption>图 P6-1 评测流水线的数据流。</figcaption>
+</figure>
+
+<h2>2 · 练到的能力</h2>
+<table>
+<tr><th>能力</th><th>对应章节</th></tr>
+<tr><td>错误分析、grader 类型、pass@k 与 pass^k、能力集与回归集</td><td><a href="ch13-evals.html">第 13 章 评测</a></td></tr>
+<tr><td>trace 作为评测任务的来源</td><td><a href="ch14-observability.html">第 14 章 可观测性、成本与运维</a></td></tr>
+<tr><td>用结构化输出实现判官</td><td><a href="ch03-structured-tools.html">第 3 章</a>、<a href="p2-triage.html">P2</a></td></tr>
+<tr><td>评结果而不是评路径：检查 agent 造成的最终状态</td><td><a href="ch04-agent-loop.html">第 4 章</a>、<a href="p1-minimal-loop.html">P1</a></td></tr>
+</table>
+
+<h2>3 · 前置</h2>
+<ul>
+  <li>完成 <a href="p1-minimal-loop.html">P1</a> 与 <a href="p2-triage.html">P2</a>。本页用到的接口：P1 的 <code>runAgent(goal, opts)</code>（返回 <code>{ text, messages, steps, usage }</code>）、<code>defineTool</code> 与 <code>OpenAICompatibleModel.fromEnv()</code>；P2 的 <code>completeStructured(model, { schema, system, user })</code>（返回 <code>{ value, usage, attempts }</code>）、<code>analyzeTicket</code> 与 <code>loadPrompt</code>。</li>
+  <li>评测要跑<strong>真实模型</strong>才有意义。本页的单元测试用桩函数和 <code>FakeModel</code>，只验证评测流水线本身没写错、评测对象和 P1/P2 接对了。</li>
+  <li>任务里断言的字段（<code>category</code>、<code>urgency</code>、<code>needs_reply</code>、<code>reply_draft</code>、<code>route.queue</code> 等）就是 P2 <code>TicketAnalysis</code> 的字段，加上路由结果 <code>route</code>。</li>
+</ul>
+
+<h2>4 · 先动手：做一次错误分析</h2>
+<p>写任何代码之前，先像评测负责人那样读 trace。下面是分诊管线对 6 张工单起草的回复。对每一条判断"能不能直接发给用户"；判失败的，选出最主要的失败原因。做完点"对照专家标注"。</p>
+
+<div class="widget" id="ea">
+<div class="w-title">错误分析练习：6 条回复草稿</div>
+<div data-cases></div>
+<div class="w-row" style="grid-template-columns:auto 1fr; align-items:center">
+  <button class="btn primary" type="button" data-check>对照专家标注</button>
+  <span class="pill" data-score>尚未提交</span>
+</div>
+<div class="w-out" data-summary style="display:none"></div>
+</div>
+
+<p>这就是 Hamel Husain 与 Shreya Shankar 推荐的流程：先亲自读（至少 30 条，读到不再出现新的失败类型），写自由笔记，再归类。你会发现失败模式往往<strong>和你事先想象的不一样</strong>——这正是不能先拍脑袋写评测指标的原因。</p>
+
+<h2>5 · 目录与文件</h2>
+<div class="callout tip"><b>参考实现</b>
+<p>本项目的完整代码在课程仓库的 <code>agent-lab/</code> 目录：<code>evals/</code>、<code>.github/workflows/evals.yml</code> 与 <code>tests/evals.test.ts</code>。所有项目共用一个仓库、一套测试，说明见 <a href="agent-lab/README.md">agent-lab/README.md</a>。建议先自己写，卡住了再对照。</p></div>
+<pre data-title="P6 新增的文件"><code>
+agent-lab/
+├── evals/
+│   ├── types.ts           # 任务、试验结果、判官的类型
+│   ├── tasks.jsonl        # 评测任务，一行一个
+│   ├── failure-modes.ts   # 错误分析得出的失败模式定义（判官的依据）
+│   ├── graders/
+│   │   ├── code.ts        # 代码 grader：字段断言
+│   │   └── judge.ts       # 二元 LLM 判官
+│   ├── targets.ts         # 被评测对象：分诊管线、带待办环境的 agent
+│   ├── runner.ts          # k 次试验、并发上限、错误隔离
+│   ├── metrics.ts         # pass@1、pass@k、pass^k、失败计数
+│   ├── report.ts          # 报告与基线对比
+│   ├── cli.ts             # 命令行入口与 CI 闸门
+│   ├── align.ts           # 判官对齐：TPR / TNR
+│   ├── from-traces.ts     # 从 trace 挑候选任务
+│   └── results/           # 每次运行的结果与报告（加进 .gitignore）
+└── tests/evals.test.ts
+</code></pre>
+
+<h2>6 · 分步实现</h2>
+
+<h3>6.1 数据结构与任务集</h3>
+<p>任务是评测的核心资产，比代码更值钱。每个任务要满足一个标准：两位领域专家各自看了，会给出相同的判断。</p>
+<pre data-title="evals/types.ts"><code class="lang-ts">
+// 评测的数据结构。任务写在 evals/tasks.jsonl，每行一个 EvalTask。
+export type Assertion =
+  | { path: string; equals: unknown }
+  | { path: string; oneOf: unknown[] }
+  | { path: string; includes: string }
+  | { path: string; excludes: string }
+  | { path: string; matches: string };
+
+export type EvalTask = {
+  id: string;
+  suite: 'regression' | 'capability'; // 回归集应接近全过；能力集一开始通过率偏低是正常的
+  target: 'triage' | 'agent';
+  input: unknown;
+  expect: Assertion[];                // 代码 grader：能用代码判的都用代码判
+  judge: string[];                    // 需要 LLM 判官检查的失败模式 id（见 failure-modes.ts）
+  reference: string | null;           // 参考答案，给人和判官看
+  tags: string[];
+  source: string;                     // manual 或 trace:&lt;id&gt;
+};
+
+export type Verdict = 'pass' | 'fail' | 'unknown';
+
+export type Failure = { mode: string; detail: string };
+
+export type TrialResult = {
+  taskId: string;
+  trial: number;
+  verdict: Verdict;
+  failures: Failure[];
+  output: unknown;
+  error: string | null;
+  ms: number;
+};
+
+export type TargetRun = { output: unknown; transcript: string };
+export type Target = (input: unknown) =&gt; Promise&lt;TargetRun&gt;;
+
+export type JudgeResult = { verdict: Verdict; reason: string };
+export type JudgeFn = (mode: string, task: EvalTask, run: TargetRun) =&gt; Promise&lt;JudgeResult&gt;;
+</code></pre>
+<pre data-title="evals/tasks.jsonl"><code class="lang-json">
+{"id":"triage-export-filter","suite":"regression","target":"triage","input":{"id":"e-1","from":"alice@example.com","channel":"email","subject":"月报导出","body":"导出的月报能不能按部门筛选？下周一要用。","receivedAt":"2026-11-30T09:12:00Z"},"expect":[{"path":"category","equals":"request"},{"path":"needs_reply","equals":true},{"path":"route.queue","equals":"product"}],"judge":["ignores_main_question","unfounded_commitment"],"reference":"说明会确认可行性并在约定时间前答复，不承诺上线日期。","tags":["request"],"source":"manual"}
+{"id":"triage-export-500","suite":"regression","target":"triage","input":{"id":"e-2","from":"bob@example.com","channel":"chat","subject":"导出报错","body":"今天导出月报一直报 500，财务部全组都卡住了，月底要交。","receivedAt":"2026-11-30T10:03:00Z"},"expect":[{"path":"category","equals":"bug"},{"path":"urgency","oneOf":["high","critical"]},{"path":"route.queue","equals":"engineering"}],"judge":["unfounded_commitment"],"reference":null,"tags":["bug"],"source":"manual"}
+{"id":"triage-newsletter","suite":"regression","target":"triage","input":{"id":"e-3","from":"news@example.com","channel":"email","subject":"本周行业资讯","body":"本周资讯汇总，无需回复。","receivedAt":"2026-11-30T07:00:00Z"},"expect":[{"path":"needs_reply","equals":false},{"path":"reply_draft","equals":null},{"path":"route.action","equals":"archive"}],"judge":[],"reference":null,"tags":["noise"],"source":"manual"}
+{"id":"agent-add-dup","suite":"capability","target":"agent","input":{"prompt":"帮我加一条待办：交周报","seed":["交周报"]},"expect":[{"path":"todos.length","equals":1},{"path":"answer","includes":"已存在"}],"judge":["claims_unperformed_action"],"reference":"清单里已有同名待办，告诉用户已存在，不重复添加。","tags":["error-handling"],"source":"trace:demo-17"}
+{"id":"agent-complete-by-name","suite":"capability","target":"agent","input":{"prompt":"把「订会议室」标成完成","seed":["交周报","订会议室"]},"expect":[{"path":"todos.1.done","equals":true},{"path":"todos.0.done","equals":false}],"judge":["claims_unperformed_action"],"reference":null,"tags":["multi-step"],"source":"manual"}
+</code></pre>
+<div class="callout tip"><b>正例与反例都要有</b>
+<p>只收"该回复"的工单，就测不出"不该回复却回了"的问题。<code>triage-newsletter</code> 是一个反例：资讯邮件不需要回复。agent 的任务里，<code>agent-add-dup</code> 检查它会不会在出错时假装成功。</p></div>
+
+<h3>6.2 代码 grader：能用代码判的都用代码判</h3>
+<p>确定性、免费、可复现。注意"字段缺失"必须算失败——这是最常见的 grader bug。</p>
+<pre data-title="evals/graders/code.ts"><code class="lang-ts">
+import type { Assertion, Failure } from '../types';
+
+// 按 "a.b.0.c" 取值；路径不存在返回 undefined。
+export function getPath(value: unknown, path: string): unknown {
+  let cur: unknown = value;
+  for (const key of path.split('.')) {
+    if (cur === null || typeof cur !== 'object') return undefined;
+    cur = (cur as Record&lt;string, unknown&gt;)[key];
+  }
+  return cur;
+}
+
+function show(v: unknown): string {
+  return v === undefined ? '（缺失）' : JSON.stringify(v);
+}
+
+export function gradeAssertions(output: unknown, assertions: Assertion[]): Failure[] {
+  const failures: Failure[] = [];
+  for (const a of assertions) {
+    const actual = getPath(output, a.path);
+    const text = typeof actual === 'string' ? actual : JSON.stringify(actual ?? '');
+    let ok: boolean;
+    let want: string;
+    if ('equals' in a) {
+      ok = actual !== undefined &amp;&amp; Bun.deepEquals(actual, a.equals);
+      want = `等于 ${show(a.equals)}`;
+    } else if ('oneOf' in a) {
+      ok = a.oneOf.some((x) =&gt; Bun.deepEquals(actual, x));
+      want = `属于 ${show(a.oneOf)}`;
+    } else if ('includes' in a) {
+      ok = actual !== undefined &amp;&amp; text.includes(a.includes);
+      want = `包含 "${a.includes}"`;
+    } else if ('excludes' in a) {
+      ok = actual !== undefined &amp;&amp; !text.includes(a.excludes);
+      want = `不包含 "${a.excludes}"`;
+    } else {
+      ok = actual !== undefined &amp;&amp; new RegExp(a.matches).test(text);
+      want = `匹配 /${a.matches}/`;
+    }
+    if (!ok) failures.push({ mode: `assert:${a.path}`, detail: `${a.path} 应${want}，实际 ${show(actual)}` });
+  }
+  return failures;
+}
+</code></pre>
+
+<h3>6.3 失败模式与二元判官</h3>
+<p>判官提示词的原料就是错误分析的产物：每个失败模式一个定义、一个通过的例子、一个失败的例子。几个刻意的设计：</p>
+<ul>
+  <li><strong>一个判官只查一种失败</strong>，不打 1–5 分。二元结论更稳定，也更容易和人工标注对齐。</li>
+  <li><strong>先摘证据再下结论</strong>：schema 里 <code>evidence</code> 排在 <code>verdict</code> 前面，让模型先找依据。</li>
+  <li><strong>允许 unknown</strong>：信息不足时说"判断不了"，比硬猜好。unknown 单独计数，交给人看。</li>
+</ul>
+<pre data-title="evals/failure-modes.ts"><code class="lang-ts">
+// 失败模式来自错误分析（读真实 trace → 开放笔记 → 归类），不是凭空列出来的。
+// 每个模式一个二元判官：只回答"这个失败有没有发生"。
+export const FAILURE_MODES: Record&lt;string, { title: string; definition: string; passExample: string; failExample: string }&gt; = {
+  unfounded_commitment: {
+    title: '无依据的承诺',
+    definition: '回复草稿承诺了具体的完成时间、结果或补偿，但工单内容和参考信息里都没有依据。',
+    passExample: '"已收到，我们确认后今天内回复你处理方案。"（只承诺回复，不承诺结果）',
+    failExample: '"这个问题明天上午一定修好。"（工单里没有任何人给出过这个时间）',
+  },
+  ignores_main_question: {
+    title: '没回应主要问题',
+    definition: '工单里有一个明确的问题或请求，回复草稿没有回应它，只给了泛泛的客套话。',
+    passExample: '对方问"导出能按部门筛选吗"，草稿说明了能否筛选或何时答复。',
+    failExample: '对方问"导出能按部门筛选吗"，草稿只说"感谢反馈，我们会持续改进"。',
+  },
+  claims_unperformed_action: {
+    title: '声称做了没做的事',
+    definition: '最终回答声称已经完成某个动作（已添加、已删除、已发送），但执行轨迹里没有对应的成功工具调用。',
+    passExample: '轨迹里有 add_todo 成功的结果，回答说"已添加"。',
+    failExample: '轨迹里 add_todo 返回错误，回答却说"已帮你添加"。',
+  },
+};
+</code></pre>
+<pre data-title="evals/graders/judge.ts"><code class="lang-ts">
+import { z } from 'zod';
+import type { Model } from '../../src/model';
+import { completeStructured } from '../../src/structured';
+import { FAILURE_MODES } from '../failure-modes';
+import type { EvalTask, JudgeFn, TargetRun } from '../types';
+
+const JudgeSchema = z.strictObject({
+  evidence: z.string().describe('从输出或轨迹里原样摘出的、支撑判断的片段；没有就写"无"'),
+  verdict: z.enum(['pass', 'fail', 'unknown']).describe('pass = 该失败没有发生；fail = 发生了；unknown = 信息不足以判断'),
+  reason: z.string().describe('一两句话说明判断依据'),
+});
+
+export function judgePrompt(mode: string): string {
+  const m = FAILURE_MODES[mode];
+  if (!m) throw new Error(`未定义的失败模式：${mode}`);
+  return [
+    '你是一名严格的评测员，只检查一种失败模式，不评价其他方面。',
+    `失败模式：${m.title}`,
+    `定义：${m.definition}`,
+    `不算失败的例子：${m.passExample}`,
+    `算失败的例子：${m.failExample}`,
+    '先摘出证据，再下结论。证据不足以判断时选 unknown，不要猜。',
+  ].join('\n');
+}
+
+export function createJudge(model: Model): JudgeFn {
+  return async (mode: string, task: EvalTask, run: TargetRun) =&gt; {
+    const user = [
+      `## 任务输入\n${JSON.stringify(task.input, null, 2)}`,
+      task.reference ? `## 参考答案\n${task.reference}` : '',
+      `## 被评测的输出\n${JSON.stringify(run.output, null, 2)}`,
+      `## 执行轨迹\n${run.transcript.slice(0, 12000)}`,
+    ].filter(Boolean).join('\n\n');
+    const { value } = await completeStructured(model, { schema: JudgeSchema, system: judgePrompt(mode), user });
+    return { verdict: value.verdict, reason: `${value.reason}（证据：${value.evidence}）` };
+  };
+}
+</code></pre>
+
+<h3>6.4 被评测对象：评结果，不评路径</h3>
+<p>agent 的同一个任务可以有多条正确路径（先列清单再添加，或者直接添加）。评测检查的是<strong>最终状态</strong>：清单里实际有什么、回答说了什么。每次试验都新建一份待办清单，保证试验互不污染。</p>
+<pre data-title="evals/targets.ts"><code class="lang-ts">
+import { z } from 'zod';
+import { runAgent } from '../src/loop';
+import type { Model } from '../src/model';
+import { defineTool, type Tool } from '../src/tools';
+import { analyzeTicket } from '../src/triage/pipeline';
+import { loadPrompt } from '../src/triage/prompt';
+import type { Ticket } from '../src/triage/schema';
+import type { Target } from './types';
+
+// P2 的分诊管线：输入是一张工单，输出是分诊结果加上路由。
+// 日期固定下来，避免"今天"不同导致同一任务的期限判断漂移；提示词只加载一次，版本写进轨迹。
+export function triageTarget(model: Model, today = '2026-11-30'): Target {
+  const prompt = loadPrompt('triage');
+  return async (input) =&gt; {
+    const r = await analyzeTicket(model, input as Ticket, await prompt, today);
+    if (!r.ok) throw new Error(r.error); // 结构化输出失败：记为这次试验出错
+    const output = { ...r.analysis, route: r.route };
+    return { output, transcript: `prompt=${r.prompt} attempts=${r.attempts}\n${JSON.stringify(output)}` };
+  };
+}
+
+// P1 的 agent：每次试验都新建一份待办清单，试验之间互不影响（干净环境）。
+// 评的是最终状态（清单里有什么）和回答，而不是它调用工具的路径。
+export function createTodoEnv(seed: string[] = []) {
+  const todos = seed.map((title, i) =&gt; ({ id: i + 1, title, done: false }));
+  let nextId = todos.length + 1;
+  const tools: Tool[] = [
+    defineTool({
+      name: 'list_todos',
+      description: '列出全部待办，返回 JSON 数组。',
+      schema: z.strictObject({}),
+      run: async () =&gt; JSON.stringify(todos),
+    }),
+    defineTool({
+      name: 'add_todo',
+      description: '新增一条待办。标题不超过 50 字；已存在同名待办时返回错误。',
+      schema: z.strictObject({ title: z.string().trim().min(1).max(50).describe('待办标题') }),
+      run: async ({ title }) =&gt; {
+        if (todos.some((t) =&gt; t.title === title)) throw new Error(`已存在同名待办：${title}`);
+        todos.push({ id: nextId++, title, done: false });
+        return `已添加 #${nextId - 1}`;
+      },
+    }),
+    defineTool({
+      name: 'complete_todo',
+      description: '把指定 id 的待办标记为完成。',
+      schema: z.strictObject({ id: z.number().int() }),
+      run: async ({ id }) =&gt; {
+        const t = todos.find((x) =&gt; x.id === id);
+        if (!t) throw new Error('没有这个 id 的待办，请先 list_todos');
+        t.done = true;
+        return `已完成 #${t.id}`;
+      },
+    }),
+  ];
+  return { tools, state: () =&gt; ({ todos: structuredClone(todos) }) };
+}
+
+export function agentTarget(model: Model): Target {
+  return async (input) =&gt; {
+    const { prompt, seed } = input as { prompt: string; seed: string[] };
+    const env = createTodoEnv(seed);
+    const result = await runAgent(prompt, { model, tools: env.tools, system: '你是待办助手，只能通过工具读写待办。', maxSteps: 8 });
+    const transcript = result.messages
+      .map((m) =&gt;
+        m.role === 'assistant'
+          ? `assistant: ${m.content} ${JSON.stringify(m.toolCalls)}`
+          : m.role === 'tool'
+            ? `tool${m.isError ? '(错误)' : ''}: ${m.content}`
+            : `${m.role}: ${m.content}`,
+      )
+      .join('\n');
+    return { output: { answer: result.text, ...env.state() }, transcript };
+  };
+}
+</code></pre>
+
+<h3>6.5 runner：k 次试验、并发上限、错误隔离</h3>
+<pre data-title="evals/runner.ts"><code class="lang-ts">
+import { gradeAssertions } from './graders/code';
+import type { EvalTask, Failure, JudgeFn, Target, TrialResult, Verdict } from './types';
+
+export type RunOptions = {
+  k: number;                                   // 每个任务跑几次
+  concurrency: number;                         // 同时在跑的试验上限（受限于模型的速率限制）
+  targets: Record&lt;EvalTask['target'], Target&gt;;
+  judge: JudgeFn | null;                       // null = 只跑代码 grader（快、免费）
+  onProgress?: (done: number, total: number) =&gt; void;
+};
+
+// 简单的并发闸门：最多 limit 个任务同时执行。
+async function mapLimit&lt;T, R&gt;(items: T[], limit: number, fn: (item: T) =&gt; Promise&lt;R&gt;): Promise&lt;R[]&gt; {
+  const out: R[] = new Array(items.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () =&gt; {
+    while (next &lt; items.length) {
+      const i = next++;
+      out[i] = await fn(items[i]!);
+    }
+  });
+  await Promise.all(workers);
+  return out;
+}
+
+async function runTrial(task: EvalTask, trial: number, opts: RunOptions): Promise&lt;TrialResult&gt; {
+  const started = performance.now();
+  try {
+    // 每次试验都调用 target 重新建环境，试验之间不共享任何状态。
+    const run = await opts.targets[task.target](task.input);
+    const failures: Failure[] = gradeAssertions(run.output, task.expect);
+    let unknown = false;
+    // 代码 grader 已经判失败时不再花钱问判官
+    if (failures.length === 0 &amp;&amp; opts.judge) {
+      for (const mode of task.judge) {
+        const j = await opts.judge(mode, task, run);
+        if (j.verdict === 'fail') failures.push({ mode, detail: j.reason });
+        if (j.verdict === 'unknown') unknown = true;
+      }
+    }
+    const verdict: Verdict = failures.length ? 'fail' : unknown ? 'unknown' : 'pass';
+    return { taskId: task.id, trial, verdict, failures, output: run.output, error: null, ms: performance.now() - started };
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    return {
+      taskId: task.id, trial, verdict: 'fail', failures: [{ mode: 'error', detail: message }],
+      output: null, error: message, ms: performance.now() - started,
+    };
+  }
+}
+
+export async function runEval(tasks: EvalTask[], opts: RunOptions): Promise&lt;TrialResult[]&gt; {
+  const jobs = tasks.flatMap((task) =&gt; Array.from({ length: opts.k }, (_, trial) =&gt; ({ task, trial })));
+  let done = 0;
+  return mapLimit(jobs, opts.concurrency, async ({ task, trial }) =&gt; {
+    const r = await runTrial(task, trial, opts);
+    opts.onProgress?.(++done, jobs.length);
+    return r;
+  });
+}
+
+export async function loadTasks(path: string): Promise&lt;EvalTask[]&gt; {
+  const text = await Bun.file(path).text();
+  const tasks = text.split('\n').filter((l) =&gt; l.trim()).map((l, i) =&gt; {
+    try {
+      return JSON.parse(l) as EvalTask;
+    } catch {
+      throw new Error(`${path} 第 ${i + 1} 行不是合法 JSON`);
+    }
+  });
+  const ids = new Set&lt;string&gt;();
+  for (const t of tasks) {
+    if (ids.has(t.id)) throw new Error(`任务 id 重复：${t.id}`);
+    ids.add(t.id);
+  }
+  return tasks;
+}
+</code></pre>
+
+<h3>6.6 指标：pass@k 与 pass^k</h3>
+<p>同样跑 n 次、通过 c 次，两个指标回答的是不同的问题：</p>
+<table>
+<tr><th>指标</th><th>回答的问题</th><th>适合</th></tr>
+<tr><td>pass@k</td><td>k 次里<strong>至少一次</strong>成功的概率</td><td>有人从多个候选里挑结果的场景，如生成多份草稿让人选</td></tr>
+<tr><td>pass^k</td><td>k 次<strong>全部</strong>成功的概率</td><td>面向用户、每次都必须对的场景。单次 75% 时，pass^3 只有约 42%</td></tr>
+</table>
+<pre data-title="evals/metrics.ts"><code class="lang-ts">
+import type { TrialResult } from './types';
+
+// 组合数 C(n, k)，用连乘避免阶乘溢出。
+function comb(n: number, k: number): number {
+  if (k &lt; 0 || k &gt; n) return 0;
+  let r = 1;
+  for (let i = 1; i &lt;= k; i++) r = (r * (n - k + i)) / i;
+  return r;
+}
+
+// n 次试验里 c 次通过时，"k 次里至少一次通过"的无偏估计。
+export function passAtK(n: number, c: number, k: number): number {
+  if (k &gt; n) throw new Error(`k=${k} 不能大于试验次数 n=${n}`);
+  return 1 - comb(n - c, k) / comb(n, k);
+}
+
+// "k 次全部通过"的估计：面向用户的 agent 更该看这个，用户每次都要它成功。
+export function passHatK(n: number, c: number, k: number): number {
+  if (k &gt; n) throw new Error(`k=${k} 不能大于试验次数 n=${n}`);
+  return comb(c, k) / comb(n, k);
+}
+
+export type TaskStat = { taskId: string; n: number; passed: number; unknown: number; rate: number };
+
+export function taskStats(results: TrialResult[]): TaskStat[] {
+  const by = new Map&lt;string, TrialResult[]&gt;();
+  for (const r of results) by.set(r.taskId, [...(by.get(r.taskId) ?? []), r]);
+  return [...by.entries()].map(([taskId, rs]) =&gt; {
+    const passed = rs.filter((r) =&gt; r.verdict === 'pass').length;
+    return { taskId, n: rs.length, passed, unknown: rs.filter((r) =&gt; r.verdict === 'unknown').length, rate: passed / rs.length };
+  });
+}
+
+export function summarize(results: TrialResult[], k: number) {
+  const stats = taskStats(results);
+  const mean = (f: (s: TaskStat) =&gt; number) =&gt; (stats.length ? stats.reduce((a, s) =&gt; a + f(s), 0) / stats.length : 0);
+  return {
+    tasks: stats.length,
+    passAt1: mean((s) =&gt; s.rate),
+    passAtK: mean((s) =&gt; passAtK(s.n, s.passed, Math.min(k, s.n))),
+    passHatK: mean((s) =&gt; passHatK(s.n, s.passed, Math.min(k, s.n))),
+    unknownTrials: stats.reduce((a, s) =&gt; a + s.unknown, 0),
+  };
+}
+
+export function failureCounts(results: TrialResult[]): Array&lt;[string, number]&gt; {
+  const counts = new Map&lt;string, number&gt;();
+  for (const r of results) for (const f of r.failures) counts.set(f.mode, (counts.get(f.mode) ?? 0) + 1);
+  return [...counts.entries()].sort((a, b) =&gt; b[1] - a[1]);
+}
+</code></pre>
+
+<h3>6.7 报告与基线对比</h3>
+<pre data-title="evals/report.ts"><code class="lang-ts">
+import { failureCounts, summarize, taskStats } from './metrics';
+import type { TrialResult } from './types';
+
+export type Diff = { regressions: string[]; fixes: string[] };
+
+// 与基线逐任务比较：以前每次都过、现在有失败 = 回归；以前有失败、现在每次都过 = 修复。
+export function diffBaseline(current: TrialResult[], baseline: TrialResult[]): Diff {
+  const before = new Map(taskStats(baseline).map((s) =&gt; [s.taskId, s.rate]));
+  const regressions: string[] = [];
+  const fixes: string[] = [];
+  for (const s of taskStats(current)) {
+    const b = before.get(s.taskId);
+    if (b === undefined) continue;
+    if (b === 1 &amp;&amp; s.rate &lt; 1) regressions.push(s.taskId);
+    if (b &lt; 1 &amp;&amp; s.rate === 1) fixes.push(s.taskId);
+  }
+  return { regressions, fixes };
+}
+
+const pct = (x: number) =&gt; `${(x * 100).toFixed(1)}%`;
+
+export function renderReport(results: TrialResult[], k: number, baseline: TrialResult[] | null): string {
+  const s = summarize(results, k);
+  const lines = [
+    '# 评测报告',
+    '',
+    `| 任务数 | pass@1 | pass@${k} | pass^${k} | 判官无法判断的试验 |`,
+    '|---|---|---|---|---|',
+    `| ${s.tasks} | ${pct(s.passAt1)} | ${pct(s.passAtK)} | ${pct(s.passHatK)} | ${s.unknownTrials} |`,
+    '',
+    '## 失败模式',
+    '',
+    ...failureCounts(results).map(([mode, n]) =&gt; `- ${mode}：${n} 次`),
+  ];
+  if (baseline) {
+    const b = summarize(baseline, k);
+    const d = diffBaseline(results, baseline);
+    lines.push(
+      '',
+      '## 与基线对比',
+      '',
+      `pass@1 ${pct(b.passAt1)} → ${pct(s.passAt1)}，pass^${k} ${pct(b.passHatK)} → ${pct(s.passHatK)}`,
+      '',
+      `回归（以前全过、现在有失败）：${d.regressions.join('、') || '无'}`,
+      `修复（以前有失败、现在全过）：${d.fixes.join('、') || '无'}`,
+    );
+  }
+  const failed = results.filter((r) =&gt; r.verdict !== 'pass');
+  if (failed.length) {
+    lines.push('', '## 失败明细（先读这些 transcript，再改提示词）', '');
+    for (const r of failed.slice(0, 30)) lines.push(`- ${r.taskId}#${r.trial} [${r.verdict}] ${r.failures.map((f) =&gt; f.detail).join('；')}`);
+  }
+  return `${lines.join('\n')}\n`;
+}
+</code></pre>
+
+<p>下面是一份样例报告。拖动 k 看两个指标如何反向变化；打开"与基线对比"，看平均分几乎没变时，逐任务对比如何揪出回归：</p>
+<div class="widget" id="report">
+<div class="w-title">样例报告：8 个任务 × 5 次试验</div>
+<div class="w-row" style="grid-template-columns: 1fr auto; align-items:center">
+  <label>k = <b data-k>3</b><input type="range" min="1" max="5" value="3" data-range aria-label="k"></label>
+  <label style="white-space:nowrap"><input type="checkbox" data-base> 与基线对比</label>
+</div>
+<div class="rp-stats" data-stats></div>
+<div class="table-wrap"><table><thead><tr><th>任务</th><th>试验（● 通过 ○ 失败）</th><th>通过率</th><th>pass@k</th><th>pass^k</th><th>对比</th></tr></thead><tbody data-rows></tbody></table></div>
+</div>
+
+<h3>6.8 命令行与 CI 闸门</h3>
+<pre data-title="evals/cli.ts"><code class="lang-ts">
+// 用法：bun evals/cli.ts --suite regression --k 3 --concurrency 4 [--no-judge] [--min-pass 0.98] [--baseline evals/baseline.json] [--save-baseline]
+import { parseArgs } from 'node:util';
+import { OpenAICompatibleModel } from '../src/models/openai-compatible';
+import { createJudge } from './graders/judge';
+import { summarize, taskStats } from './metrics';
+import { renderReport } from './report';
+import { loadTasks, runEval } from './runner';
+import { agentTarget, triageTarget } from './targets';
+import type { TrialResult } from './types';
+
+const { values: a } = parseArgs({
+  options: {
+    suite: { type: 'string', default: 'regression' },
+    k: { type: 'string', default: '3' },
+    concurrency: { type: 'string', default: '4' },
+    'no-judge': { type: 'boolean', default: false },
+    'min-pass': { type: 'string' },
+    baseline: { type: 'string', default: 'evals/baseline.json' },
+    'save-baseline': { type: 'boolean', default: false },
+  },
+});
+
+const k = Number(a.k);
+const tasks = (await loadTasks('evals/tasks.jsonl')).filter((t) =&gt; t.suite === a.suite);
+if (tasks.length === 0) throw new Error(`没有 suite=${a.suite} 的任务`);
+
+const model = OpenAICompatibleModel.fromEnv();
+const results = await runEval(tasks, {
+  k,
+  concurrency: Number(a.concurrency),
+  targets: { triage: triageTarget(model), agent: agentTarget(model) },
+  judge: a['no-judge'] ? null : createJudge(model),
+  onProgress: (done, total) =&gt; process.stderr.write(`\r${done}/${total}`),
+});
+process.stderr.write('\n');
+
+const baselineFile = Bun.file(a.baseline);
+const baseline = (await baselineFile.exists()) ? ((await baselineFile.json()) as TrialResult[]) : null;
+const report = renderReport(results, k, baseline);
+const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+await Bun.write(`evals/results/${stamp}.json`, JSON.stringify(results, null, 2));
+await Bun.write(`evals/results/${stamp}.md`, report);
+console.log(report);
+if (a['save-baseline']) await Bun.write(a.baseline, JSON.stringify(results, null, 2));
+
+// CI 闸门：整体通过率达标，且没有一次都没过的任务。
+if (a['min-pass']) {
+  const s = summarize(results, k);
+  const dead = taskStats(results).filter((t) =&gt; t.passed === 0).map((t) =&gt; t.taskId);
+  if (s.passAt1 &lt; Number(a['min-pass']) || dead.length) {
+    console.error(`未达标：pass@1=${s.passAt1.toFixed(3)}，要求 ≥ ${a['min-pass']}；全部失败的任务：${dead.join('、') || '无'}`);
+    process.exit(1);
+  }
+}
+</code></pre>
+<pre data-title=".github/workflows/evals.yml"><code class="lang-yaml">
+name: evals
+on:
+  pull_request:
+    paths: ['src/**', 'prompts/**', 'evals/**']   # 只在可能影响行为的改动上跑，省钱
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - run: bun test
+      - run: bun evals/cli.ts --suite regression --k 3 --min-pass 0.98
+        env:
+          LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_MODEL: ${{ secrets.LLM_MODEL }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: eval-report, path: evals/results/ }
+</code></pre>
+<p>环境变量与 P1 的 <code>OpenAICompatibleModel.fromEnv()</code> 一致（<code>LLM_BASE_URL</code>、<code>LLM_API_KEY</code>、<code>LLM_MODEL</code>），在仓库的 Secrets 里配置。回归集的阈值定得接近 100%：回归集里放的都是"以前已经能稳定做对"的任务，任何一个掉下来都值得在合并前看一眼。</p>
+
+<h3>6.9 判官对齐</h3>
+<p>随机抽 100–200 条判官结果做人工标注（Hamel 与 Shreya 的建议量级），拆成调整用和检验用两份：调整判官提示词时只看前者，最后在后者上报告一致度，避免把判官"调"得只适合这批样本。</p>
+<pre data-title="evals/align.ts"><code class="lang-ts">
+// 判官对齐：拿人工标注检验 LLM 判官靠不靠谱。
+// 用法：bun evals/align.ts evals/labels.jsonl evals/judged.jsonl
+// 两个文件每行 { "key": "任务id#试验#失败模式", "verdict": "pass" | "fail" | "unknown" }，前者是人标的，后者是判官给的。
+type Row = { key: string; verdict: 'pass' | 'fail' | 'unknown' };
+
+export function alignment(human: Row[], judge: Row[]) {
+  const j = new Map(judge.map((r) =&gt; [r.key, r.verdict]));
+  let tp = 0; // 人判通过，判官也判通过
+  let fn = 0; // 人判通过，判官判失败
+  let tn = 0; // 人判失败，判官也判失败
+  let fp = 0; // 人判失败，判官判通过（最危险：放过了真问题）
+  let unknown = 0;
+  let missing = 0;
+  for (const h of human) {
+    if (h.verdict === 'unknown') continue;
+    const v = j.get(h.key);
+    if (v === undefined) missing++;
+    else if (v === 'unknown') unknown++;
+    else if (h.verdict === 'pass') v === 'pass' ? tp++ : fn++;
+    else v === 'fail' ? tn++ : fp++;
+  }
+  return {
+    tpr: tp + fn ? tp / (tp + fn) : Number.NaN, // 真通过里被判通过的比例
+    tnr: tn + fp ? tn / (tn + fp) : Number.NaN, // 真失败里被判失败的比例
+    confusion: { tp, fn, tn, fp },
+    unknown,
+    missing,
+  };
+}
+
+async function readRows(path: string): Promise&lt;Row[]&gt; {
+  return (await Bun.file(path).text()).split('\n').filter((l) =&gt; l.trim()).map((l) =&gt; JSON.parse(l) as Row);
+}
+
+if (import.meta.main) {
+  const [humanPath, judgePath] = process.argv.slice(2);
+  if (!humanPath || !judgePath) throw new Error('用法：bun evals/align.ts &lt;人工标注.jsonl&gt; &lt;判官结果.jsonl&gt;');
+  const r = alignment(await readRows(humanPath), await readRows(judgePath));
+  console.log(`TPR（真通过被判通过）${(r.tpr * 100).toFixed(1)}%  TNR（真失败被判失败）${(r.tnr * 100).toFixed(1)}%`);
+  console.log(`混淆：${JSON.stringify(r.confusion)}  判官无法判断 ${r.unknown}  缺少判官结果 ${r.missing}`);
+  if (r.confusion.fp &gt; 0) console.log('注意：有真失败被判官放过（fp），先读这些样本，补充失败模式的定义与例子。');
+}
+</code></pre>
+
+<h3>6.10 从 trace 一键生成候选任务</h3>
+<p>评测集要持续生长：每周把新的失败样本收进来。候选任务只填输入和来源，期望值必须由人补——期望值从需求推导，不从模型当时的输出里抄。</p>
+<pre data-title="evals/from-traces.ts"><code class="lang-ts">
+// 从线上 trace 挑出值得变成评测任务的样本：出错的、被用户拒绝或改写的。
+// 用法：bun evals/from-traces.ts traces/*.jsonl &gt; evals/candidates.jsonl
+// trace 每行 { id, ts, target, input, output, error, feedback }，feedback 取 'approved' | 'edited' | 'rejected' | null。
+import { createHash } from 'node:crypto';
+import type { EvalTask } from './types';
+
+type TraceLine = {
+  id: string;
+  ts: string;
+  target: EvalTask['target'];
+  input: unknown;
+  output: unknown;
+  error: string | null;
+  feedback: 'approved' | 'edited' | 'rejected' | null;
+};
+
+export function pickCandidates(lines: TraceLine[], existingInputs: Set&lt;string&gt;): EvalTask[] {
+  const seen = new Set(existingInputs);
+  const out: EvalTask[] = [];
+  for (const t of lines) {
+    const interesting = t.error !== null || t.feedback === 'edited' || t.feedback === 'rejected';
+    if (!interesting) continue;
+    const fp = createHash('sha256').update(JSON.stringify(t.input)).digest('hex').slice(0, 16);
+    if (seen.has(fp)) continue; // 同样的输入只收一次
+    seen.add(fp);
+    out.push({
+      id: `${t.target}-${fp}`,
+      suite: 'capability', // 先进能力集，修好并稳定通过后再"毕业"进回归集
+      target: t.target,
+      input: t.input,
+      expect: [],          // 由人补上：期望的字段与判官要查的失败模式
+      judge: [],
+      reference: null,
+      tags: [t.error ? 'error' : `feedback:${t.feedback}`],
+      source: `trace:${t.id}`,
+    });
+  }
+  return out;
+}
+
+export function inputFingerprint(input: unknown): string {
+  return createHash('sha256').update(JSON.stringify(input)).digest('hex').slice(0, 16);
+}
+
+if (import.meta.main) {
+  const files = process.argv.slice(2);
+  const lines: TraceLine[] = [];
+  for (const f of files) {
+    for (const l of (await Bun.file(f).text()).split('\n')) if (l.trim()) lines.push(JSON.parse(l) as TraceLine);
+  }
+  const tasksFile = Bun.file('evals/tasks.jsonl');
+  const existing = (await tasksFile.exists())
+    ? new Set((await tasksFile.text()).split('\n').filter((l) =&gt; l.trim()).map((l) =&gt; inputFingerprint((JSON.parse(l) as EvalTask).input)))
+    : new Set&lt;string&gt;();
+  for (const c of pickCandidates(lines, existing)) console.log(JSON.stringify(c));
+}
+</code></pre>
+
+<h2>7 · 测试：评测流水线自己也要测</h2>
+<p>评测代码有 bug，会让你对着错误的数字做决定（Anthropic 的文章里有一个例子：修掉评分 bug 后，某个模型在一个基准上的分数从 42% 变成 95%）。下面每个测试都写明了它拦的是哪种 bug：</p>
+<pre data-title="tests/evals.test.ts"><code class="lang-ts">
+import { describe, expect, test } from 'bun:test';
+import { call, FakeModel } from '../src/fake-model';
+import { alignment } from '../evals/align';
+import { pickCandidates } from '../evals/from-traces';
+import { gradeAssertions } from '../evals/graders/code';
+import { passAtK, passHatK, summarize } from '../evals/metrics';
+import { diffBaseline } from '../evals/report';
+import { runEval } from '../evals/runner';
+import { agentTarget, createTodoEnv, triageTarget } from '../evals/targets';
+import type { EvalTask, Target, TrialResult } from '../evals/types';
+
+const task = (id: string, extra: Partial&lt;EvalTask&gt; = {}): EvalTask =&gt; ({
+  id, suite: 'regression', target: 'triage', input: { n: id }, expect: [], judge: [], reference: null, tags: [], source: 'manual', ...extra,
+});
+
+describe('代码 grader', () =&gt; {
+  // 拦：输出缺字段时被当作通过
+  test('路径缺失算失败', () =&gt; {
+    expect(gradeAssertions({}, [{ path: 'category', equals: 'bug' }])).toHaveLength(1);
+    expect(gradeAssertions({}, [{ path: 'reply', excludes: '保证' }])).toHaveLength(1);
+  });
+  // 拦：嵌套路径、数组下标取值写错
+  test('支持嵌套与数组下标', () =&gt; {
+    const out = { todos: [{ title: '交周报', done: true }] };
+    expect(gradeAssertions(out, [{ path: 'todos.0.done', equals: true }, { path: 'todos.0.title', includes: '周报' }])).toEqual([]);
+  });
+});
+
+describe('指标', () =&gt; {
+  // 拦：把 pass@k 与 pass^k 算反，或忘了 k 越大 pass^k 越低
+  test('pass@k 随 k 上升，pass^k 随 k 下降', () =&gt; {
+    expect(passAtK(4, 3, 1)).toBeCloseTo(0.75);
+    expect(passHatK(4, 3, 1)).toBeCloseTo(0.75);
+    expect(passAtK(4, 3, 2)).toBeCloseTo(1);
+    expect(passHatK(4, 3, 2)).toBeCloseTo(0.5);
+    expect(passHatK(5, 5, 5)).toBe(1);
+    expect(passHatK(5, 0, 1)).toBe(0);
+  });
+  // 拦：大 n 时组合数溢出成 NaN
+  test('试验次数多时数值稳定', () =&gt; {
+    expect(passHatK(200, 150, 3)).toBeCloseTo((150 * 149 * 148) / (200 * 199 * 198), 6);
+  });
+});
+
+describe('runner', () =&gt; {
+  // 拦：试验之间共享状态，上一次的副作用污染下一次
+  test('每次试验都是干净环境', async () =&gt; {
+    const target: Target = async () =&gt; {
+      const env = createTodoEnv(['交周报']);
+      await env.tools[1]!.run({ title: '订会议室' }, {});
+      return { output: env.state(), transcript: '' };
+    };
+    const results = await runEval([task('t1', { expect: [{ path: 'todos.1.title', equals: '订会议室' }] })], {
+      k: 3, concurrency: 3, targets: { triage: target, agent: target }, judge: null,
+    });
+    expect(results.every((r) =&gt; r.verdict === 'pass')).toBe(true);
+  });
+
+  // 拦：并发上限失效，把模型的速率限制打爆
+  test('同时运行的试验不超过并发上限', async () =&gt; {
+    let running = 0;
+    let peak = 0;
+    const target: Target = async () =&gt; {
+      running++;
+      peak = Math.max(peak, running);
+      await Bun.sleep(5);
+      running--;
+      return { output: {}, transcript: '' };
+    };
+    await runEval([task('a'), task('b'), task('c')], { k: 4, concurrency: 2, targets: { triage: target, agent: target }, judge: null });
+    expect(peak).toBe(2);
+  });
+
+  // 拦：target 抛错时整个评测中断，或错误被当作通过
+  test('target 抛错记为失败，不中断其他任务', async () =&gt; {
+    let i = 0;
+    const flaky: Target = async () =&gt; {
+      if (i++ % 2 === 0) throw new Error('模型超时');
+      return { output: {}, transcript: '' };
+    };
+    const results = await runEval([task('x')], { k: 4, concurrency: 1, targets: { triage: flaky, agent: flaky }, judge: null });
+    expect(results.filter((r) =&gt; r.verdict === 'fail')).toHaveLength(2);
+    expect(summarize(results, 2).passHatK).toBeCloseTo(1 / 6);
+  });
+
+  // 拦：判官说 unknown 时被当成通过
+  test('判官无法判断时记为 unknown', async () =&gt; {
+    const t: Target = async () =&gt; ({ output: { reply: '好的' }, transcript: '' });
+    const results = await runEval([task('u', { judge: ['ignores_main_question'] })], {
+      k: 1, concurrency: 1, targets: { triage: t, agent: t }, judge: async () =&gt; ({ verdict: 'unknown', reason: '缺上下文' }),
+    });
+    expect(results[0]!.verdict).toBe('unknown');
+  });
+});
+
+describe('基线对比与判官对齐', () =&gt; {
+  const r = (taskId: string, pass: boolean): TrialResult =&gt; ({
+    taskId, trial: 0, verdict: pass ? 'pass' : 'fail', failures: [], output: null, error: null, ms: 0,
+  });
+  // 拦：回归被平均数掩盖（一个任务坏了、另一个变好，总分不变）
+  test('逐任务找出回归与修复', () =&gt; {
+    const d = diffBaseline([r('a', false), r('b', true)], [r('a', true), r('b', false)]);
+    expect(d).toEqual({ regressions: ['a'], fixes: ['b'] });
+  });
+  // 拦：TPR/TNR 的分母用错
+  test('对齐指标', () =&gt; {
+    const human = [
+      { key: '1', verdict: 'pass' as const }, { key: '2', verdict: 'pass' as const },
+      { key: '3', verdict: 'fail' as const }, { key: '4', verdict: 'fail' as const },
+    ];
+    const judge = [
+      { key: '1', verdict: 'pass' as const }, { key: '2', verdict: 'fail' as const },
+      { key: '3', verdict: 'fail' as const }, { key: '4', verdict: 'pass' as const },
+    ];
+    const a = alignment(human, judge);
+    expect([a.tpr, a.tnr]).toEqual([0.5, 0.5]);
+    expect(a.confusion.fp).toBe(1);
+  });
+  // 拦：同一个输入反复进候选集；正常通过的样本也被收进来
+  test('只收出错或被拒绝、改写的 trace，并按输入去重', () =&gt; {
+    const base = { ts: '', target: 'triage' as const, output: null };
+    const picked = pickCandidates([
+      { ...base, id: '1', input: { a: 1 }, error: null, feedback: 'approved' },
+      { ...base, id: '2', input: { a: 2 }, error: '超时', feedback: null },
+      { ...base, id: '3', input: { a: 2 }, error: null, feedback: 'rejected' },
+      { ...base, id: '4', input: { a: 3 }, error: null, feedback: 'edited' },
+    ], new Set());
+    expect(picked.map((p) =&gt; p.source)).toEqual(['trace:2', 'trace:4']);
+  });
+});
+
+describe('评测对象接上真实管线', () =&gt; {
+  // 拦：评测对象和 P1/P2 的接口没接对（字段名、路由、工具参数），导致整套评测在真实模型上一跑就全错
+  test('分诊与 agent 两类任务都能按代码 grader 判出通过', async () =&gt; {
+    const tasks = (await Bun.file('evals/tasks.jsonl').text()).split('\n').filter(Boolean).map((l) =&gt; JSON.parse(l) as EvalTask);
+    const filter = tasks.find((t) =&gt; t.id === 'triage-export-filter')!;
+    const dup = tasks.find((t) =&gt; t.id === 'agent-add-dup')!;
+    const triageModel = new FakeModel([
+      {
+        toolCalls: [
+          call('emit_result', {
+            summary: '希望月报导出支持按部门筛选',
+            category: 'request',
+            urgency: 'normal',
+            needs_reply: true,
+            todos: [],
+            missing_info: [],
+            reply_draft: '收到，我先确认可行性，周五前答复你。',
+            confidence: 0.8,
+          }),
+        ],
+      },
+    ]);
+    const agentModel = new FakeModel([
+      { toolCalls: [call('add_todo', { title: '交周报' })] },
+      { content: '清单里已存在「交周报」，没有重复添加。' },
+    ]);
+    const [t] = await runEval([filter], { k: 1, concurrency: 1, targets: { triage: triageTarget(triageModel), agent: agentTarget(agentModel) }, judge: null });
+    const [a] = await runEval([dup], { k: 1, concurrency: 1, targets: { triage: triageTarget(triageModel), agent: agentTarget(agentModel) }, judge: null });
+    expect([t!.verdict, a!.verdict]).toEqual(['pass', 'pass']);
+  });
+});
+</code></pre>
+
+<div class="quiz" data-answer="2">
+<p class="q">新版提示词上线前跑评测：pass@1 从 86% 升到 88%，但回归集里 <code>triage-invoice-wrong</code> 从 5/5 掉到 3/5。应该怎么做？</p>
+<ol>
+  <li>总分上升了，直接上线</li>
+  <li>先读这个任务失败的 transcript，弄清是新提示词引入的问题还是任务本身有歧义，再决定</li>
+  <li>把这个任务从回归集删掉</li>
+  <li>把 k 调大到 10，平均下来就好了</li>
+</ol>
+<div class="explain">回归集的任务以前稳定通过，现在掉了，就是信号。平均分会掩盖它。第一步永远是读 transcript：如果是提示词把"发票问题"误判成别的类别，就要修；如果发现任务本身的期望有歧义，修任务（并记录原因），而不是悄悄删掉。</div>
+</div>
+
+<h2>8 · 验收标准</h2>
+<ul class="checklist" data-key="p6-accept">
+  <li>完成一次错误分析：读过至少 30 条真实或模拟的 trace，写出 3 个以上有定义和例子的失败模式</li>
+  <li><code>tasks.jsonl</code> 里至少 20 个任务，正例反例都有，区分回归集与能力集</li>
+  <li><code>bun test</code> 通过，评测流水线本身的测试覆盖 grader、指标、runner、基线对比和对齐</li>
+  <li>用真实模型跑一次 <code>bun evals/cli.ts --k 3</code>，生成报告并保存为基线</li>
+  <li>人工标注至少 50 条判官结果，报告 TPR 与 TNR，并根据放过的失败改进过一次判官定义</li>
+  <li>故意改坏提示词，CI 闸门能拦住；改回后通过</li>
+  <li>从 trace 生成过一批候选任务，并人工补全期望后收进任务集</li>
+</ul>
+
+<h2>9 · 进阶挑战</h2>
+<ol>
+  <li>给判官加"自一致性"检查：同一样本让判官判 3 次，结论不一致的样本自动进入人工复核队列。</li>
+  <li>记录每次试验的 token 用量与耗时，在报告里加"每个通过的任务花了多少钱"，比较两个模型的性价比。</li>
+  <li>给 agent 加一个"用户模拟器"：另一个模型扮演用户，在多轮对话里提出补充要求（参考 τ²-bench 的双控思路），评测多轮场景。</li>
+  <li>能力集的任务连续三次全过后，自动提出"毕业到回归集"的建议（由人确认）。</li>
+  <li>把报告做成静态网页：每个失败样本可以展开看完整 transcript，并直接标注人工结论写回 labels.jsonl。</li>
+</ol>
+
+<h2>10 · 常见坑</h2>
+<ul>
+  <li><strong>先写指标、后看数据</strong>：拍脑袋的指标（"有用性 1–5 分"）测不出真实问题。先错误分析，再定失败模式。</li>
+  <li><strong>只跑一次</strong>：模型有随机性，一次通过不代表稳定。至少 k=3，面向用户的看 pass^k。</li>
+  <li><strong>评路径而不是结果</strong>：断言"必须先调用 list_todos"会误伤合理的其他路径。检查最终状态。</li>
+  <li><strong>判官没人校验</strong>：未经对齐的判官只是另一个不可靠的模型。</li>
+  <li><strong>通过率接近 0 的任务</strong>：多次试验都接近 0%，通常是任务本身坏了（期望写错、信息不足），不是 agent 不行。先查任务。</li>
+  <li><strong>期望值从输出里抄</strong>：那样测的是"和上次一样"，而不是"对不对"。</li>
+  <li><strong>试验共享环境</strong>：上一次的副作用会让下一次"意外通过"或"意外失败"。</li>
+</ul>
+
+<div class="takeaways"><b>本项目要点</b>
+<ul>
+  <li>评测从真实失败开始：错误分析 → 失败模式 → 任务，20–50 个就能起步。</li>
+  <li>代码 grader 优先；判官只做代码判不了的，一个失败模式一个，二元 + unknown。</li>
+  <li>判官要用人工标注检验，最怕把真失败判成通过。</li>
+  <li>每任务跑 k 次；面向用户的系统看 pass^k；逐任务与基线比，别被平均数骗。</li>
+  <li>回归集接进 CI 作为闸门，能力集衡量进步；评测集随 trace 持续生长。</li>
+</ul></div>
+
+<h2>参考资料</h2>
+<ul class="refs">
+  <li><a href="https://www.anthropic.com/engineering/demystifying-evals-for-ai-agents" target="_blank" rel="noopener">Demystifying evals for AI agents</a> <span class="src">Anthropic · 2026-01-09 · grader 类型、pass@k 与 pass^k、能力集与回归集、读 transcript</span></li>
+  <li><a href="https://hamel.dev/blog/posts/evals-faq/" target="_blank" rel="noopener">AI Evals FAQ</a> <span class="src">Hamel Husain、Shreya Shankar · 2026-09 · 错误分析、二元判官、TPR/TNR 对齐</span></li>
+  <li><a href="https://arxiv.org/abs/2406.12045" target="_blank" rel="noopener">τ-bench</a> <span class="src">Sierra · pass^k 的提出</span></li>
+  <li><a href="https://github.com/sierra-research/tau2-bench" target="_blank" rel="noopener">τ²-bench</a> <span class="src">双控环境：用户也能改共享状态</span></li>
+  <li><a href="https://openai.com/index/why-we-no-longer-evaluate-swe-bench-verified/" target="_blank" rel="noopener">Why we no longer evaluate SWE-bench Verified</a> <span class="src">OpenAI · 2026-02-23 · 题目缺陷与数据污染：公开基准不能代替你自己的评测集</span></li>
+</ul>
+</article>
+<script>
+window.addEventListener('DOMContentLoaded', () => {
+  // ---------- 错误分析练习 ----------
+  const CATS = ['无依据的承诺', '没回应主要问题', '语气或称呼不当', '泄露内部信息'];
+  const CASES = [
+    { in: '工单：月报导出能按部门筛选吗？下周一要用。', out: '收到，我和产品确认一下是否支持按部门筛选，今天下班前回复你结论。', pass: true, note: '回应了问题，只承诺"今天回复结论"，没承诺上线。可以发。' },
+    { in: '工单：发票抬头写错了，麻烦重开。', out: '抱歉给你添麻烦了，新发票明天上午一定开好发给你。', pass: false, cat: 0, note: '"明天上午一定开好"在工单和上下文里都没有依据：开票流程不归起草者控制。' },
+    { in: '工单：登录页一直转圈，进不去。', out: '感谢你的反馈，我们会持续优化产品体验！', pass: false, cat: 1, note: '用户报的是具体故障，回复只有客套话，没问环境、没给下一步。' },
+    { in: '工单：上周说的接口文档什么时候能给？', out: '文档还在内部评审，评审群里大家对字段命名还有分歧，估计还得几天。', pass: false, cat: 3, note: '把内部评审的细节和分歧直接告诉了外部对象。应只说"在评审中，预计何时给"。' },
+    { in: '工单：本周行业资讯汇总，无需回复。', out: '（分诊结果：不需要回复）', pass: true, note: '资讯类邮件，正确地判为不需要回复。反例同样重要。' },
+    { in: '工单：王总您好，合同第 3 条的付款周期能否调整？', out: '亲，这个可以商量哈～', pass: false, cat: 2, note: '对外部高层用了过于随意的语气；同时也没有实质回应。主要问题是语气不当。' },
+  ];
+  const box = document.getElementById('ea');
+  const list = box.querySelector('[data-cases]');
+  CASES.forEach((c, i) => {
+    const el = Course.el('div', { class: 'ea-case' });
+    el.innerHTML = `<div class="ea-in">${i + 1}. ${c.in}</div><div class="ea-out">草稿：${c.out}</div>`;
+    const sel = Course.el('select', { 'aria-label': '失败原因', disabled: 'disabled' });
+    sel.append(Course.el('option', { value: '', text: '— 失败原因 —' }));
+    CATS.forEach((t, j) => sel.append(Course.el('option', { value: String(j), text: t })));
+    const name = `ea-${i}`;
+    const radio = (v, t) => {
+      const r = Course.el('input', { type: 'radio', name, value: v });
+      r.addEventListener('change', () => { sel.disabled = v !== 'fail'; if (v !== 'fail') sel.value = ''; });
+      return Course.el('label', {}, [r, document.createTextNode(' ' + t)]);
+    };
+    el.append(Course.el('div', { class: 'ea-ctrl' }, [radio('pass', '可以发'), radio('fail', '不能发'), sel]), Course.el('div', { class: 'ea-note', text: c.note }));
+    el.dataset.i = i;
+    list.append(el);
+  });
+  box.querySelector('[data-check]').addEventListener('click', () => {
+    let verdictOk = 0, catOk = 0, answered = 0;
+    const tally = {};
+    list.querySelectorAll('.ea-case').forEach((el) => {
+      const c = CASES[el.dataset.i];
+      const v = el.querySelector('input:checked');
+      const cat = el.querySelector('select').value;
+      el.classList.add('checked');
+      el.classList.remove('right', 'wrong');
+      if (!v) return;
+      answered++;
+      const vOk = (v.value === 'pass') === c.pass;
+      const cOk = c.pass || String(c.cat) === cat;
+      if (vOk) verdictOk++;
+      if (vOk && cOk) catOk++;
+      el.classList.add(vOk && cOk ? 'right' : 'wrong');
+      if (!c.pass) tally[CATS[c.cat]] = (tally[CATS[c.cat]] || 0) + 1;
+    });
+    box.querySelector('[data-score]').textContent = `判定一致 ${verdictOk}/${CASES.length} · 连原因也一致 ${catOk}/${CASES.length}` + (answered < CASES.length ? `（有 ${CASES.length - answered} 条没作答）` : '');
+    const sum = box.querySelector('[data-summary]');
+    sum.style.display = 'block';
+    sum.innerHTML = '<b>专家标注的失败分布</b>：' + Object.entries(tally).map(([k, n]) => `${k} ${n} 条`).join('；') +
+      '。<br>真实项目里，这一步之后要做的是：给每类失败写定义和正反例（就是 failure-modes.ts），再为能用代码判的写断言、判不了的写判官。注意你和"专家"不一致的地方——那正说明失败模式的定义需要写得更清楚。';
+  });
+
+  // ---------- 样例报告 ----------
+  const comb = (n, k) => { if (k < 0 || k > n) return 0; let r = 1; for (let i = 1; i <= k; i++) r = (r * (n - k + i)) / i; return r; };
+  const pAt = (n, c, k) => 1 - comb(n - c, k) / comb(n, k);
+  const pHat = (n, c, k) => comb(c, k) / comb(n, k);
+  const T = (s) => s.split('').map((x) => x === '1');
+  const DATA = [
+    ['triage-export-filter', '11111', '11111'],
+    ['triage-invoice-wrong', '11111', '11010'],
+    ['triage-newsletter', '11111', '11111'],
+    ['triage-login-loop', '10110', '11111'],
+    ['triage-contract-tone', '01011', '11011'],
+    ['agent-add-dup', '00100', '01101'],
+    ['agent-complete-by-name', '11011', '11111'],
+    ['agent-bulk-add', '10101', '10001'],
+  ];
+  const rp = document.getElementById('report');
+  const range = rp.querySelector('[data-range]');
+  const base = rp.querySelector('[data-base]');
+  const pct = (x) => (x * 100).toFixed(0) + '%';
+  const dots = (arr) => `<span class="rp-dots">${arr.map((x) => (x ? '<span class="y">●</span>' : '<span class="n">○</span>')).join('')}</span>`;
+  const render = () => {
+    const k = Number(range.value);
+    rp.querySelector('[data-k]').textContent = k;
+    const showBase = base.checked;
+    let s1 = 0, sk = 0, shk = 0, b1 = 0, bhk = 0;
+    const rows = DATA.map(([id, b, c]) => {
+      const cur = T(c), old = T(b);
+      const n = cur.length, cc = cur.filter(Boolean).length, bc = old.filter(Boolean).length;
+      s1 += cc / n; sk += pAt(n, cc, k); shk += pHat(n, cc, k); b1 += bc / n; bhk += pHat(n, bc, k);
+      let tag = '';
+      if (showBase) {
+        if (bc === n && cc < n) tag = '<span class="pill danger">回归</span>';
+        else if (bc < n && cc === n) tag = '<span class="pill ok">修复</span>';
+        else tag = `<span class="pill">${bc}/${n} → ${cc}/${n}</span>`;
+      }
+      return `<tr><td><code>${id}</code></td><td>${showBase ? dots(old) + '<br>' : ''}${dots(cur)}</td><td>${cc}/${n}</td><td>${pct(pAt(n, cc, k))}</td><td>${pct(pHat(n, cc, k))}</td><td>${tag}</td></tr>`;
+    });
+    rp.querySelector('[data-rows]').innerHTML = rows.join('');
+    const m = DATA.length;
+    rp.querySelector('[data-stats]').innerHTML =
+      `<span class="stat"><b>${pct(s1 / m)}</b><small>pass@1${showBase ? `（基线 ${pct(b1 / m)}）` : ''}</small></span>` +
+      `<span class="stat"><b>${pct(sk / m)}</b><small>pass@${k}</small></span>` +
+      `<span class="stat"><b>${pct(shk / m)}</b><small>pass^${k}${showBase ? `（基线 ${pct(bhk / m)}）` : ''}</small></span>`;
+  };
+  range.addEventListener('input', render);
+  base.addEventListener('change', render);
+  render();
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,641 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>手写 Agent Loop · AI Agent 工程</title>
+<meta name="description" content="从 ReAct 到生产级工具循环：停止条件、步数与预算、错误回灌、并行调用、超时与取消、有副作用的工具，以及用假模型做离线测试。">
+<link rel="stylesheet" href="assets/css/course.css">
+<script src="assets/js/manifest.js"></script>
+<script defer src="assets/js/course.js"></script>
+<style>
+  .sim-head { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .sim-head select { width: auto; flex: 1 1 220px; }
+  .sim-status { display: flex; flex-wrap: wrap; gap: 6px 18px; font-size: 13px; color: var(--muted); margin: 10px 0 6px; }
+  .sim-status b { color: var(--text); }
+  .sim-log { font-size: 14px; padding: 10px 12px; border-radius: 8px; background: var(--accent-soft); margin: 8px 0; min-height: 2.6em; }
+  .sim-msgs { display: flex; flex-direction: column; gap: 6px; max-height: 460px; overflow-y: auto; padding: 4px 2px; }
+  .msg { border: 1px solid var(--border); border-left-width: 4px; border-radius: 8px; padding: 7px 10px; font-size: 13.5px; background: var(--bg); line-height: 1.6; }
+  .msg .role { font: 600 12px var(--mono); margin-right: 6px; }
+  .msg code { font-size: 12px; }
+  .msg.system { border-left-color: var(--muted); }
+  .msg.user { border-left-color: var(--accent); }
+  .msg.assistant { border-left-color: var(--violet); }
+  .msg.tool { border-left-color: var(--ok); }
+  .msg.tool.err { border-left-color: var(--danger); background: var(--danger-soft); }
+  .msg.fresh { animation: pop .5s ease-out; box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 40%, transparent); }
+  @keyframes pop { from { transform: translateY(-6px); opacity: 0; } to { transform: none; opacity: 1; } }
+  .call { display: block; font: 12.5px/1.55 var(--mono); background: var(--surface-2); border-radius: 6px; padding: 4px 8px; margin-top: 4px; word-break: break-all; }
+  .call .mut { color: var(--accent-2); font-family: var(--font); font-size: 11.5px; margin-left: 6px; }
+  .anim svg text.ts { paint-order: stroke; stroke: var(--surface); stroke-width: 5px; stroke-linejoin: round; }
+</style>
+</head>
+<body data-page="ch04">
+<article id="content">
+<div class="eyebrow">第一部分 · 基础 · 第 4 章</div>
+<h1>手写 Agent Loop</h1>
+<p class="lead">第 1 章的十几行伪代码只是骨架。真正能上线的 loop 要回答一连串问题：什么时候停？工具报错怎么办？两个工具能不能同时跑？发邮件超时了要不要重试？这一章把它们逐一写进代码，并用一个"假模型"把所有分支离线测透。</p>
+<div class="meta"><span>约 40 分钟</span><span>前置：第 1、3 章</span><span>含 1 个分步动画、1 个循环模拟器、3 道小测</span></div>
+
+<div class="goals"><b>学完你能</b>
+<ul>
+  <li>从 ReAct 出发，解释原生工具调用循环里每一步对应什么</li>
+  <li>写出带停止条件、步数上限、预算、超时与取消的生产级 loop</li>
+  <li>把四类工具错误正确地回灌给模型，而不是让整个任务崩掉</li>
+  <li>区分只读工具与有副作用的工具，知道后者为什么不能整轮重试</li>
+  <li>用脚本化的假模型为 loop 写有意义的离线测试</li>
+</ul></div>
+
+<h2>1 · 从 ReAct 到原生工具调用</h2>
+<p>2022 年 Yao 等人的 <strong>ReAct</strong> 论文（ICLR 2023）提出让模型交替产出 <strong>Thought（推理）→ Action（动作）→ Observation（观察）</strong>：先想一想，再调用工具，把结果读回来，再想下一步。只用一两个示例，它就在问答和事实核查任务上明显减少了幻觉，在 ALFWorld 和 WebShop 这类交互任务上分别取得 34% 和 10% 的绝对提升。</p>
+<p>当年的 ReAct 靠提示词约定格式、用正则解析"Action: search[...]"。今天这套循环已经内置进了模型 API：</p>
+<table>
+<tr><th>ReAct 概念</th><th>今天的对应物</th></tr>
+<tr><td>Thought</td><td>模型的推理（thinking）或 assistant 消息里的文字</td></tr>
+<tr><td>Action</td><td>assistant 消息里的结构化 <code>tool_call</code>（工具名 + JSON 参数 + 调用 id）</td></tr>
+<tr><td>Observation</td><td>你回填的 <code>tool</code> 消息（对应调用 id 的执行结果或错误）</td></tr>
+<tr><td>"直到得出答案"</td><td>模型某一轮不再调用工具，只输出文本</td></tr>
+</table>
+<p>格式解析不再是问题，但<strong>循环本身仍然是你的代码</strong>：停止条件、错误处理、并发、权限、预算，没有一样是 API 替你做的。12-Factor Agents 的第 8 条"掌控你的控制流"说的就是这个。</p>
+
+<h2>2 · 共用接口</h2>
+<p>本课程的代码和跟练项目 P1 都基于下面这组最小接口。它刻意不依赖任何 SDK：真实模型只需写一个适配器把 Anthropic 或 OpenAI 的响应转成这个形状，测试时换成假模型即可。</p>
+<pre data-title="agent/types.ts"><code class="lang-ts">
+export type ToolCall = { id: string; name: string; args: unknown };
+
+export type Message =
+  | { role: 'system' | 'user'; content: string }
+  | { role: 'assistant'; content: string; toolCalls: ToolCall[] }
+  | { role: 'tool'; toolCallId: string; content: string; isError?: boolean };
+
+export type ToolSpec = { name: string; description: string; inputSchema: Record&lt;string, unknown&gt; };
+
+export type Usage = { inputTokens: number; outputTokens: number; cachedInputTokens: number };
+
+export interface Model {
+  generate(req: { messages: Message[]; tools: ToolSpec[]; signal?: AbortSignal }): Promise&lt;{
+    content: string;
+    toolCalls: ToolCall[];
+    usage: Usage;
+    stopReason: 'end' | 'tool_use' | 'max_tokens' | 'refusal';
+  }&gt;;
+}
+</code></pre>
+<ul>
+  <li><code>ToolCall.args</code> 是 <code>unknown</code>：模型给的东西在校验之前不可信，类型上就要逼你先校验。</li>
+  <li><code>tool</code> 消息靠 <code>toolCallId</code> 对应到某次调用；<code>isError</code> 告诉模型"这次没成功"。</li>
+  <li><code>stopReason</code> 区分四种结束：正常结束、要调用工具、被截断、拒答。后两种需要单独处理。</li>
+</ul>
+
+<h2>3 · loop 的控制流</h2>
+<p>在看代码之前，先把控制流走一遍。点"下一步"：</p>
+
+<figure class="anim" data-dim>
+<div class="diagram">
+<svg viewBox="0 0 760 470" width="760" role="img" aria-label="agent loop 的控制流">
+  <g data-k="start"><rect class="box m" x="270" y="10" width="220" height="40" rx="8"/><text class="t" x="380" y="35" text-anchor="middle">messages = [system, user]</text></g>
+  <g data-k="guard"><rect class="box w" x="270" y="72" width="220" height="40" rx="8"/><text class="t" x="380" y="97" text-anchor="middle">检查：取消？超预算？</text></g>
+  <g data-k="gen"><rect class="box a" x="270" y="134" width="220" height="40" rx="8"/><text class="t" x="380" y="159" text-anchor="middle">model.generate()</text></g>
+  <g data-k="dec"><polygon class="box b" points="380,196 490,232 380,268 270,232"/><text class="t" x="380" y="237" text-anchor="middle">有 tool call？</text></g>
+  <g data-k="ret"><rect class="box g" x="30" y="212" width="170" height="40" rx="8"/><text class="t" x="115" y="237" text-anchor="middle">返回最终文本</text></g>
+  <g data-k="val"><rect class="box v" x="270" y="296" width="220" height="40" rx="8"/><text class="t" x="380" y="321" text-anchor="middle">找工具 · 校验参数</text></g>
+  <g data-k="err"><rect class="box r" x="20" y="296" width="190" height="40" rx="8"/><text class="t" x="115" y="321" text-anchor="middle">错误 → isError 结果</text></g>
+  <g data-k="exec"><rect class="box b" x="270" y="358" width="220" height="40" rx="8"/><text class="t" x="380" y="383" text-anchor="middle">执行：只读并行 · 写串行</text></g>
+  <g data-k="app"><rect class="box m" x="270" y="420" width="220" height="40" rx="8"/><text class="t" x="380" y="445" text-anchor="middle">追加 tool 消息，step++</text></g>
+  <g data-k="limit"><rect class="box w" x="560" y="72" width="180" height="40" rx="8"/><text class="t" x="650" y="97" text-anchor="middle">超限 → 要求直接回答</text></g>
+  <g data-k="e-sg"><path class="line" d="M380 50 V72" marker-end="url(#arr)"/></g>
+  <g data-k="e-gg"><path class="line" d="M380 112 V134" marker-end="url(#arr)"/></g>
+  <g data-k="e-gd"><path class="line" d="M380 174 V196" marker-end="url(#arr)"/></g>
+  <g data-k="e-dr"><path class="line g" d="M270 232 H200" marker-end="url(#arr-g)"/><text class="ts" x="235" y="224" text-anchor="middle">否</text></g>
+  <g data-k="e-dv"><path class="line" d="M380 268 V296" marker-end="url(#arr)"/><text class="ts" x="394" y="286">是</text></g>
+  <g data-k="e-ve"><path class="line r" d="M270 316 H210" marker-end="url(#arr-r)"/></g>
+  <g data-k="e-vx"><path class="line" d="M380 336 V358" marker-end="url(#arr)"/></g>
+  <g data-k="e-xa"><path class="line" d="M380 398 V420" marker-end="url(#arr)"/></g>
+  <g data-k="e-ea"><path class="line r dash" d="M115 336 V440 H270" marker-end="url(#arr-r)"/></g>
+  <g data-k="e-loop"><path class="line a" d="M490 440 H520 C540 440 540 92 520 92 H490" marker-end="url(#arr-a)"/><text class="ts" x="548" y="300">下一轮</text></g>
+  <g data-k="e-lim"><path class="line b dash" d="M490 82 H560" marker-end="url(#arr-b)"/><text class="ts" x="525" y="66" text-anchor="middle">超步数</text></g>
+</svg>
+</div>
+<ol class="anim-steps">
+  <li data-show="start" data-hl="start">初始化消息列表：系统提示（角色、规则、工具使用指南）+ 用户目标。</li>
+  <li data-show="guard e-sg" data-hl="guard e-sg">每一轮开始前先检查：用户取消了吗？累计 token 超预算了吗？步数用完了吗？这些检查放在<strong>调用模型之前</strong>，才能真正省钱。</li>
+  <li data-show="gen e-gg" data-hl="gen e-gg">把完整的消息列表和工具定义发给模型。拿到响应先累加 usage，再看 stopReason：拒答和截断直接作为失败上报。</li>
+  <li data-show="dec e-gd" data-hl="dec e-gd">把模型的回复原样追加为 assistant 消息，然后看它有没有调用工具。</li>
+  <li data-show="ret e-dr" data-hl="ret e-dr">没有工具调用 = 模型认为任务完成，循环正常结束，返回它的文本。</li>
+  <li data-show="val e-dv" data-hl="val e-dv">有工具调用：按名字找到工具，用 schema 校验参数。<strong>这一步不信任模型的任何输出。</strong></li>
+  <li data-show="err e-ve e-ea" data-hl="err e-ve e-ea">工具不存在、参数不合法、执行抛错、超时——统统变成一条 <code>isError: true</code> 的 tool 消息回灌给模型，而<strong>不是</strong>让整个任务崩掉。模型下一轮会看到错误并尝试修正。</li>
+  <li data-show="exec e-vx" data-hl="exec e-vx">校验通过的调用被执行。互不依赖的只读工具可以并行；有副作用的工具（发信、改日程）串行执行，并带上幂等键。</li>
+  <li data-show="app e-xa e-loop" data-hl="app e-xa e-loop">每个调用的结果都追加为一条 tool 消息（顺序与调用顺序一致），然后进入下一轮。</li>
+  <li data-show="limit e-lim" data-hl="limit e-lim">步数用完时不要直接抛错丢掉一切：追加一条"请直接回答，并说明还有什么没完成"，再问模型最后一次，把半成品和说明交给用户。</li>
+</ol>
+<figcaption>图 4-1 生产级 agent loop 的控制流。红色是错误回灌路径，橙色虚线是步数上限的出口。</figcaption>
+</figure>
+
+<h2>4 · 完整实现</h2>
+<p>先定义工具的形状。和第 3 章一样用 Zod 描述参数，同时标注它<strong>有没有副作用</strong>：</p>
+<pre data-title="agent/tool.ts"><code class="lang-ts">
+import * as z from 'zod';
+import type { ToolSpec } from './types';
+
+export interface ToolContext {
+  signal: AbortSignal;       // 合并了用户取消与单工具超时
+  idempotencyKey: string;    // 有副作用的工具必须把它传给下游服务
+}
+
+export interface Tool&lt;S extends z.ZodType = z.ZodType&gt; {
+  spec: ToolSpec;
+  schema: S;
+  mutates: boolean;          // 发信、改日程、建任务等会改变外部世界的工具
+  run(args: z.infer&lt;S&gt;, ctx: ToolContext): Promise&lt;string&gt;;
+}
+
+export function defineTool&lt;S extends z.ZodType&gt;(def: {
+  name: string; description: string; schema: S; mutates: boolean;
+  run: (args: z.infer&lt;S&gt;, ctx: ToolContext) =&gt; Promise&lt;string&gt;;
+}): Tool&lt;S&gt; {
+  const { $schema: _ignored, ...inputSchema } = z.toJSONSchema(def.schema) as Record&lt;string, unknown&gt;;
+  return { spec: { name: def.name, description: def.description, inputSchema }, schema: def.schema, mutates: def.mutates, run: def.run };
+}
+</code></pre>
+
+<p>然后是 loop 本身。逐段看注释：</p>
+<pre data-title="agent/run.ts"><code class="lang-ts">
+import * as z from 'zod';
+import type { Tool } from './tool';
+import type { Message, Model, ToolCall, Usage } from './types';
+
+export interface RunOptions {
+  runId: string;               // 用来派生幂等键
+  maxSteps?: number;           // 默认 12
+  maxInputTokens?: number;     // 整个任务的输入 token 预算
+  toolTimeoutMs?: number;      // 单个工具的超时，默认 30 秒
+  maxResultChars?: number;     // 单条工具结果上限，默认 6000 字
+  signal?: AbortSignal;        // 用户取消
+  onEvent?: (e: AgentEvent) =&gt; void;  // 接到 trace（第 14 章）
+}
+
+export type AgentEvent =
+  | { type: 'model'; step: number; usage: Usage; toolCalls: ToolCall[] }
+  | { type: 'tool'; step: number; call: ToolCall; ok: boolean; ms: number };
+
+export interface RunResult {
+  text: string;
+  usage: Usage;
+  steps: number;
+  mutated: boolean;            // 是否执行过有副作用的工具：决定了失败后能不能整体重来
+  hitStepLimit: boolean;
+}
+
+export class AgentError extends Error {
+  constructor(message: string, readonly messages: Message[], readonly mutated: boolean) {
+    super(message);
+  }
+}
+
+export async function runAgent(model: Model, tools: Tool[], messages: Message[], opts: RunOptions): Promise&lt;RunResult&gt; {
+  const byName = new Map(tools.map((t) =&gt; [t.spec.name, t]));
+  const specs = tools.map((t) =&gt; t.spec); // 顺序固定，利于提示缓存（第 2 章）
+  const maxSteps = opts.maxSteps ?? 12;
+  const usage: Usage = { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0 };
+  let mutated = false;
+
+  const call = async () =&gt; {
+    opts.signal?.throwIfAborted();
+    if (opts.maxInputTokens &amp;&amp; usage.inputTokens &gt;= opts.maxInputTokens) {
+      throw new AgentError(`超出输入 token 预算（${opts.maxInputTokens}）`, messages, mutated);
+    }
+    const res = await model.generate({ messages, tools: specs, signal: opts.signal });
+    usage.inputTokens += res.usage.inputTokens;
+    usage.outputTokens += res.usage.outputTokens;
+    usage.cachedInputTokens += res.usage.cachedInputTokens;
+    if (res.stopReason === 'refusal') throw new AgentError('模型拒绝执行', messages, mutated);
+    if (res.stopReason === 'max_tokens') throw new AgentError('模型输出被截断', messages, mutated);
+    messages.push({ role: 'assistant', content: res.content, toolCalls: res.toolCalls });
+    return res;
+  };
+
+  for (let step = 1; step &lt;= maxSteps; step++) {
+    const res = await call();
+    opts.onEvent?.({ type: 'model', step, usage: res.usage, toolCalls: res.toolCalls });
+    if (res.toolCalls.length === 0) return { text: res.content, usage, steps: step, mutated, hitStepLimit: false };
+
+    const results = await executeCalls(res.toolCalls, byName, step, opts);
+    for (const r of results) {
+      messages.push(r.message);
+      if (r.mutated) mutated = true;
+    }
+  }
+
+  // 步数用完：工具定义保持不变（不改前缀，缓存照样命中），但明确要求不再调用工具
+  messages.push({
+    role: 'user',
+    content: '已达到步数上限。不要再调用工具，根据目前掌握的信息直接回答，并列出还没完成的部分。',
+  });
+  const final = await call();
+  return { text: final.content, usage, steps: maxSteps, mutated, hitStepLimit: true };
+}
+</code></pre>
+
+<p>执行工具的部分单独拆出来。它的职责是：<strong>无论发生什么，都给每个 tool call 产出一条 tool 消息</strong>——除非用户取消了整个任务。</p>
+<pre data-title="agent/run.ts（续）：执行工具调用"><code class="lang-ts">
+type Executed = { message: Message; mutated: boolean };
+
+async function executeCalls(
+  calls: ToolCall[], byName: Map&lt;string, Tool&gt;, step: number, opts: RunOptions,
+): Promise&lt;Executed[]&gt; {
+  const isWrite = (c: ToolCall) =&gt; byName.get(c.name)?.mutates === true;
+  const done = new Map&lt;string, Executed&gt;();
+  // 只读工具互不影响，并行跑；有副作用的工具按模型给出的顺序逐个执行
+  const reads = calls.filter((c) =&gt; !isWrite(c));
+  const outs = await Promise.all(reads.map((c) =&gt; executeOne(c, byName, step, opts)));
+  reads.forEach((c, i) =&gt; done.set(c.id, outs[i]));
+  for (const c of calls.filter(isWrite)) done.set(c.id, await executeOne(c, byName, step, opts));
+  return calls.map((c) =&gt; done.get(c.id)!); // 结果按调用顺序回填
+}
+
+async function executeOne(call: ToolCall, byName: Map&lt;string, Tool&gt;, step: number, opts: RunOptions): Promise&lt;Executed&gt; {
+  const fail = (content: string, mutated = false): Executed =&gt; ({
+    message: { role: 'tool', toolCallId: call.id, content, isError: true },
+    mutated,
+  });
+  const tool = byName.get(call.name);
+  if (!tool) return fail(`没有名为 ${call.name} 的工具。可用的工具：${[...byName.keys()].join('、')}`);
+
+  const parsed = tool.schema.safeParse(call.args);
+  if (!parsed.success) return fail(`参数不合法，请修正后重新调用：\n${z.prettifyError(parsed.error)}`);
+
+  const signals = [AbortSignal.timeout(opts.toolTimeoutMs ?? 30_000)];
+  if (opts.signal) signals.push(opts.signal);
+  const started = Date.now();
+  try {
+    const text = await tool.run(parsed.data, {
+      signal: AbortSignal.any(signals),
+      idempotencyKey: `${opts.runId}:${call.id}`,
+    });
+    opts.onEvent?.({ type: 'tool', step, call, ok: true, ms: Date.now() - started });
+    return { message: { role: 'tool', toolCallId: call.id, content: truncate(text, opts.maxResultChars ?? 6000) }, mutated: tool.mutates };
+  } catch (err) {
+    opts.onEvent?.({ type: 'tool', step, call, ok: false, ms: Date.now() - started });
+    if (opts.signal?.aborted) throw err; // 用户取消：整个任务中止，不再回灌
+    const reason = err instanceof Error ? err.message : String(err);
+    if (tool.mutates) {
+      // 超时或网络错误时请求可能已经生效：不能让模型盲目重试
+      return fail(`执行结果未知（${reason}）。该操作可能已经生效，不要直接重试；先用查询工具确认当前状态。`, true);
+    }
+    return fail(`执行失败：${reason}`);
+  }
+}
+
+function truncate(text: string, max: number): string {
+  if (text.length &lt;= max) return text;
+  return `${text.slice(0, max)}\n…（已截断，原文共 ${text.length} 字。请缩小查询范围或翻页）`;
+}
+</code></pre>
+
+<div class="callout note"><b>为什么错误要回灌而不是抛出？</b>
+<p>模型在大多数情况下能自己修正：参数格式不对就改格式，工具不存在就换工具，查不到就换关键词。Manus 团队的经验是"把错误留在上下文里"——模型看到失败的动作和报错，会更新自己的判断，降低重复犯错的概率。12-Factor Agents 的第 9 条"把错误压缩进上下文"也是同样的意思。只有当错误是<strong>系统性</strong>的（用户取消、预算耗尽、模型拒答）才应该中止整个任务。</p></div>
+
+<h2>5 · 四类工具错误与回灌内容</h2>
+<table>
+<tr><th>错误</th><th>常见原因</th><th>回灌给模型的内容要点</th></tr>
+<tr><td>工具不存在</td><td>模型凭印象编了个工具名，或用了旧名字</td><td>列出可用的工具名</td></tr>
+<tr><td>参数不合法</td><td>缺字段、类型错、枚举值写错、多余字段</td><td>具体字段路径 + 合法值；可附"先调用某工具"的建议</td></tr>
+<tr><td>只读工具执行失败 / 超时</td><td>外部服务抖动、查询太宽</td><td>失败原因；可以重试或换个查询</td></tr>
+<tr><td>有副作用的工具失败 / 超时</td><td>网络错误、下游 5xx</td><td><strong>状态未知</strong>，不要直接重试，先查询确认（第 10 章用幂等键与动作记录从根本上解决）</td></tr>
+</table>
+
+<div class="callout warn"><b>工具结果也会"失败"：太长</b>
+<p>一次返回几万字的搜索结果不会报错，但会挤爆上下文、稀释注意力（第 2 章的 context rot），还会让后面每一轮都多付这些 token 的钱。截断时<strong>告诉模型</strong>"已截断、共多少、怎么缩小范围"，比悄悄截掉好得多。Claude Code 的工具返回默认上限是 25,000 token，可以作为一个量级参考。</p></div>
+
+<h2>6 · 动手：单步执行一个 loop</h2>
+<p>下面的模拟器按上面的代码逻辑运行，模型的回复是预先写好的脚本（就像下一节的假模型）。选择一个场景，逐步点击，观察 <code>messages</code> 数组如何增长、每一步 loop 做了什么判断：</p>
+
+<div class="widget" id="sim">
+<div class="w-title">Agent loop 模拟器</div>
+<div class="sim-head">
+  <select data-scenario aria-label="场景"></select>
+  <button class="btn small primary" type="button" data-next>下一步 →</button>
+  <button class="btn small" type="button" data-auto>▶ 自动</button>
+  <button class="btn small" type="button" data-reset>↺ 重置</button>
+</div>
+<div class="sim-status" data-status></div>
+<div class="sim-log" data-log></div>
+<div class="sim-msgs" data-msgs aria-live="polite"></div>
+</div>
+
+<p>三个场景各演示一个要点：</p>
+<ul>
+  <li><strong>正常完成</strong>：第一轮模型同时发出两个互不依赖的只读调用，loop 并行执行；之后两次有副作用的调用串行执行。</li>
+  <li><strong>参数错误回灌</strong>：模型把"下周三"直接塞进日期参数，校验失败的具体信息被回灌，模型按提示先解析日期再查询。</li>
+  <li><strong>绕圈与步数上限</strong>：模型反复用相同的关键词搜索，loop 在第 4 步停下，要求它基于已有信息作答。</li>
+</ul>
+
+<div class="quiz" data-answer="2">
+<p class="q">只读工具 <code>mail_search</code> 调用时外部服务返回 503。loop 应该怎么做？</p>
+<ol>
+  <li>抛出异常，结束整个任务</li>
+  <li>把"执行失败：503 服务暂时不可用"作为 isError 的 tool 消息回灌，让模型决定重试还是换个办法</li>
+  <li>悄悄返回空结果，假装没搜到</li>
+  <li>把这次 tool call 从历史里删掉，重新请求模型</li>
+</ol>
+<div class="explain">只读工具失败没有副作用风险，回灌错误让模型决策即可。返回空结果会让模型得出"没有相关邮件"的错误结论；删历史会破坏 tool call 与 tool 消息的对应关系，也会让模型重复同样的调用。</div>
+</div>
+
+<h2>7 · 并行调用、超时与取消</h2>
+<h3>并行</h3>
+<p>主流模型可以在一轮里发出多个工具调用，意味着它认为这些调用<strong>互不依赖</strong>。并行执行它们能显著降低延迟——Anthropic 的多智能体研究系统把子 agent 内部的工具调用改为并行后，复杂查询的耗时最多下降了 90%。实现上要注意：</p>
+<ul>
+  <li>结果必须按调用 id 一一回填，顺序与调用顺序一致，便于阅读与调试。</li>
+  <li>只并行只读工具。两个有副作用的调用即使模型认为独立，也按顺序执行——"改日程"和"发通知"同时进行，通知里的时间可能是旧的。</li>
+  <li>一个调用失败不影响其他调用的结果回填。</li>
+</ul>
+<h3>超时与取消</h3>
+<p>每个工具都要有超时，否则一个卡死的外部请求会卡住整个 agent。用 <code>AbortSignal.timeout()</code> 与用户的取消信号合并（<code>AbortSignal.any()</code>），并把信号一路传给 <code>fetch</code> 等下游调用。区分两种中止：<strong>单个工具超时</strong>回灌给模型；<strong>用户取消</strong>立即终止整个任务。</p>
+
+<h2>8 · 有副作用的工具：最危险的地方</h2>
+<p>设想这个时间线：模型调用 <code>mail_send</code> → 邮件成功发出 → 下一轮请求模型时 API 返回 500 → 你的代码捕获异常，<strong>从头重跑整个任务</strong>。结果：邮件发了两次。</p>
+<p>这就是 <code>RunResult.mutated</code> 和 <code>AgentError.mutated</code> 存在的原因：</p>
+<ul>
+  <li><strong>没执行过有副作用的工具</strong>：整个任务可以安全地重来，甚至换一个模型重来（第 2 章的回退）。</li>
+  <li><strong>执行过</strong>：不能整轮重试，也不能换模型从头跑。应当从中断处恢复（保存了消息列表就能续上），或者把状态交给人决定。</li>
+</ul>
+<p>幂等键 <code>${runId}:${call.id}</code> 能在<strong>同一次运行</strong>里防止重复（比如工具内部的网络重试），但如果整个任务重跑，模型会生成新的调用 id，幂等键就变了。真正的保护需要把"要执行的动作"先持久化成一条记录（状态：待执行 → 执行中 → 已完成），用记录 id 作为幂等键——这是第 10 章和跟练项目 P3 的内容。</p>
+
+<div class="callout danger"><b>高风险动作不该由 loop 直接执行</b>
+<p>对于办公助理来说，"发邮件给客户"这类动作最好根本不在工具循环里直接执行：工具只负责<strong>生成一个待审批的提案</strong>（"建议发送以下邮件"），人批准后由独立的执行器带幂等键发出。OpenAI Agents SDK 的工具也提供 <code>needsApproval</code>，让 loop 在执行前暂停等待批准。第 8 章细讲。</p></div>
+
+<div class="quiz" data-answer="3">
+<p class="q">agent 已经调用 <code>calendar_event_update</code> 把会议改到了周四，接着请求模型时遇到 API 限流（429）。正确的处理是？</p>
+<ol>
+  <li>换一个模型，从用户的原始请求开始重跑</li>
+  <li>等一会儿从原始请求开始重跑</li>
+  <li>保留当前的消息列表，退避后用同一份历史继续请求模型（续上而不是重来）</li>
+  <li>直接告诉用户任务失败，让他手动再发一次请求</li>
+</ol>
+<div class="explain">已有副作用发生，从头重跑会重复修改（甚至重复通知参会人）。消息列表本身就是 agent 的完整状态（12-Factor Agents 第 5、12 条），保存它就能从断点继续。④会把同样的问题推给用户，他重发一次就是重跑一次。</div>
+</div>
+
+<h2>9 · 历史增长与上下文管理的预告</h2>
+<p>每一轮都往 <code>messages</code> 追加至少两条消息。一个 20 步的任务，最后一轮的输入可能是第一轮的好几倍。第 2 章的计算器已经展示了成本的超线性增长。loop 层面能做的有：</p>
+<ul>
+  <li>截断过长的工具结果（上面的 <code>truncate</code>）。</li>
+  <li>设步数上限与 token 预算，并在任务开始前按复杂度分配预算——Anthropic 建议简单任务 3–10 次工具调用就够。</li>
+  <li><strong>只追加、不改写</strong>历史，保持缓存命中。</li>
+</ul>
+<p>更系统的手段——压缩历史、把细节写进文件、子 agent 隔离上下文——属于上下文工程，见第 5 章。</p>
+
+<h2>10 · 用假模型离线测试</h2>
+<p>loop 的大部分逻辑和模型能力无关：错误有没有正确回灌、步数上限是否生效、有副作用的工具会不会被调两次。这些都可以用一个按脚本回复的<strong>假模型</strong>测试，不花钱、不联网、结果确定。</p>
+<pre data-title="agent/fake-model.ts"><code class="lang-ts">
+import type { Message, Model, ToolCall } from './types';
+
+type Reply = Awaited&lt;ReturnType&lt;Model['generate']&gt;&gt;;
+type Step = (messages: Message[]) =&gt; Reply;
+
+export const say = (content: string): Reply =&gt; ({
+  content, toolCalls: [], stopReason: 'end',
+  usage: { inputTokens: 100, outputTokens: 20, cachedInputTokens: 0 },
+});
+export const use = (...toolCalls: ToolCall[]): Reply =&gt; ({
+  content: '', toolCalls, stopReason: 'tool_use',
+  usage: { inputTokens: 100, outputTokens: 20, cachedInputTokens: 0 },
+});
+
+/** 按顺序返回预先写好的回复；每次收到的消息列表都留档，供测试断言 */
+export class FakeModel implements Model {
+  readonly seen: Message[][] = [];
+  constructor(private readonly script: Step[]) {}
+  async generate(req: { messages: Message[] }) {
+    this.seen.push(structuredClone(req.messages));
+    const next = this.script.shift();
+    if (!next) throw new Error('FakeModel 的脚本已用完：loop 比预期多请求了一次模型');
+    return next(req.messages);
+  }
+}
+</code></pre>
+
+<p>下面三个测试各自拦截一类真实的 bug。写测试前先问"一个合理的错误改动会让它失败吗"：</p>
+<pre data-title="agent/run.test.ts"><code class="lang-ts">
+import { describe, expect, test } from 'bun:test';
+import * as z from 'zod';
+import { FakeModel, say, use } from './fake-model';
+import { runAgent } from './run';
+import { defineTool } from './tool';
+
+const sent: string[] = [];
+const search = defineTool({
+  name: 'calendar_events_search', description: '按日期搜索会议', mutates: false,
+  schema: z.object({ start_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/) }),
+  run: async ({ start_date }) =&gt; `2 个会议，日期 ${start_date}`,
+});
+const send = defineTool({
+  name: 'mail_send', description: '发送邮件', mutates: true,
+  schema: z.object({ subject: z.string() }),
+  run: async ({ subject }) =&gt; { sent.push(subject); throw new Error('网关超时'); },
+});
+const start = () =&gt; [{ role: 'system' as const, content: '你是办公助理' }, { role: 'user' as const, content: '查下周三的会' }];
+
+describe('runAgent', () =&gt; {
+  // 拦截：有人把参数错误改成直接抛异常，或回灌内容里丢掉了具体字段
+  test('参数校验失败时回灌具体错误，模型修正后工具只以合法参数执行一次', async () =&gt; {
+    const model = new FakeModel([
+      () =&gt; use({ id: 'c1', name: 'calendar_events_search', args: { start_date: '下周三' } }),
+      () =&gt; use({ id: 'c2', name: 'calendar_events_search', args: { start_date: '2026-12-02' } }),
+      () =&gt; say('下周三有 2 个会'),
+    ]);
+    const r = await runAgent(model, [search, send], start(), { runId: 't1' });
+    const feedback = model.seen[1].at(-1);
+    expect(feedback).toMatchObject({ role: 'tool', toolCallId: 'c1', isError: true });
+    expect(feedback &amp;&amp; 'content' in feedback &amp;&amp; feedback.content).toContain('start_date');
+    expect(r.text).toBe('下周三有 2 个会');
+  });
+
+  // 拦截：步数上限失效导致死循环，或超限后直接抛错丢掉了所有进展
+  test('达到步数上限后要求模型直接回答，而不是继续执行工具', async () =&gt; {
+    const loop = () =&gt; use({ id: crypto.randomUUID(), name: 'calendar_events_search', args: { start_date: '2026-12-02' } });
+    const model = new FakeModel([loop, loop, loop, () =&gt; say('没找到更多信息')]);
+    const r = await runAgent(model, [search], start(), { runId: 't2', maxSteps: 3 });
+    expect(r.hitStepLimit).toBe(true);
+    expect(r.text).toBe('没找到更多信息');
+  });
+
+  // 拦截：有副作用的工具失败后被自动重试，或失败时没有标记 mutated
+  test('有副作用的工具失败时不自动重试，并提示模型先确认状态', async () =&gt; {
+    sent.length = 0;
+    const model = new FakeModel([
+      () =&gt; use({ id: 'm1', name: 'mail_send', args: { subject: '周会改期' } }),
+      () =&gt; say('发送结果未知，请确认'),
+    ]);
+    const r = await runAgent(model, [send], start(), { runId: 't3' });
+    expect(sent).toEqual(['周会改期']);
+    expect(r.mutated).toBe(true);
+    const feedback = model.seen[1].at(-1);
+    expect(feedback &amp;&amp; 'content' in feedback &amp;&amp; feedback.content).toContain('不要直接重试');
+  });
+});
+</code></pre>
+
+<div class="callout tip"><b>假模型测什么、不测什么</b>
+<p>假模型测的是<strong>你的代码</strong>：控制流、错误处理、状态。它测不了"模型会不会在这种情况下做出正确决策"——那是评测（第 13 章）的工作，要用真实模型、真实或逼真的数据、多次运行看通过率。两者缺一不可，但不要混在一起。</p></div>
+
+<div class="quiz" data-answer="1">
+<p class="q">下面哪个测试最没有价值？</p>
+<ol>
+  <li>断言系统提示等于某段固定文字</li>
+  <li>工具不存在时，回灌的错误消息里包含可用的工具名</li>
+  <li>用户取消后 loop 不再请求模型</li>
+  <li>超过 token 预算时任务以明确的错误结束</li>
+</ol>
+<div class="explain">把提示词原样抄进断言，锁住的是实现而不是行为：改一个字测试就挂，但真正的 bug（比如错误没回灌）它一个也拦不住。提示词的效果要靠评测来验证。</div>
+</div>
+
+<div class="callout case review-link"><b>真实项目复盘</b>
+<p>本章的知识点在两个真实项目里缺位时发生了什么，以及"有这块知识"时会怎么设计：</p>
+<ul><li><a href="review.html#f-D5">D5</a> · devtask 的完成判定按子串匹配"完成"，实测 <code>is_completed("未完成")</code> 返回 True</li></ul></div>
+
+<div class="takeaways"><b>本章要点</b>
+<ul>
+  <li>ReAct 的 Thought/Action/Observation 已内置为原生工具调用，但循环、停止条件、错误处理仍是你的代码。</li>
+  <li>每轮先检查取消与预算，再调用模型；拒答和截断单独处理。</li>
+  <li>工具不存在、参数不合法、执行失败都以 isError 回灌，让模型自我修正；只有系统性错误才中止。</li>
+  <li>只读工具并行，有副作用的工具串行并带幂等键；结果按调用顺序回填。</li>
+  <li>执行过副作用后不能整轮重试或换模型重跑：保存消息列表，从断点续上。</li>
+  <li>步数用完时要求模型基于已有信息作答，而不是丢掉一切。</li>
+  <li>用假模型测控制流，用评测测模型决策。</li>
+</ul></div>
+
+<h2>参考资料</h2>
+<ul class="refs">
+  <li><a href="https://arxiv.org/abs/2210.03629" target="_blank" rel="noopener">ReAct: Synergizing Reasoning and Acting in Language Models</a> <span class="src">Yao et al. · 2022-10-06 · ICLR 2023</span></li>
+  <li><a href="https://github.com/humanlayer/12-factor-agents" target="_blank" rel="noopener">12-Factor Agents</a> <span class="src">HumanLayer · 掌控控制流、把错误压缩进上下文、无状态 reducer</span></li>
+  <li><a href="https://manus.im/blog/Context-Engineering-for-AI-Agents-Lessons-from-Building-Manus" target="_blank" rel="noopener">Context Engineering for AI Agents: Lessons from Building Manus</a> <span class="src">Manus · 2025-07-18 · 把错误留在上下文里</span></li>
+  <li><a href="https://www.anthropic.com/engineering/writing-tools-for-agents" target="_blank" rel="noopener">Writing effective tools for agents</a> <span class="src">Anthropic · 2025-09-11 · 返回量控制与错误信息</span></li>
+  <li><a href="https://www.anthropic.com/engineering/multi-agent-research-system" target="_blank" rel="noopener">How we built our multi-agent research system</a> <span class="src">Anthropic · 2025-06-13 · 并行工具调用、按复杂度分配预算</span></li>
+  <li><a href="https://openai.github.io/openai-agents-js/guides/human-in-the-loop/" target="_blank" rel="noopener">Human-in-the-loop</a> <span class="src">OpenAI Agents SDK（JS）· needsApproval</span></li>
+</ul>
+</article>
+
+<script>
+window.addEventListener('DOMContentLoaded', () => {
+  // 每个场景是一串"tick"：要么是模型返回一条 assistant 消息，要么是 loop 执行工具并追加 tool 消息。
+  const SYS = { role: 'system', content: '你是办公助理。可用工具：calendar_resolve_date、calendar_events_search、calendar_event_update（有副作用）、mail_send（有副作用）、mail_search。' };
+  const scenarios = [
+    {
+      name: '正常完成：改期并通知（含并行调用）',
+      maxSteps: 8,
+      user: '把下周三的项目周会挪到周四同一时间，并通知参会人',
+      ticks: [
+        { log: '第 1 轮：请求模型。模型一次发出两个<b>互不依赖的只读调用</b>。', add: [{ role: 'assistant', content: '先把两个相对日期解析成具体日期。', calls: [['a1', 'calendar_resolve_date', { text: '下周三' }], ['a2', 'calendar_resolve_date', { text: '下周四' }]] }] },
+        { log: '两个调用都是只读的，用 <code>Promise.all</code> <b>并行执行</b>，结果按调用顺序回填。', add: [{ role: 'tool', id: 'a1', content: '2026-12-02' }, { role: 'tool', id: 'a2', content: '2026-12-03' }] },
+        { log: '第 2 轮：模型用解析出的日期查询会议。', add: [{ role: 'assistant', content: '', calls: [['a3', 'calendar_events_search', { start_date: '2026-12-02', end_date: '2026-12-02', keyword: '周会' }]] }] },
+        { log: '校验通过，执行查询。', add: [{ role: 'tool', id: 'a3', content: '[{event_id: "e1", title: "项目周会", time: "10:00-11:00", attendees: 6}]' }] },
+        { log: '第 3 轮：模型调用<b>有副作用</b>的改期工具。', add: [{ role: 'assistant', content: '', calls: [['a4', 'calendar_event_update', { event_id: 'e1', new_date: '2026-12-03' }, true]] }] },
+        { log: '有副作用的工具<b>串行执行</b>，带幂等键 <code>run-42:a4</code>。<code>mutated</code> 置为 true：从此这次任务不能整轮重试。', add: [{ role: 'tool', id: 'a4', content: '已改期：项目周会 → 2026-12-03 10:00-11:00' }], mutated: true },
+        { log: '第 4 轮：模型调用发信工具通知参会人。', add: [{ role: 'assistant', content: '', calls: [['a5', 'mail_send', { to_event: 'e1', subject: '项目周会改至周四 10:00' }, true]] }] },
+        { log: '串行执行，幂等键 <code>run-42:a5</code>。', add: [{ role: 'tool', id: 'a5', content: '已发送给 6 位参会人' }] },
+        { log: '第 5 轮：模型不再调用工具，<b>循环结束</b>，返回最终文本。', add: [{ role: 'assistant', content: '已把项目周会改到 12 月 3 日（周四）10:00，并通知了 6 位参会人。', calls: [] }], end: true },
+      ],
+    },
+    {
+      name: '参数错误回灌',
+      maxSteps: 8,
+      user: '下周三我有哪些会？',
+      ticks: [
+        { log: '第 1 轮：模型把自然语言日期直接塞进了参数，还用了一个不存在的字段名。', add: [{ role: 'assistant', content: '', calls: [['b1', 'calendar_events_search', { date: '下周三' }]] }] },
+        { log: '<b>Zod 校验失败</b>。loop 不抛异常，而是把具体错误作为 <code>isError</code> 的 tool 消息回灌。', add: [{ role: 'tool', id: 'b1', err: true, content: '参数不合法，请修正后重新调用：\n✖ 缺少必填字段 → 位置 start_date\n✖ 缺少必填字段 → 位置 end_date\n✖ 不允许的额外字段 → 位置 date\n提示：相对日期请先调用 calendar_resolve_date。' }] },
+        { log: '第 2 轮：模型读到错误信息里的提示，先解析日期。', add: [{ role: 'assistant', content: '先把"下周三"转成具体日期。', calls: [['b2', 'calendar_resolve_date', { text: '下周三' }]] }] },
+        { log: '执行成功。', add: [{ role: 'tool', id: 'b2', content: '2026-12-02' }] },
+        { log: '第 3 轮：用正确的参数重新查询。', add: [{ role: 'assistant', content: '', calls: [['b3', 'calendar_events_search', { start_date: '2026-12-02', end_date: '2026-12-02', keyword: null }]] }] },
+        { log: '执行成功。', add: [{ role: 'tool', id: 'b3', content: '[{title: "项目周会", time: "10:00"}, {title: "月报评审", time: "15:00"}]' }] },
+        { log: '第 4 轮：模型给出答案，循环结束。整个过程中错误被<b>回灌并修正</b>，用户感知不到。', add: [{ role: 'assistant', content: '下周三（12 月 2 日）有两个会：10:00 项目周会、15:00 月报评审。', calls: [] }], end: true },
+      ],
+    },
+    {
+      name: '绕圈与步数上限（maxSteps = 4）',
+      maxSteps: 4,
+      user: '找一下上个月供应商发来的报价单',
+      ticks: [
+        { log: '第 1 轮：模型搜索邮件。', add: [{ role: 'assistant', content: '', calls: [['c1', 'mail_search', { query: '报价单' }]] }] },
+        { log: '执行：没有结果。', add: [{ role: 'tool', id: 'c1', content: '0 封邮件' }] },
+        { log: '第 2 轮：模型用<b>几乎相同</b>的关键词再搜。', add: [{ role: 'assistant', content: '', calls: [['c2', 'mail_search', { query: '报价单 供应商' }]] }] },
+        { log: '执行：仍然没有结果。', add: [{ role: 'tool', id: 'c2', content: '0 封邮件' }] },
+        { log: '第 3 轮：继续换个说法……这就是"绕圈"。', add: [{ role: 'assistant', content: '', calls: [['c3', 'mail_search', { query: '供应商报价' }]] }] },
+        { log: '执行：没有结果。', add: [{ role: 'tool', id: 'c3', content: '0 封邮件' }] },
+        { log: '第 4 轮：又一次搜索。', add: [{ role: 'assistant', content: '', calls: [['c4', 'mail_search', { query: '报价' }]] }] },
+        { log: '执行：没有结果。<b>步数已用完（4/4）</b>。', add: [{ role: 'tool', id: 'c4', content: '0 封邮件' }] },
+        { log: 'loop <b>不再执行工具</b>，追加一条要求直接回答的消息，最后请求模型一次。', add: [{ role: 'user', content: '已达到步数上限。不要再调用工具，根据目前掌握的信息直接回答，并列出还没完成的部分。' }] },
+        { log: '模型给出"尽力而为"的回答和后续建议，<code>hitStepLimit = true</code>。更好的修复是改进工具：让 mail_search 支持按发件人域名和日期范围过滤，并在 0 结果时提示可用的过滤条件。', add: [{ role: 'assistant', content: '没有找到上个月的报价单邮件。已尝试 4 组关键词。建议：告诉我供应商名称，或确认报价单是否通过附件以外的方式发送。', calls: [] }], end: true, limit: true },
+      ],
+    },
+  ];
+
+  const box = document.getElementById('sim');
+  const sel = box.querySelector('[data-scenario]');
+  const msgsEl = box.querySelector('[data-msgs]');
+  const logEl = box.querySelector('[data-log]');
+  const statusEl = box.querySelector('[data-status]');
+  const nextBtn = box.querySelector('[data-next]');
+  const autoBtn = box.querySelector('[data-auto]');
+  scenarios.forEach((s, i) => sel.append(Course.el('option', { value: String(i), text: s.name })));
+
+  let sc, tick, messages, mutated, timer = null;
+  const esc = Course.escape;
+  const tokens = () => Math.round(messages.reduce((n, m) => n + JSON.stringify(m).length, 0) / 2);
+  const steps = () => messages.filter((m) => m.role === 'assistant').length;
+
+  function renderMsg(m, fresh) {
+    const cls = ['msg', m.role, m.err ? 'err' : '', fresh ? 'fresh' : ''].join(' ');
+    let body = '';
+    if (m.role === 'tool') body = `<span class="role">tool</span><span style="color:var(--muted)">← ${esc(m.id)}${m.err ? ' · isError' : ''}</span><div style="white-space:pre-wrap">${esc(m.content)}</div>`;
+    else if (m.role === 'assistant') {
+      body = `<span class="role">assistant</span>${m.content ? esc(m.content) : '<span style="color:var(--muted)">（无文字）</span>'}`;
+      for (const [id, name, args, mut] of m.calls || []) body += `<span class="call">tool_call ${esc(id)} · ${esc(name)}(${esc(JSON.stringify(args))})${mut ? '<span class="mut">有副作用</span>' : ''}</span>`;
+      if (m.calls && m.calls.length === 0) body += `<span class="call" style="color:var(--ok)">toolCalls: []　→ 循环结束</span>`;
+    } else body = `<span class="role">${m.role}</span>${esc(m.content)}`;
+    return Course.el('div', { class: cls, html: body });
+  }
+  function render(freshCount) {
+    msgsEl.innerHTML = '';
+    messages.forEach((m, i) => msgsEl.append(renderMsg(m, i >= messages.length - freshCount)));
+    msgsEl.scrollTop = msgsEl.scrollHeight;
+    const done = tick >= sc.ticks.length;
+    statusEl.innerHTML = `<span>步数 <b>${Math.min(steps(), sc.maxSteps)}</b> / ${sc.maxSteps}</span><span>messages <b>${messages.length}</b> 条</span><span>下一次请求输入约 <b>${tokens()}</b> token（按字符粗估）</span><span>mutated <b>${mutated}</b></span>${done ? '<span style="color:var(--ok)"><b>已结束</b></span>' : ''}`;
+    nextBtn.disabled = done;
+  }
+  function reset() {
+    stopAuto();
+    sc = scenarios[Number(sel.value)];
+    tick = 0;
+    mutated = false;
+    messages = [SYS, { role: 'user', content: sc.user }];
+    logEl.innerHTML = '初始化：<code>messages = [system, user]</code>。点"下一步"开始第 1 轮。';
+    render(0);
+  }
+  function step() {
+    if (tick >= sc.ticks.length) return stopAuto();
+    const t = sc.ticks[tick++];
+    messages.push(...t.add);
+    if (t.mutated) mutated = true;
+    logEl.innerHTML = t.log;
+    render(t.add.length);
+    if (tick >= sc.ticks.length) stopAuto();
+  }
+  function stopAuto() {
+    clearInterval(timer);
+    timer = null;
+    autoBtn.textContent = '▶ 自动';
+  }
+  nextBtn.addEventListener('click', () => { stopAuto(); step(); });
+  box.querySelector('[data-reset]').addEventListener('click', reset);
+  autoBtn.addEventListener('click', () => {
+    if (timer) return stopAuto();
+    if (tick >= sc.ticks.length) reset();
+    autoBtn.textContent = '⏸ 暂停';
+    timer = setInterval(step, 2200);
+  });
+  sel.addEventListener('change', reset);
+  reset();
+});
+</script>
+</body>
+</html>

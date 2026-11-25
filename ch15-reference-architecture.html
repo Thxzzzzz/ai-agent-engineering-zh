@@ -1,0 +1,576 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>参考架构 · AI Agent 工程</title>
+<meta name="description" content="把全课程拼成一个生产级 agent 系统：四层可替换接口 + 确定性内核管线 + 旁路任务，附设计原则、ADR 模板、设计评审清单与从 0 到 1 的演进路线。">
+<link rel="stylesheet" href="assets/css/course.css">
+<script src="assets/js/manifest.js"></script>
+<script defer src="assets/js/course.js"></script>
+<style>
+  .arch [data-comp] { cursor: pointer; }
+  .arch [data-comp]:hover rect { stroke-width: 2.5; }
+  .arch [data-comp].sel rect { stroke-width: 3.2; filter: drop-shadow(0 0 6px color-mix(in srgb, var(--accent) 50%, transparent)); }
+  .arch-panel h4 { margin: 0 0 6px; font-size: 17px; }
+  .arch-panel .k { font-size: 13px; color: var(--muted); margin: 10px 0 2px; font-weight: 600; }
+  .arch-panel pre { margin: 6px 0; font-size: 12.5px; }
+  .arch-panel ul { margin: 4px 0; }
+  .arch-panel .links a { margin-right: 10px; white-space: nowrap; }
+</style>
+</head>
+<body data-page="ch15">
+<article id="content">
+<div class="eyebrow">第五部分 · 综合 · 第 15 章</div>
+<h1>参考架构：设计一个生产级 Agent 系统</h1>
+<p class="lead">前面十四章各讲了一个部件。这一章把它们拼起来：以"替用户处理日常工作消息的助理"为例，给出一套可以直接拿去用的参考架构、设计原则、决策记录模板和评审清单，以及一条从零做到可用的演进路线。</p>
+<div class="meta"><span>约 40 分钟</span><span>前置：前 14 章</span><span>含 1 个分步动画、1 个可点击架构图、2 道小测</span></div>
+
+<div class="goals"><b>学完你能</b>
+<ul>
+  <li>画出一个生产级 agent 系统的分层架构，说清每层的职责和接口</li>
+  <li>解释为什么内核应该是"确定性管线 + 少数几个模型节点"，而不是一个大 agent</li>
+  <li>写出一份架构决策记录（ADR），用评审清单审查一个 agent 设计</li>
+  <li>规划一个 agent 项目从 0 到 1 的演进顺序，知道每一步先做什么、后做什么</li>
+</ul></div>
+
+<h2>1 · 全景：四层可替换 + 确定性内核</h2>
+<p>先看全图。外面一圈是四个<strong>可替换</strong>的接口层：消息从哪来、模型用谁、用户在哪审批、活交给谁干。中间是<strong>确定性内核</strong>：一条由代码掌控的管线，模型只在其中少数几个节点出现，而且都是结构化输出。<strong>点击图中任意组件</strong>，下方面板会显示它的职责、关键接口、主要风险，以及对应的章节和跟练项目。</p>
+
+<div class="widget arch">
+<div class="w-title">可点击的参考架构图</div>
+<div class="diagram" style="box-shadow:none">
+<svg viewBox="0 0 760 400" width="760" role="img" aria-label="参考架构图，可点击组件查看说明">
+  <rect class="box m" x="196" y="20" width="368" height="362" rx="14"/>
+  <text class="ta" x="380" y="44" text-anchor="middle">确定性内核（纯逻辑 + 接口调用）</text>
+
+  <g data-comp="channel"><rect class="box g" x="20" y="64" width="150" height="70" rx="10"/><text class="tb" x="95" y="94" text-anchor="middle">通道连接器</text><text class="ts" x="95" y="114" text-anchor="middle">收消息 · 发回复</text></g>
+  <g data-comp="model"><rect class="box a" x="590" y="64" width="150" height="70" rx="10"/><text class="tb" x="665" y="94" text-anchor="middle">模型层</text><text class="ts" x="665" y="114" text-anchor="middle">结构化输出唯一入口</text></g>
+  <g data-comp="control"><rect class="box w" x="20" y="234" width="150" height="70" rx="10"/><text class="tb" x="95" y="264" text-anchor="middle">审批入口</text><text class="ts" x="95" y="284" text-anchor="middle">卡片 · CLI · Web</text></g>
+  <g data-comp="executor"><rect class="box b" x="590" y="234" width="150" height="70" rx="10"/><text class="tb" x="665" y="264" text-anchor="middle">执行方插件</text><text class="ts" x="665" y="284" text-anchor="middle">外部 agent · 工作流</text></g>
+
+  <g data-comp="ingest"><rect class="box" x="210" y="78" width="76" height="44" rx="8"/><text class="t" x="248" y="97" text-anchor="middle">ingest</text><text class="ts" x="248" y="113" text-anchor="middle">去重落库</text></g>
+  <g data-comp="batcher"><rect class="box" x="298" y="78" width="76" height="44" rx="8"/><text class="t" x="336" y="97" text-anchor="middle">batcher</text><text class="ts" x="336" y="113" text-anchor="middle">去抖成批</text></g>
+  <g data-comp="triage"><rect class="box a" x="386" y="78" width="76" height="44" rx="8"/><text class="t" x="424" y="97" text-anchor="middle">triage</text><text class="ts" x="424" y="113" text-anchor="middle">分诊</text></g>
+  <g data-comp="analyzer"><rect class="box a" x="474" y="78" width="76" height="44" rx="8"/><text class="t" x="512" y="97" text-anchor="middle">analyzer</text><text class="ts" x="512" y="113" text-anchor="middle">结构化分析</text></g>
+
+  <g data-comp="proposals"><rect class="box" x="210" y="160" width="76" height="44" rx="8"/><text class="t" x="248" y="179" text-anchor="middle">proposals</text><text class="ts" x="248" y="195" text-anchor="middle">生成提案</text></g>
+  <g data-comp="policy"><rect class="box r" x="298" y="160" width="76" height="44" rx="8"/><text class="t" x="336" y="179" text-anchor="middle">policy</text><text class="ts" x="336" y="195" text-anchor="middle">策略护栏</text></g>
+  <g data-comp="actions"><rect class="box" x="386" y="160" width="76" height="44" rx="8"/><text class="t" x="424" y="179" text-anchor="middle">actions</text><text class="ts" x="424" y="195" text-anchor="middle">执行动作</text></g>
+  <g data-comp="feedback"><rect class="box v" x="474" y="160" width="76" height="44" rx="8"/><text class="t" x="512" y="179" text-anchor="middle">feedback</text><text class="ts" x="512" y="195" text-anchor="middle">反馈学习</text></g>
+
+  <g data-comp="sidecar"><rect class="box w" x="210" y="244" width="164" height="50" rx="8"/><text class="t" x="292" y="265" text-anchor="middle">旁路任务</text><text class="ts" x="292" y="283" text-anchor="middle">简报 · 派发追踪 · 记忆整理</text></g>
+  <g data-comp="memory"><rect class="box v" x="386" y="244" width="164" height="50" rx="8"/><text class="t" x="468" y="265" text-anchor="middle">记忆与知识</text><text class="ts" x="468" y="283" text-anchor="middle">档案 · 记忆条目 · 知识库</text></g>
+  <g data-comp="store"><rect class="box m" x="210" y="316" width="340" height="50" rx="8"/><text class="t" x="380" y="337" text-anchor="middle">存储：单机 SQLite（WAL）</text><text class="ts" x="380" y="355" text-anchor="middle">消息 · 分析 · 提案 · 动作 · 记忆 · 调用记录</text></g>
+
+  <path class="line g" d="M170 100 H208" marker-end="url(#arr-g)"/>
+  <path class="line" d="M286 100 H296" marker-end="url(#arr)"/>
+  <path class="line" d="M374 100 H384" marker-end="url(#arr)"/>
+  <path class="line" d="M462 100 H472" marker-end="url(#arr)"/>
+  <path class="line a" d="M550 100 H588" marker-end="url(#arr-a)" marker-start="url(#arr-a)"/>
+  <path class="line" d="M512 122 V141 H248 V158" marker-end="url(#arr)"/>
+  <path class="line" d="M286 182 H296" marker-end="url(#arr)"/>
+  <path class="line" d="M374 182 H384" marker-end="url(#arr)"/>
+  <path class="line" d="M462 182 H472" marker-end="url(#arr)"/>
+  <path class="line b dash" d="M336 204 V222 H95 V232" marker-end="url(#arr-b)"/>
+  <path class="line b" d="M424 204 V222 H665 V232" marker-end="url(#arr-b)"/></svg>
+</div>
+<div class="arch-panel w-out" data-panel></div>
+</div>
+
+<p>这张图里有两个容易被忽略、但决定成败的设计：</p>
+<ul>
+  <li><strong>模型只出现在少数节点</strong>：分诊、分析，以及旁路里的记忆整理和简报生成。这些节点全部是"输入 → 结构化输出"，可以单独测试、单独评测。ingest、batcher、proposals、policy、actions 全是普通代码——这是第 1 章"workflow 优先"原则在系统层面的体现，也是 12-Factor Agents 里"掌控你的控制流"（Own your control flow）的含义。</li>
+  <li><strong>没有"直接发送"的代码路径</strong>：一切对外动作都先成为提案，经过 policy 才能到达 actions。即使是"自动回复"，也只是"提案被策略自动批准"，同样留下记录、同样受护栏约束、同样可以撤回。</li>
+</ul>
+
+<h2>2 · 一条消息的旅程</h2>
+<p>同事在群里 @你："月报导出能加个按部门筛选吗？周五前要。"看这条消息怎样穿过整条管线：</p>
+
+<figure class="anim" data-dim>
+<div class="diagram">
+<svg viewBox="0 0 770 300" width="770" role="img" aria-label="一条消息穿过管线的分步动画">
+  <g data-k="s1"><rect class="box g" x="20" y="50" width="128" height="44" rx="8"/><text class="t" x="84" y="77" text-anchor="middle">通道连接器</text></g>
+  <g data-k="s2"><rect class="box" x="168" y="50" width="128" height="44" rx="8"/><text class="t" x="232" y="77" text-anchor="middle">ingest</text></g>
+  <g data-k="s3"><rect class="box" x="316" y="50" width="128" height="44" rx="8"/><text class="t" x="380" y="77" text-anchor="middle">batcher</text></g>
+  <g data-k="s4"><rect class="box a" x="464" y="50" width="128" height="44" rx="8"/><text class="t" x="528" y="77" text-anchor="middle">triage</text></g>
+  <g data-k="s5"><rect class="box a" x="612" y="50" width="128" height="44" rx="8"/><text class="t" x="676" y="77" text-anchor="middle">analyzer</text></g>
+  <g data-k="s6"><rect class="box" x="612" y="200" width="128" height="44" rx="8"/><text class="t" x="676" y="227" text-anchor="middle">proposals</text></g>
+  <g data-k="s7"><rect class="box r" x="464" y="200" width="128" height="44" rx="8"/><text class="t" x="528" y="227" text-anchor="middle">policy</text></g>
+  <g data-k="s8"><rect class="box w" x="316" y="200" width="128" height="44" rx="8"/><text class="t" x="380" y="227" text-anchor="middle">用户审批</text></g>
+  <g data-k="s9"><rect class="box" x="168" y="200" width="128" height="44" rx="8"/><text class="t" x="232" y="227" text-anchor="middle">actions</text></g>
+  <g data-k="s10"><rect class="box v" x="20" y="200" width="128" height="44" rx="8"/><text class="t" x="84" y="227" text-anchor="middle">feedback</text></g>
+  <path class="line" d="M148 72 H166" marker-end="url(#arr)"/><path class="line" d="M296 72 H314" marker-end="url(#arr)"/><path class="line" d="M444 72 H462" marker-end="url(#arr)"/><path class="line" d="M592 72 H610" marker-end="url(#arr)"/>
+  <path class="line" d="M740 72 H756 V222 H742" marker-end="url(#arr)"/>
+  <path class="line" d="M612 222 H594" marker-end="url(#arr)"/><path class="line" d="M464 222 H446" marker-end="url(#arr)"/><path class="line" d="M316 222 H298" marker-end="url(#arr)"/><path class="line" d="M168 222 H150" marker-end="url(#arr)"/>
+  <g data-k="a1"><text class="ts" x="84" y="114" text-anchor="middle">归一化为统一结构</text><text class="ts" x="84" y="130" text-anchor="middle">InboundMessage</text></g>
+  <g data-k="a2"><text class="ts" x="232" y="114" text-anchor="middle">按 msg_id 去重</text><text class="ts" x="232" y="130" text-anchor="middle">落库、更新会话</text></g>
+  <g data-k="a3"><text class="ts" x="380" y="114" text-anchor="middle">安静 N 秒才成批</text><text class="ts" x="380" y="130" text-anchor="middle">连发三条合成一批</text></g>
+  <g data-k="a4"><text class="ts" x="528" y="114" text-anchor="middle">@我 + 提需求</text><text class="ts" x="528" y="130" text-anchor="middle">→ 值得深度分析</text></g>
+  <g data-k="a5"><text class="ts" x="676" y="114" text-anchor="middle">摘要 · 需求 · 追问</text><text class="ts" x="676" y="130" text-anchor="middle">回复草稿（JSON）</text></g>
+  <g data-k="a6"><text class="ts" x="676" y="264" text-anchor="middle">有未澄清的问题</text><text class="ts" x="676" y="280" text-anchor="middle">→ 追问提案</text></g>
+  <g data-k="a7"><text class="ts" x="528" y="264" text-anchor="middle">会话为"建议"模式</text><text class="ts" x="528" y="280" text-anchor="middle">→ 待审批</text></g>
+  <g data-k="a8"><text class="ts" x="380" y="264" text-anchor="middle">用户改了一句</text><text class="ts" x="380" y="280" text-anchor="middle">点"发送"</text></g>
+  <g data-k="a9"><text class="ts" x="232" y="264" text-anchor="middle">带幂等键发送</text><text class="ts" x="232" y="280" text-anchor="middle">记下 message_id</text></g>
+  <g data-k="a10"><text class="ts" x="84" y="264" text-anchor="middle">改前 / 改后</text><text class="ts" x="84" y="280" text-anchor="middle">→ 风格样本</text></g>
+</svg>
+</div>
+<ol class="anim-steps">
+  <li data-show="a1" data-hl="s1 a1"><strong>通道连接器</strong>收到平台事件，归一化成统一的 <code>InboundMessage</code>（来源、消息 ID、会话、发送者、正文、附件、是否 @我）。内核从此不再关心消息来自哪个平台。这也是不可信内容进入系统的入口（第 9 章）。</li>
+  <li data-show="a2" data-hl="s2 a2"><strong>ingest</strong> 按（通道，消息 ID）去重——长连接重连后平台常会重放消息；落库，更新会话的最后活跃时间；过滤系统消息。用户自己发的消息只用于记忆提取，不进分析。</li>
+  <li data-show="a3" data-hl="s3 a3"><strong>batcher</strong> 按会话去抖：同事常把一件事拆成三条发。等会话安静 N 秒、或累计 M 条才成批，一批只分析一次，省钱也更准。</li>
+  <li data-show="a4" data-hl="s4 a4"><strong>triage</strong> 分诊：用便宜的模型或规则判断这一批值不值得深度分析。大量通知、闲聊在这里被挡掉。这是第 1 章"路由"模式的成本用法（第 14 章）。</li>
+  <li data-show="a5" data-hl="s5 a5"><strong>analyzer</strong> 组装上下文——用户档案、最近若干条历史、会话摘要、相关人物档案与知识、未关闭的需求——调用模型，得到通过 schema 校验的结构化分析：摘要、是否需要回复、提炼出的需求、未澄清问题（"默认导出全部部门，还是本人所在部门？"）、回复草稿（第 3、5、6、7 章）。</li>
+  <li data-show="a6" data-hl="s6 a6"><strong>proposals</strong> 由分析生成提案。因为需求还有未澄清问题，生成的是"向需求方追问"的提案，而<strong>不是</strong>"派发给执行方"——先问再派。</li>
+  <li data-show="a7" data-hl="s7 a7"><strong>policy</strong> 按会话模式和信任矩阵决定：这个会话处于"建议"模式，提案进入待审批。若处于"自动"模式，还要逐条过护栏：白名单、置信度、频率上限、静默时段、敏感词（第 8、9 章）。</li>
+  <li data-show="a8" data-hl="s8 a8"><strong>审批入口</strong>把提案推成一张卡片：原消息摘录、草稿、依据。用户把"周五前"改成"周四前给你确认"，点发送。只认用户本人的操作。</li>
+  <li data-show="a9" data-hl="s9 a9"><strong>actions</strong> 执行：以"提案 ID + 正文"生成幂等键，经通道发出，记下平台返回的 message_id。网络失败最多重试 2 次，仍失败就回到待审批并标红原因——再批准一次也不会发重（第 10 章）。</li>
+  <li data-show="a10" data-hl="s10 a10"><strong>feedback</strong>：用户改过草稿，"改前 / 改后"成为风格样本，下次起草时作为示例；积累到一定数量，后台反思任务会提出修改用户档案的提案——同样要用户批准才写入（第 6、13 章）。</li>
+</ol>
+<figcaption>图 15-1 一条入站消息穿过内核管线。每一段都可以单独测试、单独替换。</figcaption>
+</figure>
+
+<h2>3 · 内核管线逐段拆解</h2>
+<table>
+<tr><th>阶段</th><th>输入 → 输出</th><th>用模型？</th><th>关键设计</th><th>章节</th></tr>
+<tr><td>ingest</td><td>InboundMessage → 入库的消息</td><td>否</td><td>按（通道，消息 ID）去重；过滤；自己发的只做记忆</td><td><a href="ch10-durable-execution.html">10</a></td></tr>
+<tr><td>batcher</td><td>消息流 → 批次</td><td>否</td><td>按会话去抖：安静 N 秒或累计 M 条</td><td><a href="ch05-context-engineering.html">5</a></td></tr>
+<tr><td>triage</td><td>批次 → 是否深度分析</td><td>小模型 / 规则</td><td>挡掉通知与闲聊；漏判要可回捞</td><td><a href="ch14-observability.html">14</a></td></tr>
+<tr><td>analyzer</td><td>批次 + 上下文 → Analysis（JSON）</td><td>是</td><td>schema 全必填、strict；上下文按预算组装；稳定内容在前</td><td><a href="ch03-structured-tools.html">3</a>、<a href="ch05-context-engineering.html">5</a></td></tr>
+<tr><td>requirements</td><td>Analysis → 需求记录的增删改</td><td>否</td><td>跨消息、跨会话聚合同一需求，维护生命周期</td><td><a href="ch10-durable-execution.html">10</a></td></tr>
+<tr><td>proposals</td><td>Analysis + 需求状态 → 提案</td><td>否</td><td>有未澄清问题只生成追问，不生成派发</td><td><a href="ch08-hitl-autonomy.html">8</a></td></tr>
+<tr><td>policy</td><td>提案 → 待审批 / 自动批准 / 丢弃</td><td>否</td><td>模式是总闸；信任矩阵按"动作 × 对象"；护栏逐条记录</td><td><a href="ch08-hitl-autonomy.html">8</a>、<a href="ch09-security.html">9</a></td></tr>
+<tr><td>control</td><td>待审批提案 ↔ 用户决定</td><td>否</td><td>批准 / 改写 / 拒绝 + 原因；只认本人</td><td><a href="ch08-hitl-autonomy.html">8</a></td></tr>
+<tr><td>actions</td><td>已批准提案 → 外部动作 + 结果</td><td>否</td><td>幂等键、有限重试、失败回待审批、启动时不自动重发</td><td><a href="ch10-durable-execution.html">10</a></td></tr>
+<tr><td>feedback</td><td>用户决定 → 样本、反思提案、信任升降级、评测用例</td><td>反思时用</td><td>改写是最好的样本；撤回立即降级</td><td><a href="ch06-memory.html">6</a>、<a href="ch13-evals.html">13</a></td></tr>
+</table>
+
+<h3>旁路任务</h3>
+<p>不是每件事都由入站消息触发。几类定时或后台任务和主管线并行：</p>
+<ul>
+  <li><strong>定时简报</strong>：按时段汇总所有分析，生成一张"哪些要回、哪些可派、哪些只是通知"的简报。</li>
+  <li><strong>派发追踪</strong>：定期回查交给执行方的任务状态；长时间没变化或一直查不到，标为"未知"并请人确认，而不是假设它还在跑。</li>
+  <li><strong>记忆整理</strong>：从新消息里提取记忆条目、更新会话摘要、综合人物档案；定期反思用户反馈，产出待审批的档案修改提案。</li>
+  <li><strong>知识编译</strong>：把消息里稳定的、可共享的知识编译成知识库页面，只存策展结论和来源引用，不存原文。</li>
+</ul>
+<p>旁路任务有自己的预算和超时，和主管线共享同一个串行队列或锁，避免两个流程同时改同一条记录。</p>
+
+<h2>4 · 存储与进程模型</h2>
+<p>单用户、本机运行的 agent，最合适的存储往往就是<strong>一个 SQLite 文件</strong>，开启 WAL（预写日志）模式：</p>
+<ul>
+  <li>一个写、多个读可以并发：守护进程在写，CLI 命令（查看待办、批准提案）作为独立进程直接读写同一个库，不需要 IPC。</li>
+  <li>CLI 写入的决定（比如"批准提案 42"），守护进程下一拍拾取执行。<strong>数据库就是进程间的消息总线</strong>，状态机就是协议。</li>
+  <li>迁移脚本随代码发布、按编号执行；破坏性迁移前自动备份（第 14 章）。</li>
+  <li>消息原文只存在本机库里；知识库只收结论和引用。</li>
+</ul>
+<p>这和 12-Factor Agents 的两条原则一致：<strong>统一执行状态和业务状态</strong>（Unify execution state and business state）——提案的状态既是业务数据也是执行进度，不需要另一个工作流引擎；以及<strong>用简单的 API 启动、暂停、恢复</strong>——崩溃后重启，从库里读出未完成的提案继续即可。</p>
+
+<div class="callout deep"><b>什么时候需要更重的方案？</b>
+<p>多用户、多实例、长达数天的等待，才值得引入持久执行引擎（如 Temporal、Inngest 这类"等待事件"的工作流）或独立的托管 agent 平台。Anthropic 2026-04 的《Scaling Managed Agents》描述了一种把"大脑"（无状态的 harness）、"手"（沙箱）和"会话"（耐久事件日志）彻底分开的托管架构，凭据不进沙箱。原则相同——状态持久化、执行可恢复、权限隔离——只是规模不同。从单机 SQLite 开始，在真的遇到瓶颈时再升级。</p></div>
+
+<h2>5 · 插件与外部 agent 的接口</h2>
+<p>内核不应该知道"活最后是谁干的"。把执行方抽象成插件，内核只通过一个窄接口触发和回读：</p>
+
+<pre data-title="plugins/types.ts"><code class="lang-ts">
+export interface TaskSpec {
+  title: string;
+  goal: string;
+  scope: string[];
+  acceptance: string[];          // 验收点：交付时逐条对照
+  openQuestions: string[];       // 非空时不允许派发（先问再派）
+  references: { messageId: string; link: string | null }[];
+}
+
+export type DispatchState = 'queued' | 'running' | 'waiting_input' | 'done' | 'failed' | 'cancelled' | 'unknown';
+
+export interface DispatchStatus {
+  state: DispatchState;
+  summary: string | null;
+  artifacts: { kind: 'link' | 'file'; url: string }[];   // 交付物：链接、PR、文档
+  question: string | null;      // 执行方在等答复时的问题
+  checkedAt: string;
+}
+
+export interface Executor {
+  id: string;
+  canHandle(spec: TaskSpec): boolean;
+  dispatch(spec: TaskSpec, ctx: { idempotencyKey: string }): Promise&lt;{ handle: string }&gt;;
+  status(handle: string): Promise&lt;DispatchStatus&gt;;   // 回读真实状态，不信"我做完了"的自述
+  cancel(handle: string): Promise&lt;void&gt;;
+}
+</code></pre>
+
+<p>几个要点：</p>
+<ul>
+  <li><strong>状态回读，而不是信自述</strong>：执行方说"完成了"，要以可验证的事实为准——PR 是否存在、CI 是否通过、文档链接能否打开。长任务里 agent 过早宣布完成是常见失败（第 12 章）。</li>
+  <li><strong>交付前对照验收点</strong>：TaskSpec 的 acceptance 在派发时写好，交付时逐条对照，没对上的标出来让人决定。</li>
+  <li><strong>插件可以是任何东西</strong>：发一条消息到某个群、建一个 issue、调用本机的编码 agent、发 webhook 到工作流、按 A2A 协议交给另一个 agent。协议层的选择见第 11 章。</li>
+  <li><strong>接口只引用、不复制</strong>：插件只依赖接口定义文件，不依赖内核实现；接口变了，插件仓库同步接口文件即可。</li>
+</ul>
+
+<div class="quiz" data-answer="2">
+<p class="q">执行方插件回报"任务已完成"，但附带的 PR 链接打开是 404。系统应该？</p>
+<ol>
+  <li>相信执行方，通知需求方"已完成"</li>
+  <li>以可验证的事实为准：状态标为待确认，提醒用户核实，不自动通知需求方</li>
+  <li>自动重新派发一次</li>
+  <li>直接把任务标为失败并关闭</li>
+</ol>
+<div class="explain">"状态回读而不信自述"：交付物验证不通过时，既不能当完成（会对需求方说错话），也不该擅自重派或关闭（可能只是链接权限问题）。交给人判断，这正是人在回路该介入的地方。</div>
+</div>
+
+<h2>6 · 设计原则</h2>
+<table>
+<tr><th>原则</th><th>含义</th><th>防的是什么</th></tr>
+<tr><td>一切对外动作皆提案</td><td>没有"直接发"的代码路径；自动只是"提案被策略自动批准"</td><td>绕过审批与护栏的后门；无记录的动作</td></tr>
+<tr><td>默认需要审批</td><td>新会话、新动作默认 L4（审批者），放权只经用户确认</td><td>过早自动化；ASI09 那种"审批人被说服"之外的整体风险</td></tr>
+<tr><td>模型只在少数节点</td><td>其余是确定性代码和状态机</td><td>不可测、不可预测的控制流</td></tr>
+<tr><td>结构化输出唯一入口</td><td>所有模型调用经同一个函数：schema 校验、重试、记录、预算、回退</td><td>到处散落的模型调用，各自处理错误</td></tr>
+<tr><td>先问再派</td><td>需求有未澄清问题时只生成追问</td><td>执行方按猜测干活，返工</td></tr>
+<tr><td>原文留本地</td><td>原始消息只在本机；共享的知识只收结论与引用</td><td>隐私外泄；知识库成为数据副本</td></tr>
+<tr><td>记忆透明可改</td><td>档案和记忆条目是人能读、能改、能删的文字，带来源；人写的优先于自动生成的</td><td>记忆投毒；用户不信任看不见的记忆</td></tr>
+<tr><td>最小自主权</td><td>每个动作按风险设自主度；读不可信内容的会话不同时拥有对外发送能力（Rule of Two）</td><td>提示注入导致的数据外泄</td></tr>
+<tr><td>接口只引用不复制</td><td>文档、接口定义、配置各只有一处来源</td><td>多处副本不一致</td></tr>
+</table>
+
+<h2>7 · 架构决策记录（ADR）</h2>
+<p>agent 系统里有大量"看起来可以这样也可以那样"的决定：用不用框架、结构化输出走 JSON 模式还是工具调用、记忆存文件还是数据库、执行方内置还是插件。这些决定的<strong>理由</strong>往往比决定本身更重要——半年后模型变了、需求变了，你需要知道当初为什么这么选，才能判断现在该不该改。</p>
+<p>ADR（Architecture Decision Record）就是为此而生的：每个重要决定写一份短文档，编号、不删除，被推翻时写一份新的并标明"取代了第几号"。最常见的格式源自 Michael Nygard 的博文，包含背景、决定、后果三块。下面是一个适合 agent 项目的模板：</p>
+
+<pre data-title="docs/adr/NNNN-标题.md"><code>
+# ADR-0007：结构化输出统一经单一工具调用实现
+
+- 状态：已采纳（2026-03-02）
+- 取代：无　　被取代：无
+
+## 背景
+分析、分诊、记忆提取都需要模型返回 JSON。我们同时使用两家提供商和
+一个兼容端点，三者的 JSON 模式参数、支持的 schema 子集各不相同。
+
+## 决定
+所有结构化输出都经同一个函数 completeStructured()：
+构造唯一工具 emit_result（strict），要求模型只能通过调用它提交结果；
+参数用同一份 schema 校验，失败时把校验错误回灌给模型重试，最多 2 次。
+schema 统一为：字段全部必填、additionalProperties: false，
+可选语义用 "类型 | null" 表达。
+
+## 考虑过的方案
+1. 各提供商原生的 JSON 模式：参数与限制各不相同，要维护三套分支。
+2. 只在提示词里要求输出 JSON 再解析：无法保证格式，失败率高。
+
+## 后果
++ 三个端点行为一致，换提供商不改业务代码。
++ 校验、重试、记录、预算集中在一处。
+- schema 必须遵守最严格提供商的子集，不能用 oneOf、递归等。
+- 每次调用多一个工具定义的 token。
+
+## 验证
+用假模型覆盖：首次成功、未调用工具、参数不合法后修正、重试耗尽。
+</code></pre>
+
+<div class="callout tip"><b>ADR 的几个好习惯</b>
+<p>写"考虑过的方案"和"后果"里的负面项——没有代价的决定通常是你还没想清楚。每份 ADR 控制在一屏。在代码里引用 ADR 编号（"见 ADR-0007"），比在注释里重复解释理由更好维护。实现要偏离文档时，先改文档再改代码。</p></div>
+
+<h2>8 · 设计评审清单</h2>
+<p>拿到一个 agent 设计（自己的或别人的），逐项过一遍。勾选状态保存在你的浏览器里，可以反复用。</p>
+
+<h3>安全</h3>
+<ul class="checklist" data-key="sec">
+  <li>列出了所有不可信输入的来源（消息、邮件、网页、文档、工具返回、其他 agent）</li>
+  <li>任何一个会话里，"不可信输入 / 敏感数据 / 对外动作"三者最多同时具备两项，否则有人工审批（Rule of Two）</li>
+  <li>对外动作全部经过审批或明确的自动化护栏，没有直接发送的代码路径</li>
+  <li>每个工具按最小权限设计；凭证不进模型上下文、不进沙箱</li>
+  <li>审批卡片展示了足够的依据（原文摘录、目标对象、将执行的确切内容），而不只是一段模型写的理由</li>
+  <li>记忆写入有来源、可撤销，外部内容不能直接改写用户档案</li>
+</ul>
+
+<h3>可靠</h3>
+<ul class="checklist" data-key="rel">
+  <li>每个对外动作有幂等键，重试与重启不会重复执行</li>
+  <li>有状态机图：每个状态的进入条件、退出条件、崩溃后如何恢复</li>
+  <li>进程崩溃后，"执行中"的动作不会被自动重发，而是交给人决定</li>
+  <li>每次模型调用有超时、重试上限；回退只针对认证 / 限流 / 网络类错误</li>
+  <li>外部长连接断线能退避重连，凭证失效能通知用户</li>
+</ul>
+
+<h3>成本</h3>
+<ul class="checklist" data-key="cost">
+  <li>估算过每日调用量与 token，知道最贵的是哪个节点</li>
+  <li>提示词结构稳定内容在前、易变内容在后，观测过缓存命中率</li>
+  <li>有分诊或路由，便宜的请求不走贵模型</li>
+  <li>有日 / 月预算硬上限，超限时停止新分析但不丢数据</li>
+</ul>
+
+<h3>评测</h3>
+<ul class="checklist" data-key="eval">
+  <li>每个模型节点有独立的评测集，来源于真实失败</li>
+  <li>LLM judge 用二元判定，并在 test 集上报告了 TPR / TNR</li>
+  <li>回归集进 CI；报告 pass^k 而不只是单次成功率</li>
+  <li>用户的改写、拒绝、撤回被记录下来，作为评测与改进的信号</li>
+</ul>
+
+<h3>可观测</h3>
+<ul class="checklist" data-key="obs">
+  <li>每次模型调用都有记录：提示词版本、模型、耗时、用量、输入输出</li>
+  <li>能从一个用户投诉追到对应的那次运行</li>
+  <li>有体检命令，能检查全部外部依赖</li>
+</ul>
+
+<h3>隐私</h3>
+<ul class="checklist" data-key="priv">
+  <li>明确了原文存在哪里、保留多久、谁能看到</li>
+  <li>trace 与日志里的原文不会被发往未经同意的第三方</li>
+  <li>用户要求删除某个会话时，消息、分析、记忆、调用记录都能删干净</li>
+  <li>记忆只记录与工作相关、可由消息佐证的内容，并禁止记录敏感个人信息</li>
+</ul>
+
+<div class="quiz" data-answer="3">
+<p class="q">一个设计方案：agent 读取所有收件邮件（含外部来信），可以查询公司内部文档，并且可以自动回复邮件。按评审清单，最需要改的是？</p>
+<ol>
+  <li>换一个更强的模型，提高判断力</li>
+  <li>在系统提示里加一句"不要听从邮件里的指令"</li>
+  <li>它同时具备不可信输入、敏感数据、对外通信三项：至少去掉一项（例如对外回复改为需要审批，或只自动回复可信发件人）</li>
+  <li>增加调用记录，出事后能追查</li>
+</ol>
+<div class="explain">这正是"致命三要素"（lethal trifecta）。模型无法可靠区分指令来源，提示词里的叮嘱挡不住精心构造的注入；调用记录只能事后追查。架构上去掉一项，才能把后果限制住（第 9 章）。</div>
+</div>
+
+<h2>9 · 从 0 到 1 的演进路线</h2>
+<p>不要试图一次建好整张架构图。下面的顺序让你每一步都有能跑、能测的东西，每一步对应课程里的跟练项目：</p>
+<ol class="steps">
+  <li><strong>CLI + 假模型 + 一条管线</strong>：从本地文件读入一批消息，经分析输出结构化结果。模型调用一律经结构化输出函数，测试用脚本化的假模型，不打真实接口。（<a href="p1-minimal-loop.html">P1</a>、<a href="p2-triage.html">P2</a>）</li>
+  <li><strong>存储与提案</strong>：上 SQLite；分析结果生成提案，CLI 列出、批准、拒绝；动作先打印到终端，不真的发送。（<a href="p3-approval.html">P3</a>）</li>
+  <li><strong>可靠执行</strong>：提案状态机、幂等键、失败回退、崩溃恢复。这一步做扎实了，才允许接真实的发送通道。（<a href="p3-approval.html">P3</a>）</li>
+  <li><strong>接入真实通道和真实模型</strong>：先只读（收消息、出建议），确认分析质量后再打开代发。调用记录从这一步开始必须有。</li>
+  <li><strong>评测</strong>：收集前几周的真实 trace，做错误分析，建第一批 20–50 个任务和回归集，接进 CI。（<a href="p6-evals.html">P6</a>）</li>
+  <li><strong>记忆</strong>：用户档案、人物档案、记忆条目，带来源、可撤销；用户反馈进入样本与反思。（<a href="p4-memory.html">P4</a>）</li>
+  <li><strong>工具与协议</strong>：把日历、文档等外部能力以 MCP 接入，供分析和对话助手按需调用。（<a href="p5-mcp.html">P5</a>）</li>
+  <li><strong>执行方插件</strong>：把成熟的需求派发给外部 agent，回读状态、对照验收点。（<a href="p7-coding-harness.html">P7</a>）</li>
+  <li><strong>逐步放权</strong>：按采纳记录给出放权建议，用户确认后才把某类动作升到自动；撤回立即降级。</li>
+  <li><strong>运维化</strong>：服务管理器托管、体检命令、预算、日志轮转、备份迁移、单文件发布。（<a href="capstone.html">毕业项目</a>）</li>
+</ol>
+
+<div class="callout note"><b>为什么"可靠执行"排在"接真实通道"之前</b>
+<p>一旦代发接上真实通道，任何重复发送、错发都是对外可见的事故，而且无法撤回干净。在假通道上把状态机、幂等、崩溃恢复测透，代价最低。</p></div>
+
+<div class="callout case review-link"><b>真实项目复盘</b>
+<p>本章的知识点在两个真实项目里缺位时发生了什么，以及"有这块知识"时会怎么设计：</p>
+<ul><li><a href="review.html#f-N1">N1</a> · niuma 功能扩张跑在验证前面</li><li><a href="review.html#f-D2">D2</a> · devtask 的文档写"7 个工具"，实际有 20 个</li></ul></div>
+
+<div class="takeaways"><b>本章要点</b>
+<ul>
+  <li>参考架构 = 四个可替换接口层（通道、模型、审批入口、执行方）+ 确定性内核管线 + 旁路任务 + 单机存储。</li>
+  <li>模型只在分诊、分析、记忆整理等少数节点出现，且都是结构化输出；控制流在代码里。</li>
+  <li>一切对外动作皆提案，没有直接发送的代码路径；默认需要审批，放权按动作逐格进行。</li>
+  <li>执行方是插件：派发、回读状态、取消；以可验证的事实而不是自述判断完成。</li>
+  <li>用 ADR 记录重要决定的理由与代价，用评审清单系统地审查安全、可靠、成本、评测、可观测与隐私。</li>
+  <li>演进顺序：假模型管线 → 存储与提案 → 可靠执行 → 真实通道 → 评测 → 记忆 → 工具 → 插件 → 放权 → 运维化。</li>
+</ul></div>
+
+<h2>参考资料</h2>
+<ul class="refs">
+  <li><a href="https://www.anthropic.com/engineering/building-effective-agents" target="_blank" rel="noopener">Building effective agents</a> <span class="src">Anthropic · 2024-12-19 · workflow 优先、简单可组合</span></li>
+  <li><a href="https://github.com/humanlayer/12-factor-agents" target="_blank" rel="noopener">12-Factor Agents</a> <span class="src">HumanLayer · 掌控控制流、统一执行状态与业务状态</span></li>
+  <li><a href="https://ai.meta.com/blog/practical-ai-agent-security/" target="_blank" rel="noopener">Agents Rule of Two</a> <span class="src">Meta · 2025-10-31 · 三项能力最多同时具备两项</span></li>
+  <li><a href="https://genai.owasp.org/2025/12/09/owasp-top-10-for-agentic-applications-the-benchmark-for-agentic-security-in-the-age-of-autonomous-ai/" target="_blank" rel="noopener">OWASP Top 10 for Agentic Applications</a> <span class="src">OWASP · 2025-12-09 · 设计评审的风险清单</span></li>
+  <li><a href="https://www.anthropic.com/engineering/effective-harnesses-for-long-running-agents" target="_blank" rel="noopener">Effective harnesses for long-running agents</a> <span class="src">Anthropic · 2025-11-26 · 状态外置与可验证的完成</span></li>
+  <li><a href="https://simonwillison.net/2025/Jun/16/the-lethal-trifecta/" target="_blank" rel="noopener">The lethal trifecta for AI agents</a> <span class="src">Simon Willison · 2025-06-16</span></li>
+</ul>
+</article>
+
+<script>
+window.addEventListener('DOMContentLoaded', () => {
+  const C = {
+    channel: {
+      t: '通道连接器（Channel）',
+      d: '把外部平台（邮件、即时消息、日历、工单系统）的事件归一化成统一的入站消息；把已批准的动作发出去；报告自己支持哪些能力（引用回复、撤回、编辑、表情），内核据此降级。内核不 import 任何具体平台的代码。',
+      i: `interface Channel {
+  id: string;
+  capabilities: { quote: boolean; recall: boolean; edit: boolean };
+  start(onMessage: (m: InboundMessage) => void): Promise<void>;
+  send(to: Target, body: Outbound, key: string): Promise<{ messageId: string }>;
+  stop(): Promise<void>;
+}`,
+      r: ['不可信内容的入口：提示注入从这里进来', '断线重连后的消息重放导致重复处理', '以用户本人身份和以机器人身份的操作混用，权限边界不清'],
+      ch: [['ch09-security.html', '第 9 章 安全'], ['ch10-durable-execution.html', '第 10 章 可靠执行'], ['ch11-protocols.html', '第 11 章 协议']],
+      p: [['p3-approval.html', 'P3']],
+    },
+    model: {
+      t: '模型层（LLM）',
+      d: '统一多个提供商与凭证（订阅登录与自带密钥并存）；所有结构化输出经唯一入口：schema 校验、错误回灌重试、调用记录、预算检查、回退链都在这里。业务代码不直接拼提供商 SDK。',
+      i: `function completeStructured<T extends TSchema>(
+  model: Model,
+  req: { schema: T; system: string; user: string },
+  opts?: { reasoning?: Level; signal?: AbortSignal; maxAttempts?: number },
+): Promise<{ value: Static<T>; usage: Usage; attempts: number }>;`,
+      r: ['成本失控：循环卡住、批量任务', 'schema 与提供商 strict 子集不兼容', '回退掩盖了提示词的问题（schema 错误不应回退）'],
+      ch: [['ch02-llm-fundamentals.html', '第 2 章'], ['ch03-structured-tools.html', '第 3 章'], ['ch14-observability.html', '第 14 章']],
+      p: [['p2-triage.html', 'P2']],
+    },
+    control: {
+      t: '审批入口（ControlSurface）',
+      d: '把待审批的提案展示给用户（消息卡片、命令行、网页控制台），收集"批准 / 改写 / 拒绝"及可选的原因，回流给内核。只认用户本人的操作；网页控制台只监听本机或带访问令牌，写操作做同源检查。',
+      i: `interface ControlSurface {
+  present(p: Proposal, view: CardView): Promise<void>;
+  update(p: Proposal): Promise<void>;          // 状态变化时改原卡，不刷新卡
+  onDecision(cb: (d: Decision) => void): void;  // { proposalId, action, text?, reason?, actor }
+}`,
+      r: ['走过场的审批：用户习惯性点"批准"（OWASP ASI09）', '卡片信息不足，用户无法判断', '决定被他人伪造或误触'],
+      ch: [['ch08-hitl-autonomy.html', '第 8 章'], ['ch09-security.html', '第 9 章']],
+      p: [['p3-approval.html', 'P3']],
+    },
+    executor: {
+      t: '执行方插件（Executor）',
+      d: '接收任务规格并交给真正干活的一方：发到某个群、建 issue、调用本机编码 agent、发 webhook、按 A2A 交给另一个 agent。内核只通过派发 / 回读状态 / 取消三个操作与它交互，不依赖它的内部实现。',
+      i: `interface Executor {
+  canHandle(spec: TaskSpec): boolean;
+  dispatch(spec: TaskSpec, ctx: { idempotencyKey: string }): Promise<{ handle: string }>;
+  status(handle: string): Promise<DispatchStatus>;
+  cancel(handle: string): Promise<void>;
+}`,
+      r: ['相信执行方"已完成"的自述', '长任务失联，状态永远停在"进行中"', '执行方权限过大（能推主分支、能发外部消息）'],
+      ch: [['ch11-protocols.html', '第 11 章'], ['ch12-long-running.html', '第 12 章']],
+      p: [['p7-coding-harness.html', 'P7']],
+    },
+    ingest: {
+      t: 'ingest：去重落库',
+      d: '按（通道，消息 ID）去重，落库，更新会话，过滤系统消息与忽略的会话。用户自己发的消息只做记忆提取（它是承诺与风格的来源），不进分析。',
+      i: `function ingest(m: InboundMessage): 'new' | 'duplicate' | 'filtered' {
+  // INSERT ... ON CONFLICT(channel, msg_id) DO NOTHING
+}`,
+      r: ['重连后的消息重放被当成新消息', '自己发的消息被当成别人的需求'],
+      ch: [['ch10-durable-execution.html', '第 10 章']],
+      p: [['p3-approval.html', 'P3']],
+    },
+    batcher: {
+      t: 'batcher：去抖成批',
+      d: '按会话去抖：会话安静 N 秒或累计 M 条消息才形成一个批次，一批只分析一次。既省钱，也让模型看到完整的一件事。',
+      i: `interface BatchPolicy { quietMs: number; maxMessages: number; maxWaitMs: number }`,
+      r: ['等太久：紧急消息被延迟（加最长等待时间）', '切太碎：一件事被拆成几次分析，结论互相矛盾'],
+      ch: [['ch05-context-engineering.html', '第 5 章']],
+      p: [['p2-triage.html', 'P2']],
+    },
+    triage: {
+      t: 'triage：分诊',
+      d: '用便宜的模型或规则判断一个批次值不值得深度分析：私聊、点名、提需求的进入分析；通知与闲聊在这里挡掉。是"路由"模式的成本用法。',
+      i: `const TriageSchema = Type.Object({
+  verdict: Type.Union([Type.Literal('analyze'), Type.Literal('skip')]),
+  reason: Type.String(),
+}, { additionalProperties: false });`,
+      r: ['漏判重要消息（要能事后回捞、要进评测）', '为省钱把分诊模型降得太弱'],
+      ch: [['ch01-what-is-agent.html', '第 1 章 路由'], ['ch14-observability.html', '第 14 章 成本']],
+      p: [['p2-triage.html', 'P2']],
+    },
+    analyzer: {
+      t: 'analyzer：结构化分析',
+      d: '按预算组装上下文：用户档案、最近若干条历史、会话摘要、相关人物档案与知识、未关闭的需求；调用模型得到结构化分析：摘要、紧急度、是否需要回复、需求与未澄清问题、回复草稿。',
+      i: `const AnalysisSchema = Type.Object({
+  summary: Type.String(),
+  urgency: Type.Union([Type.Literal('low'), Type.Literal('normal'), Type.Literal('high')]),
+  needs_reply: Type.Boolean(),
+  requirements: Type.Array(RequirementUpdate),
+  reply_options: Type.Array(Type.String()),
+  confidence: Type.Number(),
+}, { additionalProperties: false });`,
+      r: ['上下文缺关键信息（如今天的日期）导致误判', '把消息里的指令当成用户的指令（注入）', '虚构需求、虚构承诺'],
+      ch: [['ch03-structured-tools.html', '第 3 章'], ['ch05-context-engineering.html', '第 5 章'], ['ch06-memory.html', '第 6 章'], ['ch07-retrieval.html', '第 7 章']],
+      p: [['p2-triage.html', 'P2']],
+    },
+    proposals: {
+      t: 'proposals：生成提案',
+      d: '把分析结果转成具体的待执行动作：回复、向需求方追问、建任务、派发给执行方、修改记忆。需求有未澄清问题时只生成追问，不生成派发。',
+      i: `type ProposalKind = 'reply' | 'clarify' | 'task' | 'dispatch' | 'memory';
+interface Proposal { id: number; kind: ProposalKind; payload: unknown; status: ProposalStatus; analysisId: number }`,
+      r: ['同一件事生成重复提案（新提案要取代旧的）', '过早派发：需求没问清就开工'],
+      ch: [['ch08-hitl-autonomy.html', '第 8 章']],
+      p: [['p3-approval.html', 'P3']],
+    },
+    policy: {
+      t: 'policy：策略与护栏',
+      d: '会话模式是总闸（关闭 / 建议 / 自动）；自动模式下按"动作 × 对象"的信任矩阵决定等级，再逐条过护栏：白名单、置信度、每小时上限、静默时段、敏感词、疑似机器人对话、全局暂停。未通过的护栏写进日志。',
+      i: `function decidePolicy(p: Proposal, ctx: PolicyContext):
+  { status: 'pending' | 'approved' | 'dropped'; autoApproved: boolean; failedGuards: string[] };`,
+      r: ['护栏配置过宽导致误发', '两个 agent 互相自动回复形成循环', '自动化范围悄悄扩大，用户不知情'],
+      ch: [['ch08-hitl-autonomy.html', '第 8 章'], ['ch09-security.html', '第 9 章']],
+      p: [['p3-approval.html', 'P3']],
+    },
+    actions: {
+      t: 'actions：执行动作',
+      d: '执行已批准的提案：以"提案 ID + 正文"生成幂等键，经通道或插件执行，记录结果。网络类错误有限重试；仍失败回到待审批并标注原因。启动时把残留的"执行中"改回待审批，不自动重发。',
+      i: `async function execute(p: Proposal): Promise<ActionResult> {
+  const key = hash(p.id, p.payload.text);   // 改写后的新正文是另一条消息
+  return withRetry(2, () => channel.send(p.target, p.payload, key));
+}`,
+      r: ['重试或重启导致重复发送', '部分成功（发出去了但没记下结果）'],
+      ch: [['ch10-durable-execution.html', '第 10 章']],
+      p: [['p3-approval.html', 'P3']],
+    },
+    feedback: {
+      t: 'feedback：反馈学习',
+      d: '用户的每个决定都是信号：原样批准、改写（改前 / 改后是最好的风格样本）、拒绝（附原因则是直接规则）、亲自处理、撤回。即时用作起草示例；定期反思产出修改档案的提案（要批准）；按采纳率给出放权建议，撤回立即降级；同时成为评测用例来源。',
+      i: `type Signal =
+  | { kind: 'edited'; before: string; after: string; reason?: string }
+  | { kind: 'rejected'; reason?: string }
+  | { kind: 'self_replied'; actual: string }
+  | { kind: 'recalled' };`,
+      r: ['把一次性的改动泛化成规则', '自动修改档案而不经用户确认'],
+      ch: [['ch06-memory.html', '第 6 章'], ['ch08-hitl-autonomy.html', '第 8 章'], ['ch13-evals.html', '第 13 章']],
+      p: [['p4-memory.html', 'P4'], ['p6-evals.html', 'P6']],
+    },
+    sidecar: {
+      t: '旁路任务',
+      d: '不由入站消息触发的后台工作：定时简报、派发追踪（定期回查执行方状态，长时间不变标为未知）、记忆整理与反思、知识编译。各有预算和超时，与主管线共享串行队列避免并发改同一条记录。',
+      i: `scheduler.cron('0 9,14 * * 1-5', digest);        // 定时简报
+scheduler.every('10m', trackDispatches);          // 派发追踪
+scheduler.cron('30 18 * * 1-5', reflectMemory);   // 反思（产出提案）`,
+      r: ['后台任务失控烧钱', '与主管线并发写同一条记录'],
+      ch: [['ch06-memory.html', '第 6 章'], ['ch07-retrieval.html', '第 7 章'], ['ch12-long-running.html', '第 12 章']],
+      p: [['p4-memory.html', 'P4'], ['p7-coding-harness.html', 'P7']],
+    },
+    memory: {
+      t: '记忆与知识',
+      d: '用户档案（身份、说话方式、底线、先问我的情况）、人物档案、带来源与有效期的记忆条目、承诺台账；以及可共享的知识库（只收策展结论和来源引用）。人写的内容优先于自动生成的，自动流程不得覆盖。',
+      i: `interface MemoryItem {
+  subject: 'me' | { person: string } | { chat: string };
+  text: string;
+  sourceMessageId: string;
+  validFrom: string; validTo: string | null;   // 失效而不删除
+  author: 'user' | 'auto';
+}`,
+      r: ['记忆投毒：外部内容写进了长期记忆（OWASP ASI06）', '记了不该记的个人信息', '过期事实仍被当真'],
+      ch: [['ch06-memory.html', '第 6 章'], ['ch07-retrieval.html', '第 7 章']],
+      p: [['p4-memory.html', 'P4']],
+    },
+    store: {
+      t: '存储：单机 SQLite（WAL）',
+      d: '一个文件装下消息、会话、分析、需求、提案、动作、派发、记忆与设置。WAL 模式下守护进程写、CLI 进程直接读写同一个库，数据库就是进程间的消息总线；迁移随代码发布，破坏性迁移前自动备份。',
+      i: `db.exec('PRAGMA journal_mode = WAL');
+db.exec('PRAGMA busy_timeout = 5000');
+migrate(db, MIGRATIONS);   // 按编号顺序执行，记录已执行的版本`,
+      r: ['多个守护进程同时写（要单实例锁）', '迁移失败无法回滚（要先备份）'],
+      ch: [['ch10-durable-execution.html', '第 10 章'], ['ch14-observability.html', '第 14 章']],
+      p: [['p3-approval.html', 'P3']],
+    },
+  };
+  const box = document.querySelector('.arch');
+  const panel = box.querySelector('[data-panel]');
+  const esc = Course.escape;
+  const show = (id) => {
+    const c = C[id];
+    box.querySelectorAll('[data-comp]').forEach((g) => g.classList.toggle('sel', g.dataset.comp === id));
+    panel.innerHTML = `<h4>${c.t}</h4><div>${c.d}</div>
+      <div class="k">关键接口</div><pre><code>${esc(c.i)}</code></pre>
+      <div class="k">主要风险</div><ul>${c.r.map((x) => `<li>${x}</li>`).join('')}</ul>
+      <div class="k">相关章节与项目</div><div class="links">${c.ch.concat(c.p).map(([f, n]) => `<a href="${f}">${n}</a>`).join('')}</div>`;
+  };
+  box.querySelectorAll('[data-comp]').forEach((g) => {
+    g.setAttribute('tabindex', '0');
+    g.setAttribute('role', 'button');
+    g.addEventListener('click', () => show(g.dataset.comp));
+    g.addEventListener('keydown', (e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), show(g.dataset.comp)));
+  });
+  show('analyzer');
+});
+</script>
+</body>
+</html>

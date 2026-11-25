@@ -1,0 +1,400 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>模型工程基础 · AI Agent 工程</title>
+<meta name="description" content="token、上下文窗口、消息结构、采样与推理强度、流式、提示缓存、成本与延迟估算、模型分级与回退：agent 工程师必须算得清的账。">
+<link rel="stylesheet" href="assets/css/course.css">
+<script src="assets/js/manifest.js"></script>
+<script defer src="assets/js/course.js"></script>
+<style>
+  .cost-bar { display: flex; height: 18px; border-radius: 6px; overflow: hidden; background: var(--surface-2); margin: 8px 0 4px; }
+  .cost-bar i { display: block; height: 100%; transition: width .3s; }
+  .legend { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 12.5px; color: var(--muted); }
+  .legend span::before { content: ""; display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 5px; background: var(--c); vertical-align: -1px; }
+  .stats { display: flex; flex-wrap: wrap; gap: 14px 26px; margin-top: 10px; }
+</style>
+</head>
+<body data-page="ch02">
+<article id="content">
+<div class="eyebrow">第一部分 · 基础 · 第 2 章</div>
+<h1>模型工程基础：Token、上下文、推理与成本</h1>
+<p class="lead">你不需要知道 Transformer 的每个矩阵，但必须算得清 agent 的账：一次调用多少 token、为什么第二次比第一次便宜、为什么把时间戳放错位置会让成本翻几倍、延迟花在了哪里。这一章是后面所有设计决策的"物理学"。</p>
+<div class="meta"><span>约 35 分钟</span><span>前置：第 1 章</span><span>含 1 个分步动画、1 个成本计算器、3 道小测</span></div>
+
+<div class="goals"><b>学完你能</b>
+<ul>
+  <li>解释 token、上下文窗口、消息角色，并说明"模型无状态"对 agent 设计意味着什么</li>
+  <li>为不同任务选择采样参数与推理强度</li>
+  <li>说清提示缓存的前缀匹配原理，排查"缓存命中率低"的常见原因</li>
+  <li>估算一个 agent 每天、每月的模型成本，并找出最大的优化杠杆</li>
+  <li>设计模型分级、路由与回退策略</li>
+</ul></div>
+
+<h2>1 · Token：模型眼中的文本</h2>
+<p>模型不直接读字符，而是读 <strong>token</strong>——分词器（tokenizer）把文本切成的片段，每个片段对应词表里的一个整数编号。常见英文单词往往是一个 token，生僻词、代码、中文则会被切成多个片段。所有计费、所有长度上限、所有延迟都以 token 为单位。</p>
+<ul>
+  <li><strong>不同模型的分词器不同</strong>：同一段中文，在不同厂商、甚至同一厂商不同代际的模型上，token 数都可能不一样。不要用"字数 × 系数"拍脑袋，用官方的计数接口或 SDK 实测你的真实负载。</li>
+  <li><strong>结构化内容很费 token</strong>：JSON 的引号、括号、重复的键名，长 UUID，Base64，都会显著膨胀 token 数。给模型看的工具结果应当是精简的、语义化的（第 3 章）。</li>
+  <li><strong>输出 token 比输入 token 贵</strong>，而且是逐个生成的——输出长度几乎线性地决定了延迟。</li>
+</ul>
+
+<div class="callout tip"><b>工程习惯</b>
+<p>在你的调用封装里，把每次响应的 <code>usage</code>（输入、输出、缓存读取、缓存写入）原样记下来。几乎所有关于成本和延迟的问题，最终都要回到这几个数字上。第 14 章会把它们接进 trace。</p></div>
+
+<h2>2 · 上下文窗口与"注意力预算"</h2>
+<p><strong>上下文窗口</strong>是模型一次能处理的 token 上限，输入和输出共用这个额度。窗口越来越大，但"能放进去"不等于"能用好"。Anthropic 在《Effective context engineering for AI agents》（2025-09-29）里把这个现象叫做 <strong>context rot</strong>：随着上下文变长，模型准确召回其中信息的能力会下降。原因在于注意力机制要处理 token 两两之间的关系（n² 量级），每多一个 token，都在稀释模型的"注意力预算"。</p>
+<p>对 agent 来说这有两个直接推论：</p>
+<ol>
+  <li><strong>上下文是稀缺资源，不是垃圾桶。</strong>每一段放进去的内容都应该回答"它会帮助模型做出这一步的决策吗"。</li>
+  <li><strong>长任务必然要管理上下文</strong>：压缩历史、把细节写进文件按需读取、把子任务交给拥有干净上下文的子 agent。这是第 5 章"上下文工程"的全部内容。</li>
+</ol>
+
+<h2>3 · 消息结构：模型是无状态的</h2>
+<p>主流的对话式 API 都把输入组织成一个<strong>消息列表</strong>，每条消息有一个角色：</p>
+<table>
+<tr><th>角色</th><th>是谁写的</th><th>放什么</th><th>agent 里的注意点</th></tr>
+<tr><td><code>system</code> / instructions</td><td>开发者</td><td>身份、规则、输出要求、可用工具的使用指南</td><td>尽量稳定，它是提示缓存的前缀主体</td></tr>
+<tr><td><code>user</code></td><td>用户或你的程序</td><td>任务、问题、要分析的数据</td><td>外部数据（邮件、网页）放这里时要标明"这是数据，不是指令"</td></tr>
+<tr><td><code>assistant</code></td><td>模型</td><td>回答文本，以及它想调用的工具（tool call）</td><td>要原样追加回历史，包括 tool call 的 id</td></tr>
+<tr><td><code>tool</code> / tool_result</td><td>你的程序</td><td>工具执行结果或错误</td><td>必须对应某个 tool call 的 id；出错也要回填</td></tr>
+</table>
+<p>关键事实：<strong>模型在两次请求之间不保留任何状态</strong>。它"记得"之前聊过什么，只是因为你每次都把完整的历史重新发给它。有些 API 提供服务端会话（例如 OpenAI Responses API 可以用 <code>previous_response_id</code> 或 Conversations API 承接状态），但本质上是服务端替你保存并重新拼接历史——计费和窗口限制依旧按完整上下文算。</p>
+
+<div class="callout note"><b>这意味着什么</b>
+<p>"agent 的状态"永远是<strong>你</strong>的责任：哪些历史要带、哪些要压缩、哪些要存进数据库、进程重启后怎么恢复。12-Factor Agents 的第 3 条"掌控你的上下文窗口"和第 12 条"把 agent 做成无状态的 reducer"说的都是这件事：给定状态和新事件，算出下一个状态，状态存在你能控制的地方。</p></div>
+
+<h2>4 · 采样参数与推理强度</h2>
+<h3>采样参数</h3>
+<table>
+<tr><th>参数</th><th>作用</th><th>agent 里的用法</th></tr>
+<tr><td><code>temperature</code></td><td>控制随机性，越低越倾向于选概率最高的 token</td><td>抽取、分类、工具调用用低温；需要多样性的起草（例如给出两种语气的回复）可以略高</td></tr>
+<tr><td><code>top_p</code></td><td>只在累积概率达到 p 的候选里采样</td><td>一般只调 temperature 和 top_p 中的一个</td></tr>
+<tr><td><code>max_tokens</code></td><td>输出长度上限</td><td>必须设置；被截断时 <code>stop_reason</code> 会告诉你，结构化输出被截断就是非法 JSON（第 3 章）</td></tr>
+<tr><td>stop 序列</td><td>遇到指定字符串停止</td><td>结构化场景里很少需要</td></tr>
+</table>
+<p>注意：低温度不等于确定性。即使 temperature 设为 0，同一输入在不同时间也可能得到不同输出（服务端的批处理、硬件差异都会引入微小差别）。<strong>不要把系统的正确性建立在"模型每次输出一样"之上</strong>——这正是评测里要区分 pass@k 和 pass^k 的原因（第 13 章）。部分推理模型固定或不开放某些采样参数，以各家文档为准。</p>
+
+<h3>推理强度（thinking / reasoning effort）</h3>
+<p>推理模型在给出答案前会先生成一段内部推理。多数 API 让你设置推理的"强度"或 token 预算。权衡很直接：</p>
+<ul>
+  <li><strong>更高的强度</strong>：复杂判断、多约束规划、需要对照多份资料时更准；代价是更多的输出 token（推理 token 按输出计费——OpenTelemetry 的 GenAI 约定里 <code>gen_ai.usage.output_tokens</code> 也明确包含推理 token）和更长的延迟。</li>
+  <li><strong>更低的强度</strong>：分类、格式转换、简单抽取足够用，便宜而且快。</li>
+</ul>
+<div class="callout warn"><b>常见误区：用推理强度弥补上下文缺失</b>
+<p>模型判断错了，第一反应往往是"调高推理强度"。但如果错误的根源是它没看到关键信息（比如不知道发件人是你的上级），推理再多也只是更自信地猜错。先读 trace 确认模型拿到了什么，再决定是补上下文、改提示词，还是加推理。</p></div>
+
+<div class="quiz" data-answer="2">
+<p class="q">办公助理要把每封新邮件分成"需回复 / 仅通知 / 垃圾"三类，每天几千封。最合理的配置是？</p>
+<ol>
+  <li>最强模型 + 最高推理强度，确保准确</li>
+  <li>较小的模型 + 低推理强度 + 低温度 + 结构化输出，用评测集确认准确率够用</li>
+  <li>高温度，让分类更有创意</li>
+  <li>不设 max_tokens，让模型充分解释理由</li>
+</ol>
+<div class="explain">高频、简单、可度量的任务，应当用够用的最小配置，并用评测集证明它够用。省下的预算留给真正困难的环节（例如起草需要综合多方信息的回复）。"够用"必须有数据支撑，而不是凭感觉。</div>
+</div>
+
+<h2>5 · 流式输出与超时</h2>
+<p>流式（streaming）让模型边生成边返回，通常通过 SSE（Server-Sent Events）推送事件：文本增量、工具调用参数的增量、用量统计、结束原因。对 agent 工程有三个实际影响：</p>
+<ol>
+  <li><strong>用户体验</strong>：交互式场景下首个 token 早到，用户感觉快得多。</li>
+  <li><strong>工具调用参数是分片到达的</strong>：在收到完整参数之前不能执行工具。流在工具调用中途断开时，那次调用必须作废，而不是执行一半的参数。</li>
+  <li><strong>超时要分两种</strong>：等待首个事件的超时，和两个事件之间的间隔超时。只设一个总超时，会遇到"连接没断但再也没有数据"的僵死请求——批量任务可能因此卡住几个小时。再加一个单次请求的总时长上限，并与调用方的取消信号（AbortSignal）合并。</li>
+</ol>
+
+<pre data-title="把用户取消、空闲超时和总时长上限合并成一个信号"><code class="lang-ts">
+// 每收到一个流事件就调用 touch()；超过 idleMs 没有新事件或超过 totalMs 都会中止请求。
+export function requestSignal(parent: AbortSignal | undefined, idleMs: number, totalMs: number) {
+  const idle = new AbortController();
+  let timer = setTimeout(() =&gt; idle.abort(new Error('流式响应空闲超时')), idleMs);
+  const touch = () =&gt; {
+    clearTimeout(timer);
+    timer = setTimeout(() =&gt; idle.abort(new Error('流式响应空闲超时')), idleMs);
+  };
+  const signals = [idle.signal, AbortSignal.timeout(totalMs)];
+  if (parent) signals.push(parent);
+  return { signal: AbortSignal.any(signals), touch, dispose: () =&gt; clearTimeout(timer) };
+}
+</code></pre>
+
+<h2>6 · 提示缓存：最大的成本杠杆</h2>
+<p>agent 的输入远多于输出：每一步都要把系统提示、工具定义和越来越长的历史重新发一遍。Manus 团队在《Context Engineering for AI Agents》（2025-07-18）里给出的数据是，他们的 agent 输入与输出的 token 比大约 <strong>100:1</strong>，并把 <strong>KV-cache 命中率</strong>称为生产级 agent 最重要的单一指标——在他们引用的价格下，缓存命中的输入 token 比未命中便宜 10 倍。</p>
+<p>提示缓存的原理是<strong>前缀匹配</strong>：服务端把一段请求前缀计算出的中间状态（KV cache）保存一段时间，下次请求如果以<strong>完全相同</strong>的前缀开头，就直接复用。只要前缀里有一个 token 不同，从那个位置往后全部要重新计算。看看下面两种布局的差别：</p>
+
+<figure class="anim" data-dim>
+<div class="diagram">
+<svg viewBox="0 0 760 320" width="760" role="img" aria-label="提示缓存的前缀匹配：好布局与坏布局">
+  <text class="ta" x="20" y="26">布局 A：变化的内容放在末尾</text>
+  <g data-k="a1">
+    <text class="ts" x="20" y="62">第 1 次</text>
+    <rect class="box w" x="90" y="40" width="140" height="36" rx="6"/><text class="t" x="160" y="63" text-anchor="middle">工具定义</text>
+    <rect class="box w" x="234" y="40" width="170" height="36" rx="6"/><text class="t" x="319" y="63" text-anchor="middle">系统提示</text>
+    <rect class="box w" x="408" y="40" width="200" height="36" rx="6"/><text class="t" x="508" y="63" text-anchor="middle">历史消息</text>
+    <rect class="box w" x="612" y="40" width="130" height="36" rx="6"/><text class="t" x="677" y="63" text-anchor="middle">新消息 · 10:01</text>
+  </g>
+  <g data-k="a2">
+    <text class="ts" x="20" y="108">第 2 次</text>
+    <rect class="box g" x="90" y="86" width="140" height="36" rx="6"/><text class="t" x="160" y="109" text-anchor="middle">工具定义 ✓</text>
+    <rect class="box g" x="234" y="86" width="170" height="36" rx="6"/><text class="t" x="319" y="109" text-anchor="middle">系统提示 ✓</text>
+    <rect class="box g" x="408" y="86" width="200" height="36" rx="6"/><text class="t" x="508" y="109" text-anchor="middle">历史消息 ✓</text>
+    <rect class="box r" x="612" y="86" width="130" height="36" rx="6"/><text class="t" x="677" y="109" text-anchor="middle">新消息 · 10:02</text>
+  </g>
+  <text class="ta" x="20" y="166">布局 B：当前时间放在系统提示开头</text>
+  <g data-k="b1">
+    <text class="ts" x="20" y="202">第 1 次</text>
+    <rect class="box w" x="90" y="180" width="70" height="36" rx="6"/><text class="t" x="125" y="203" text-anchor="middle">10:01</text>
+    <rect class="box w" x="164" y="180" width="130" height="36" rx="6"/><text class="t" x="229" y="203" text-anchor="middle">工具定义</text>
+    <rect class="box w" x="298" y="180" width="150" height="36" rx="6"/><text class="t" x="373" y="203" text-anchor="middle">系统提示</text>
+    <rect class="box w" x="452" y="180" width="170" height="36" rx="6"/><text class="t" x="537" y="203" text-anchor="middle">历史消息</text>
+    <rect class="box w" x="626" y="180" width="116" height="36" rx="6"/><text class="t" x="684" y="203" text-anchor="middle">新消息</text>
+  </g>
+  <g data-k="b2">
+    <text class="ts" x="20" y="248">第 2 次</text>
+    <rect class="box r" x="90" y="226" width="70" height="36" rx="6"/><text class="t" x="125" y="249" text-anchor="middle">10:02</text>
+    <rect class="box r" x="164" y="226" width="130" height="36" rx="6"/><text class="t" x="229" y="249" text-anchor="middle">工具定义 ✗</text>
+    <rect class="box r" x="298" y="226" width="150" height="36" rx="6"/><text class="t" x="373" y="249" text-anchor="middle">系统提示 ✗</text>
+    <rect class="box r" x="452" y="226" width="170" height="36" rx="6"/><text class="t" x="537" y="249" text-anchor="middle">历史消息 ✗</text>
+    <rect class="box r" x="626" y="226" width="116" height="36" rx="6"/><text class="t" x="684" y="249" text-anchor="middle">新消息</text>
+  </g>
+  <rect class="box w" x="90" y="286" width="16" height="16" rx="3"/><text class="ts" x="112" y="299">写入缓存（比基础价贵）</text>
+  <rect class="box g" x="290" y="286" width="16" height="16" rx="3"/><text class="ts" x="312" y="299">命中（远比基础价便宜）</text>
+  <rect class="box r" x="490" y="286" width="16" height="16" rx="3"/><text class="ts" x="512" y="299">未命中（按基础价）</text>
+</svg>
+</div>
+<ol class="anim-steps">
+  <li data-show="a1" data-hl="a1">布局 A 第一次请求：缓存是空的，整段前缀被计算并<strong>写入</strong>缓存。写入比基础输入价略贵——以 Anthropic 为例，5 分钟有效期的写入是基础价的 1.25 倍，1 小时有效期是 2 倍。</li>
+  <li data-show="a2" data-hl="a2">第二次请求：工具定义、系统提示、历史消息逐 token 相同，全部<strong>命中</strong>。命中部分通常只收基础价的一成左右，部分新模型更低；只有末尾的新消息按原价计算。agent 每多走一步，命中的前缀就更长。</li>
+  <li data-show="b1" data-hl="b1">布局 B：开发者为了让模型知道"现在几点"，把当前时间写在系统提示最前面。第一次请求看起来没什么不同。</li>
+  <li data-show="b2" data-hl="b2">第二次请求：时间从 10:01 变成 10:02，<strong>第一个 token 就不同了</strong>。前缀匹配在开头就失败，后面所有内容都要重新计算并重新写入缓存——每次都付写入的溢价，一次也不命中。</li>
+  <li data-hl="a2 b2">同样的内容，只是顺序不同，成本可以差出好几倍。规则：<strong>稳定的放前面，变化的放后面，只追加不改写</strong>。当前时间、本次请求的 ID 这类东西，放在最末尾的用户消息里。</li>
+  <li data-hl="a1 b1">还要注意缓存的层级顺序是 <strong>工具 → 系统提示 → 消息</strong>：改动工具定义会让后面的系统提示和消息缓存一起失效。所以工具列表要按确定的顺序输出（MCP 2026-07-28 版规范也要求 tools/list 按确定顺序返回，理由正是方便提示缓存），JSON 序列化时键的顺序也要固定。</li>
+</ol>
+<figcaption>图 2-1 提示缓存的前缀匹配。倍数以 Anthropic 文档（2026-11 核实）为例，各家与各模型会变，请以官方价格页为准。</figcaption>
+</figure>
+
+<h3>各家缓存机制的差异</h3>
+<table>
+<tr><th></th><th>Anthropic</th><th>OpenAI</th></tr>
+<tr><td>开启方式</td><td>在请求里标注缓存断点（最多 4 个）</td><td>默认自动开启；新模型也支持显式断点</td></tr>
+<tr><td>最小长度</td><td>按模型不同，从 512 到 4,096 token 不等；不到最小长度时<strong>静默不缓存</strong></td><td>1,024 token 起</td></tr>
+<tr><td>有效期</td><td>5 分钟（写入 1.25×）或 1 小时（写入 2×）；每次命中免费续期</td><td>随模型不同，从几分钟到更长的留存模式</td></tr>
+<tr><td>读取价格</td><td>默认 0.1×，部分新模型更低</td><td>默认 0.1×，部分模型更低</td></tr>
+<tr><td>怎么看命中</td><td><code>usage.cache_read_input_tokens</code> / <code>cache_creation_input_tokens</code></td><td><code>usage.input_tokens_details.cached_tokens</code></td></tr>
+</table>
+
+<div class="callout danger"><b>排查"缓存命中率低"的清单</b>
+<ul>
+  <li>系统提示开头有时间戳、请求 ID、随机示例顺序等每次都变的内容</li>
+  <li>工具列表顺序不固定（例如从 Map/Set 遍历、多个 MCP 服务器并发返回后拼接）</li>
+  <li>JSON 序列化时键的顺序不稳定</li>
+  <li>修改了历史消息（例如事后截断某条工具结果），而不是只追加</li>
+  <li>前缀短于该模型的最小缓存长度，静默不缓存</li>
+  <li>同一份提示词的请求被路由到不同服务器——有的 API 提供 <code>prompt_cache_key</code> 之类的参数帮助落到同一处</li>
+  <li>两次请求的间隔超过了有效期</li>
+</ul></div>
+
+<h2>7 · 算清成本</h2>
+<p>一次调用的成本可以拆成四部分：</p>
+<pre data-title="成本公式"><code class="lang-ts">
+// 单价按"每百万 token"计；read / write 是相对基础输入价的倍数
+const cost =
+  (uncachedInput * inputPrice
+   + cacheReadTokens * inputPrice * readMultiplier
+   + cacheWriteTokens * inputPrice * writeMultiplier
+   + outputTokens * outputPrice) / 1_000_000;
+</code></pre>
+<p>agent 的成本还要乘上<strong>每个任务的步数</strong>和<strong>任务量</strong>，而且每一步的输入都比上一步长（历史在增长）。用下面的计算器体会各个参数的杠杆大小。单价请填你所用模型的官方价格，默认值只是示例：</p>
+
+<div class="widget" id="calc">
+<div class="w-title">Agent 成本计算器</div>
+<div class="w-row">
+  <label>输入单价（每百万 token）<input type="number" data-k="pin" value="3" min="0" step="0.1"></label>
+  <label>输出单价（每百万 token）<input type="number" data-k="pout" value="15" min="0" step="0.1"></label>
+  <label>缓存读取倍数<input type="number" data-k="read" value="0.1" min="0" step="0.01"></label>
+  <label>缓存写入倍数<input type="number" data-k="write" value="1.25" min="0" step="0.05"></label>
+</div>
+<div class="w-row">
+  <label>首步输入 token：<b data-v="base"></b><input type="range" data-k="base" min="1000" max="60000" step="1000" value="12000"></label>
+  <label>每步历史增长 token：<b data-v="grow"></b><input type="range" data-k="grow" min="0" max="8000" step="250" value="1500"></label>
+  <label>每步输出 token：<b data-v="out"></b><input type="range" data-k="out" min="50" max="4000" step="50" value="400"></label>
+  <label>每个任务的步数：<b data-v="steps"></b><input type="range" data-k="steps" min="1" max="40" step="1" value="8"></label>
+</div>
+<div class="w-row">
+  <label>前缀缓存命中率：<b data-v="hit"></b><input type="range" data-k="hit" min="0" max="100" step="5" value="85"></label>
+  <label>每天任务数：<b data-v="tasks"></b><input type="range" data-k="tasks" min="10" max="5000" step="10" value="300"></label>
+</div>
+<div class="cost-bar" data-bar></div>
+<div class="legend">
+  <span style="--c:var(--ok)">缓存读取</span><span style="--c:var(--warn)">缓存写入</span><span style="--c:var(--accent)">输出</span>
+</div>
+<div class="stats" data-stats></div>
+<div class="w-out" data-note></div>
+</div>
+
+<p>玩一会儿你会发现几个规律：</p>
+<ul>
+  <li><strong>步数的影响是超线性的</strong>：历史每步增长，总输入 ≈ 步数 × 首步输入 + 增长 × 步数² / 2。把 8 步的任务做成 30 步，成本远不止翻四倍。</li>
+  <li><strong>命中率从 0 到 85%，常常比换一个便宜一档的模型省得更多</strong>，而且不损失质量。</li>
+  <li><strong>输出 token 单价高，但在 agent 里通常不是大头</strong>——除非你开了很高的推理强度。</li>
+</ul>
+
+<div class="quiz" data-answer="4">
+<p class="q">一个 agent 平均每个任务走 20 步，系统提示加工具定义约 1 万 token，开发者发现缓存命中率接近 0。最可能的原因是？</p>
+<ol>
+  <li>输出太长</li>
+  <li>温度设得太高</li>
+  <li>任务步数太多</li>
+  <li>系统提示或工具定义里有每次请求都会变化的内容，或工具顺序不固定</li>
+</ol>
+<div class="explain">前缀匹配要求开头完全一致。命中率接近 0 几乎总是因为前缀的最前面在变：时间戳、请求 ID、工具列表顺序、序列化键序。步数多反而会让命中带来的节省更明显。</div>
+</div>
+
+<h2>8 · 延迟从哪里来</h2>
+<table>
+<tr><th>组成</th><th>主要取决于</th><th>怎么优化</th></tr>
+<tr><td>首 token 时间（TTFT）</td><td>输入长度、是否命中缓存、服务端排队</td><td>缩短与稳定前缀、提高缓存命中</td></tr>
+<tr><td>生成时间</td><td>输出 token 数（含推理 token）÷ 生成速度</td><td>限制输出长度、简单任务降推理强度、换更快的模型</td></tr>
+<tr><td>工具执行</td><td>外部 API、数据库、网页</td><td>并行执行互不依赖的只读工具、缓存工具结果</td></tr>
+<tr><td>步数</td><td>任务需要几轮循环</td><td>更好的工具（一次调用拿到够用的信息）、预取上下文</td></tr>
+</table>
+<p>agent 的端到端延迟 ≈ 步数 × (TTFT + 生成时间 + 工具时间)。所以<strong>减少步数</strong>往往是最大的延迟优化：Anthropic 在多智能体研究系统里通过改写工具描述，让完成任务的时间下降了 40%；把互相独立的检索改为并行后，复杂查询的耗时最多下降 90%（2025-06-13）。</p>
+
+<h2>9 · 模型怎么选：分级、路由与回退</h2>
+<h3>分级</h3>
+<p>不要全系统只用一个模型。把调用按难度和频率分级：</p>
+<ul>
+  <li><strong>高频简单</strong>（分类、分诊、格式转换）：小而快的模型，低推理强度。</li>
+  <li><strong>核心判断</strong>（综合多方信息起草回复、规划多步任务）：能力强的模型。</li>
+  <li><strong>后台批处理</strong>（夜间整理记忆、编译知识库）：对延迟不敏感，可以用强模型配合批处理接口，或者用便宜模型多跑几遍。</li>
+</ul>
+<p>第 1 章的<strong>路由模式</strong>就是分级的落地：先用小模型判断一条请求属于哪一级，再交给对应的模型。路由本身也要评测——把难题错分给小模型的代价，往往比省下的钱更大。</p>
+
+<h3>回退</h3>
+<pre data-title="只在“换个模型可能有用”的错误上回退"><code class="lang-ts">
+type ModelRef = string;
+
+// 认证失败、配额用尽、限流、5xx、网络错误：换一个模型可能就好了。
+// 输出不符合 schema：换模型不一定好，应该在同一模型上带着错误信息重试（第 3 章）。
+function isFallbackWorthy(err: unknown): boolean {
+  const status = (err as { status?: number }).status;
+  if (status === 401 || status === 403 || status === 429) return true;
+  if (status !== undefined &amp;&amp; status &gt;= 500) return true;
+  return err instanceof TypeError; // fetch 的网络错误
+}
+
+export async function withFallback&lt;R&gt;(refs: ModelRef[], fn: (ref: ModelRef) =&gt; Promise&lt;R&gt;): Promise&lt;R&gt; {
+  let last: unknown;
+  for (const ref of refs) {
+    try {
+      return await fn(ref);
+    } catch (err) {
+      if (!isFallbackWorthy(err)) throw err;
+      console.warn(`模型 ${ref} 调用失败，切换下一个`, err);
+      last = err;
+    }
+  }
+  throw last;
+}
+</code></pre>
+
+<div class="callout warn"><b>回退的两个陷阱</b>
+<ul>
+  <li><strong>有副作用的步骤不要整轮回退。</strong>如果 agent 已经执行过发邮件之类的工具，换个模型从头重跑会再发一遍（第 4、10 章）。</li>
+  <li><strong>回退会改变缓存与行为。</strong>备用模型没有你的缓存，提示词也可能需要适配。回退应该被记录、被监控，而不是悄悄发生。</li>
+</ul></div>
+
+<h3>预算</h3>
+<p>给系统设日/月花费上限，在每次调用<strong>之前</strong>检查。超限时不要直接丢弃工作：新的输入照常收录，未完成的分析在额度恢复后补上。这让"钱花完了"成为一个可预期的降级状态，而不是一场事故。</p>
+
+<div class="quiz" data-answer="1">
+<p class="q">模型返回的 JSON 连续两次不符合 schema，下面哪个处理最合适？</p>
+<ol>
+  <li>在同一模型上带着具体的校验错误重试，达到上限后报错，记录 trace 留作评测用例</li>
+  <li>立刻回退到另一个厂商的模型</li>
+  <li>把 temperature 调到最高再试</li>
+  <li>忽略校验错误，按字符串截取需要的字段</li>
+</ol>
+<div class="explain">schema 校验失败通常是提示词、schema 设计或任务难度的问题，把错误信息回灌给模型让它自我修正最有效（第 3 章的模式）。持续失败应当暴露出来并成为评测用例，而不是被回退或"宽松解析"掩盖。</div>
+</div>
+
+<div class="callout case review-link"><b>真实项目复盘</b>
+<p>本章的知识点在两个真实项目里缺位时发生了什么，以及"有这块知识"时会怎么设计：</p>
+<ul><li><a href="review.html#f-N11">N11</a> · niuma 曾一天 407 万输入 token 只命中 3072 个缓存；个人档案仍放在静态规则之前，一改就破坏前缀缓存</li></ul></div>
+
+<div class="takeaways"><b>本章要点</b>
+<ul>
+  <li>一切以 token 计：计费、窗口、延迟。记录每次调用的 usage。</li>
+  <li>上下文越长，模型越难用好它（context rot），上下文是稀缺资源。</li>
+  <li>模型无状态：历史、压缩、持久化都是你的责任。</li>
+  <li>采样参数与推理强度按任务调；先补上下文，再加推理。</li>
+  <li>提示缓存靠前缀匹配：稳定的放前面、变化的放后面、只追加不改写、序列化要确定。</li>
+  <li>agent 成本随步数超线性增长；缓存命中率与步数是两大杠杆。</li>
+  <li>分级用模型；只在认证/配额/网络类错误上回退；设预算并优雅降级。</li>
+</ul></div>
+
+<h2>参考资料</h2>
+<ul class="refs">
+  <li><a href="https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents" target="_blank" rel="noopener">Effective context engineering for AI agents</a> <span class="src">Anthropic · 2025-09-29 · context rot 与注意力预算</span></li>
+  <li><a href="https://manus.im/blog/Context-Engineering-for-AI-Agents-Lessons-from-Building-Manus" target="_blank" rel="noopener">Context Engineering for AI Agents: Lessons from Building Manus</a> <span class="src">Manus · 2025-07-18 · KV-cache 命中率与 100:1 的输入输出比</span></li>
+  <li><a href="https://platform.claude.com/docs/en/build-with-claude/prompt-caching" target="_blank" rel="noopener">Prompt caching</a> <span class="src">Anthropic 文档 · 倍数与最小长度（2026-11 核实）</span></li>
+  <li><a href="https://developers.openai.com/api/docs/guides/prompt-caching" target="_blank" rel="noopener">Prompt caching</a> <span class="src">OpenAI 文档</span></li>
+  <li><a href="https://developers.openai.com/api/docs/guides/migrate-to-responses" target="_blank" rel="noopener">Migrate to the Responses API</a> <span class="src">OpenAI 文档 · 服务端状态的承接方式</span></li>
+  <li><a href="https://github.com/open-telemetry/semantic-conventions-genai" target="_blank" rel="noopener">OpenTelemetry GenAI semantic conventions</a> <span class="src">用量字段的定义</span></li>
+  <li><a href="https://www.anthropic.com/engineering/multi-agent-research-system" target="_blank" rel="noopener">How we built our multi-agent research system</a> <span class="src">Anthropic · 2025-06-13 · 工具描述与并行化对耗时的影响</span></li>
+  <li><a href="https://github.com/humanlayer/12-factor-agents" target="_blank" rel="noopener">12-Factor Agents</a> <span class="src">HumanLayer · 掌控上下文、无状态 reducer</span></li>
+</ul>
+</article>
+
+<script>
+window.addEventListener('DOMContentLoaded', () => {
+  const box = document.getElementById('calc');
+  const val = (k) => Number(box.querySelector(`[data-k="${k}"]`).value) || 0;
+  const money = (x) => (x >= 100 ? x.toFixed(0) : x >= 1 ? x.toFixed(2) : x.toFixed(4));
+  const fmt = (n) => n.toLocaleString('zh-CN');
+  const render = () => {
+    for (const k of ['base', 'grow', 'out', 'steps', 'tasks']) box.querySelector(`[data-v="${k}"]`).textContent = fmt(val(k));
+    box.querySelector('[data-v="hit"]').textContent = val('hit') + '%';
+    const pin = val('pin') / 1e6, pout = val('pout') / 1e6, read = val('read'), write = val('write');
+    const steps = val('steps'), hit = val('hit') / 100;
+    let cacheRead = 0, cacheWrite = 0, output = 0, rawInput = 0;
+    for (let i = 0; i < steps; i++) {
+      const input = val('base') + i * val('grow');
+      rawInput += input;
+      // 每一步里，除了本步新追加的那部分，其余都是可缓存的前缀；命中率作用在这部分上。
+      const fresh = i === 0 ? input * 0.1 : val('grow');
+      const prefix = input - fresh;
+      cacheRead += prefix * hit;
+      cacheWrite += prefix * (1 - hit) + fresh; // 未命中的前缀与新内容都会被写入，供下一步命中
+      output += val('out');
+    }
+    const parts = {
+      read: cacheRead * pin * read,
+      write: cacheWrite * pin * write,
+      out: output * pout,
+    };
+    const perTask = parts.read + parts.write + parts.out;
+    const noCache = rawInput * pin + output * pout;
+    const daily = perTask * val('tasks');
+    const bar = box.querySelector('[data-bar]');
+    const colors = { read: 'var(--ok)', write: 'var(--warn)', out: 'var(--accent)' };
+    bar.innerHTML = Object.entries(parts).map(([k, v]) => `<i style="width:${perTask ? (v / perTask) * 100 : 0}%;background:${colors[k]}" title="${k}"></i>`).join('');
+    const saving = noCache ? (1 - perTask / noCache) * 100 : 0;
+    box.querySelector('[data-stats]').innerHTML = [
+      ['每个任务', money(perTask)],
+      ['每天', money(daily)],
+      ['每月（30 天）', money(daily * 30)],
+      ['不用缓存时每月', money(noCache * val('tasks') * 30)],
+      ['缓存节省', saving.toFixed(0) + '%'],
+    ].map(([t, v]) => `<span class="stat"><b>${v}</b><small>${t}</small></span>`).join('');
+    box.querySelector('[data-note]').innerHTML =
+      `每个任务共 <b>${fmt(Math.round(rawInput))}</b> 输入 token、<b>${fmt(output)}</b> 输出 token，输入:输出 ≈ <b>${Math.round(rawInput / Math.max(output, 1))}:1</b>。` +
+      `货币单位与你填的单价一致。简化假设：首步有一成内容是新的，之后每步只有新增的历史是新的；未命中的前缀按写入计价（自动缓存、没有写入溢价的 API，把写入倍数填 1）。`;
+  };
+  box.querySelectorAll('input').forEach((i) => i.addEventListener('input', render));
+  render();
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>精选资料库 · AI Agent 工程</title>
+<meta name="description" content="AI Agent 工程一手资料：官方工程博客、规范、论文、SDK 文档、书与基准，标注必读与推荐阅读顺序，核实于 2026-11。">
+<link rel="stylesheet" href="assets/css/course.css">
+<script src="assets/js/manifest.js"></script>
+<script defer src="assets/js/course.js"></script>
+<style>
+  .res { list-style: none; padding: 0; margin: 10px 0; }
+  .res > li { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 10px 14px; margin: 8px 0; }
+  .res > li .pill { margin-right: 6px; vertical-align: 1px; }
+  .res > li a { font-weight: 600; }
+  .res > li .src { display: block; color: var(--muted); font-size: 12.5px; margin-top: 2px; }
+  .res > li .why { display: block; font-size: 14.5px; margin-top: 4px; }
+  .r-filter { display: flex; flex-wrap: wrap; gap: 6px; margin: 12px 0; }
+  .r-filter button.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+  section[data-topic].off { display: none; }
+  .order li { margin: 8px 0; }
+</style>
+</head>
+<body data-page="resources">
+<article id="content">
+<div class="eyebrow">附录</div>
+<h1>精选资料库</h1>
+<p class="lead">这门课的每个结论都能追溯到这里的一手资料：官方工程博客、协议规范、原论文和官方文档。<span class="pill ok">必读</span> 是成为合格 Agent 工程师绕不开的，<span class="pill">选读</span> 在需要深入某个方向时再看。</p>
+<div class="meta"><span>核实于 2026-11</span><span>日期为原文发布日期</span><span>未能确认日期的不标注</span></div>
+
+<div class="callout warn"><b>关于时效</b>
+<p>这些链接和日期在 2026 年 11 月逐条对照原文核实过。规范版本、SDK 接口、价格与基准分数变化很快，引用前请以原文最新版本为准。</p></div>
+
+<h2>1 · 推荐阅读顺序</h2>
+<p>如果只读 10 篇，按这个顺序读。前三篇建立整体观，中间四篇是日常工程手艺，最后三篇是让系统可信的关键。</p>
+<ol class="order">
+  <li><a href="https://www.anthropic.com/engineering/building-effective-agents" target="_blank" rel="noopener">Building effective agents</a>（Anthropic）—— workflow 与 agent 的定义、五种编排模式、"从简单开始"。</li>
+  <li><a href="https://openai.com/business/guides-and-resources/a-practical-guide-to-building-ai-agents/" target="_blank" rel="noopener">A practical guide to building agents</a>（OpenAI）—— 何时该做 agent、模型/工具/指令三要素、护栏与人工介入。</li>
+  <li><a href="https://github.com/humanlayer/12-factor-agents" target="_blank" rel="noopener">12-Factor Agents</a>（HumanLayer）—— 掌控提示词、上下文和控制流的 12 条工程原则。</li>
+  <li><a href="https://www.anthropic.com/engineering/writing-tools-for-agents" target="_blank" rel="noopener">Writing effective tools for agents</a>（Anthropic）—— 工具怎么设计、怎么用评测迭代。</li>
+  <li><a href="https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents" target="_blank" rel="noopener">Effective context engineering for AI agents</a>（Anthropic）—— 注意力预算、即用即取、压缩、笔记、子 agent。</li>
+  <li><a href="https://manus.im/blog/Context-Engineering-for-AI-Agents-Lessons-from-Building-Manus" target="_blank" rel="noopener">Context Engineering for AI Agents: Lessons from Building Manus</a>（Manus）—— KV 缓存命中率、屏蔽而非删除工具、保留错误。</li>
+  <li><a href="https://www.anthropic.com/engineering/effective-harnesses-for-long-running-agents" target="_blank" rel="noopener">Effective harnesses for long-running agents</a>（Anthropic）—— 长任务驾驭器：功能清单、进度文件、每次一个功能。</li>
+  <li><a href="https://simonwillison.net/2025/Jun/16/the-lethal-trifecta/" target="_blank" rel="noopener">The lethal trifecta for AI agents</a>（Simon Willison）—— 一张图讲清提示注入为什么危险。</li>
+  <li><a href="https://www.anthropic.com/engineering/demystifying-evals-for-ai-agents" target="_blank" rel="noopener">Demystifying evals for AI agents</a>（Anthropic）—— grader 类型、pass@k 与 pass^k、从真实失败起步。</li>
+  <li><a href="https://hamel.dev/blog/posts/evals-faq/" target="_blank" rel="noopener">AI Evals FAQ</a>（Hamel Husain、Shreya Shankar）—— 错误分析与二元判官的实操方法。</li>
+</ol>
+
+<h2>2 · 按主题浏览</h2>
+<p>点按钮只看某个主题，"全部"恢复。</p>
+<div class="r-filter" id="r-filter"></div>
+
+<section data-topic="基础与架构">
+<h3>基础与架构</h3>
+<ul class="res">
+  <li><span class="pill ok">必读</span><a href="https://www.anthropic.com/engineering/building-effective-agents" target="_blank" rel="noopener">Building effective agents</a><span class="src">Erik S.、Barry Zhang · Anthropic · 2024-12-19</span><span class="why">业界最常引用的 agent 定义；五种 workflow 模式；简单、透明、认真设计工具接口三原则。</span></li>
+  <li><span class="pill ok">必读</span><a href="https://openai.com/business/guides-and-resources/a-practical-guide-to-building-ai-agents/" target="_blank" rel="noopener">A practical guide to building agents</a><span class="src">OpenAI · 网页标注 2026-01-15 · 另有 <a href="https://cdn.openai.com/business-guides-and-resources/a-practical-guide-to-building-agents.pdf" target="_blank" rel="noopener">PDF 版</a></span><span class="why">单 agent 优先、manager 与 handoff 两种多 agent 编排、分层护栏与人工介入触发条件。</span></li>
+  <li><span class="pill ok">必读</span><a href="https://github.com/humanlayer/12-factor-agents" target="_blank" rel="noopener">12-Factor Agents</a><span class="src">Dex Horthy · HumanLayer</span><span class="why">把 agent 当普通软件来工程化：自己掌控提示词、上下文和控制流，"agent 是无状态的 reducer"。</span></li>
+  <li><span class="pill ok">必读</span><a href="https://lilianweng.github.io/posts/2023-06-23-agent/" target="_blank" rel="noopener">LLM Powered Autonomous Agents</a><span class="src">Lilian Weng · 2023-06-23</span><span class="why">规划、记忆、工具三组件的经典框架，很多后来的概念都能在这里找到源头。</span></li>
+  <li><span class="pill">选读</span><a href="https://arxiv.org/abs/2210.03629" target="_blank" rel="noopener">ReAct: Synergizing Reasoning and Acting in Language Models</a><span class="src">Shunyu Yao 等 · arXiv 2022-10-06 · ICLR 2023</span><span class="why">Thought / Action / Observation 循环的出处，现代 agent loop 的思想源头。</span></li>
+  <li><span class="pill ok">必读</span><a href="https://www.anthropic.com/engineering/multi-agent-research-system" target="_blank" rel="noopener">How we built our multi-agent research system</a><span class="src">Jeremy Hadfield 等 · Anthropic · 2025-06-13</span><span class="why">编排者-工作者在生产中的样子；多 agent 约 15 倍 token 的代价，以及评测与上线经验。</span></li>
+  <li><span class="pill">选读</span><a href="https://cognition.com/blog/dont-build-multi-agents" target="_blank" rel="noopener">Don't Build Multi-Agents</a><span class="src">Walden Yan · Cognition · 2025-06-12</span><span class="why">反方观点：共享完整 trace，动作里隐含决策，冲突的决策带来坏结果。</span></li>
+  <li><span class="pill">选读</span><a href="https://cognition.com/blog/multi-agents-working" target="_blank" rel="noopener">Multi-Agents: What's Actually Working</a><span class="src">Cognition · 2026-04-22</span><span class="why">一年后的修正：并行写仍不行，"一个 agent 写、其他 agent 贡献智能"可行。</span></li>
+  <li><span class="pill">选读</span><a href="https://openai.github.io/openai-agents-python/" target="_blank" rel="noopener">OpenAI Agents SDK（Python）</a> · <a href="https://openai.github.io/openai-agents-js/" target="_blank" rel="noopener">TypeScript 版</a><span class="src">OpenAI · 官方文档</span><span class="why">Agent、Handoff、Guardrail、Session、Tracing 等原语，看一个"原语少但够用"的框架怎么设计。</span></li>
+  <li><span class="pill">选读</span><a href="https://openai.com/index/the-next-evolution-of-the-agents-sdk/" target="_blank" rel="noopener">The next evolution of the Agents SDK</a><span class="src">OpenAI · 2026-04-15</span><span class="why">harness 与计算分离、原生沙箱、凭证不进沙箱、快照与恢复。</span></li>
+  <li><span class="pill">选读</span><a href="https://developers.openai.com/api/docs/guides/migrate-to-responses" target="_blank" rel="noopener">Migrate to the Responses API</a><span class="src">OpenAI · 官方文档</span><span class="why">带类型的 Items、会话状态承接方式、内置托管工具；Assistants API 已于 2026-08-26 下线。</span></li>
+  <li><span class="pill">选读</span><a href="https://www.anthropic.com/research/managed-agents" target="_blank" rel="noopener">Scaling Managed Agents: Decoupling the brain from the hands</a><span class="src">Lance Martin 等 · Anthropic Engineering · 2026-04-08</span><span class="why">harness（大脑）、sandbox（手）、session（持久事件日志）三者分离；harness 无状态、可按会话恢复。</span></li>
+</ul>
+</section>
+
+<section data-topic="上下文工程">
+<h3>上下文工程</h3>
+<ul class="res">
+  <li><span class="pill ok">必读</span><a href="https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents" target="_blank" rel="noopener">Effective context engineering for AI agents</a><span class="src">Prithvi Rajasekaran 等 · Anthropic · 2025-09-29</span><span class="why">context rot、系统提示的"高度"、即用即取、压缩、结构化笔记、子 agent。</span></li>
+  <li><span class="pill ok">必读</span><a href="https://manus.im/blog/Context-Engineering-for-AI-Agents-Lessons-from-Building-Manus" target="_blank" rel="noopener">Context Engineering for AI Agents: Lessons from Building Manus</a><span class="src">季逸超（Peak Ji）· Manus · 2025-07-18</span><span class="why">生产 agent 的实战经验：KV 缓存命中率、屏蔽而非删除工具、文件系统当上下文、复述 todo、保留错误。</span></li>
+  <li><span class="pill">选读</span><a href="https://www.anthropic.com/engineering/code-execution-with-mcp" target="_blank" rel="noopener">Code execution with MCP</a><span class="src">Adam Jones、Conor Kelly · Anthropic · 2025-11-04</span><span class="why">把工具呈现为代码 API，让中间结果不经过模型；示例中上下文从 150k token 降到 2k。</span></li>
+</ul>
+</section>
+
+<section data-topic="工具与结构化输出">
+<h3>工具与结构化输出</h3>
+<ul class="res">
+  <li><span class="pill ok">必读</span><a href="https://www.anthropic.com/engineering/writing-tools-for-agents" target="_blank" rel="noopener">Writing effective tools for agents — with agents</a><span class="src">Ken Aizawa · Anthropic · 2025-09-11</span><span class="why">围绕任务而不是 API 设计工具、命名空间、返回语义字段、可执行的错误信息、用评测迭代工具。</span></li>
+  <li><span class="pill">选读</span><a href="https://openai.com/index/introducing-structured-outputs-in-the-api/" target="_blank" rel="noopener">Introducing Structured Outputs in the API</a> · <a href="https://developers.openai.com/api/docs/guides/structured-outputs" target="_blank" rel="noopener">指南</a><span class="src">OpenAI · 2024-08-06</span><span class="why">strict 模式的 schema 限制（全部 required、additionalProperties:false、嵌套与数量上限）与拒答处理。</span></li>
+  <li><span class="pill">选读</span><a href="https://platform.claude.com/docs/en/build-with-claude/structured-outputs" target="_blank" rel="noopener">Structured outputs</a><span class="src">Anthropic · 官方文档 · 2025-11-13 起公测，现已稳定</span><span class="why">JSON 输出与 strict 工具两种用法、不支持的 schema 特性、可能偏离 schema 的情况。</span></li>
+</ul>
+</section>
+
+<section data-topic="记忆">
+<h3>记忆</h3>
+<ul class="res">
+  <li><span class="pill ok">必读</span><a href="https://arxiv.org/abs/2304.03442" target="_blank" rel="noopener">Generative Agents: Interactive Simulacra of Human Behavior</a><span class="src">Park 等 · Stanford / Google · 2023-04-07</span><span class="why">记忆流、近因/重要性/相关性检索打分、反思树——记忆系统设计的起点。</span></li>
+  <li><span class="pill ok">必读</span><a href="https://www.anthropic.com/research/components-of-agent-memory" target="_blank" rel="noopener">The components of agent memory</a><span class="src">Lance Martin · Anthropic · 2026-11-06</span><span class="why">记忆分层（记录、笔记、wiki、注入上下文）、离线整理、常驻记忆要小、只存从环境拿不回来的东西。</span></li>
+  <li><span class="pill">选读</span><a href="https://arxiv.org/abs/2310.08560" target="_blank" rel="noopener">MemGPT: Towards LLMs as Operating Systems</a><span class="src">Packer 等 · 2023-10-12</span><span class="why">借鉴操作系统分层内存的"虚拟上下文管理"。</span></li>
+  <li><span class="pill">选读</span><a href="https://docs.letta.com/guides/agents/architectures/memgpt" target="_blank" rel="noopener">Letta：MemGPT 架构文档</a><span class="src">Letta · 官方文档</span><span class="why">core / archival / recall 三层记忆及对应工具。</span></li>
+  <li><span class="pill">选读</span><a href="https://letta.com/blog/sleep-time-compute" target="_blank" rel="noopener">Sleep-time Compute</a> · <a href="https://arxiv.org/abs/2504.13171" target="_blank" rel="noopener">论文</a><span class="src">Letta · 博客 2025-04-21 · 论文 2025-04-17</span><span class="why">让后台 agent 在空闲时整理记忆、预先推理。</span></li>
+  <li><span class="pill">选读</span><a href="https://arxiv.org/abs/2504.19413" target="_blank" rel="noopener">Mem0: Building Production-Ready AI Agents with Scalable Long-Term Memory</a><span class="src">Chhikara 等 · 2025-04-28</span><span class="why">ADD / UPDATE / DELETE / NOOP 的记忆更新流程；用准确率换延迟和 token 的取舍数据。</span></li>
+  <li><span class="pill">选读</span><a href="https://arxiv.org/abs/2501.13956" target="_blank" rel="noopener">Zep: A Temporal Knowledge Graph Architecture for Agent Memory</a><span class="src">Rasmussen 等 · 2025-01</span><span class="why">时序知识图谱与双时间轴：矛盾时让旧事实失效而不是删除。</span></li>
+  <li><span class="pill">选读</span><a href="https://www.langchain.com/blog/langmem-sdk-launch" target="_blank" rel="noopener">LangMem SDK 发布博客</a><span class="src">LangChain · 2025-02-18</span><span class="why">语义、情景、程序性三类记忆的工程化划分。</span></li>
+  <li><span class="pill">选读</span><a href="https://claude.com/blog/context-management" target="_blank" rel="noopener">上下文管理与 memory tool 发布博客</a> · <a href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/memory-tool" target="_blank" rel="noopener">memory tool 文档</a><span class="src">Anthropic · 2025-09-29</span><span class="why">客户端执行的文件式记忆工具与 context editing；注意防路径穿越。</span></li>
+</ul>
+</section>
+
+<section data-topic="检索">
+<h3>检索</h3>
+<ul class="res">
+  <li><span class="pill ok">必读</span><a href="https://www.anthropic.com/news/contextual-retrieval" target="_blank" rel="noopener">Introducing Contextual Retrieval</a><span class="src">Anthropic · 2024-09-19</span><span class="why">给分块补背景再索引，检索失败率最多降 67%；知识库小于约 20 万 token 时可直接整体放进提示。</span></li>
+  <li><span class="pill">选读</span><a href="https://www.elastic.co/search-labs/blog/improving-information-retrieval-elastic-stack-hybrid" target="_blank" rel="noopener">Elastic：混合检索实验</a><span class="src">Elastic · 官方博客</span><span class="why">BM25 与向量的混合检索、RRF 与线性组合的对比实验。</span></li>
+</ul>
+</section>
+
+<section data-topic="人在回路">
+<h3>人在回路与主动式 agent</h3>
+<ul class="res">
+  <li><span class="pill ok">必读</span><a href="https://arxiv.org/abs/2506.12469" target="_blank" rel="noopener">Levels of Autonomy for AI Agents</a><span class="src">Feng、McDonald、Zhang · v2 2025-07-28</span><span class="why">按用户角色划分的五级自主度；自主度是设计选择，"如何避免走过场审批"是开放问题。</span></li>
+  <li><span class="pill">选读</span><a href="https://www.erichorvitz.com/chi99horvitz.pdf" target="_blank" rel="noopener">Principles of Mixed-Initiative User Interfaces</a><span class="src">Eric Horvitz · CHI 1999</span><span class="why">自动动作要权衡收益与打扰成本，拿不准时先简短澄清。</span></li>
+  <li><span class="pill">选读</span><a href="https://www.microsoft.com/en-us/research/publication/guidelines-for-human-ai-interaction/" target="_blank" rel="noopener">Guidelines for Human-AI Interaction</a><span class="src">Amershi 等 · Microsoft · CHI 2019</span><span class="why">18 条人机交互指南，如按情境把握时机、鼓励细粒度反馈、变更时通知用户。</span></li>
+  <li><span class="pill">选读</span><a href="https://arxiv.org/abs/2410.12361" target="_blank" rel="noopener">Proactive Agent: Shifting LLM Agents from Reactive Responses to Active Assistance</a><span class="src">Lu 等 · ICLR 2025</span><span class="why">以"用户是否接受"作为主动帮助成功与否的标准。</span></li>
+  <li><span class="pill">选读</span><a href="https://arxiv.org/abs/2602.01532" target="_blank" rel="noopener">PRISM</a><span class="src">2026-02-02</span><span class="why">用"需要帮助的概率"和"用户接受的概率"加误报/漏报成本决定是否打扰，显著降低误报。</span></li>
+  <li><span class="pill">选读</span><a href="https://openai.com/index/introducing-chatgpt-pulse/" target="_blank" rel="noopener">Introducing ChatGPT Pulse</a><span class="src">OpenAI · 2025-09-25</span><span class="why">主动式产品形态：夜间异步研究、次日推送卡片、用反馈调整。</span></li>
+</ul>
+</section>
+
+<section data-topic="安全">
+<h3>安全</h3>
+<ul class="res">
+  <li><span class="pill ok">必读</span><a href="https://simonwillison.net/2025/Jun/16/the-lethal-trifecta/" target="_blank" rel="noopener">The lethal trifecta for AI agents</a><span class="src">Simon Willison · 2025-06-16</span><span class="why">私有数据 + 不可信内容 + 对外通信；"拦住 95%"在应用安全里是不及格。</span></li>
+  <li><span class="pill ok">必读</span><a href="https://ai.meta.com/blog/practical-ai-agent-security/" target="_blank" rel="noopener">Agents Rule of Two（Meta AI 博客）</a><span class="src">Meta · 2025-10-31</span><span class="why">一个会话里三项能力最多占两项；邮件机器人的例子几乎就是"代发消息助理"。</span></li>
+  <li><span class="pill ok">必读</span><a href="https://arxiv.org/abs/2506.08837" target="_blank" rel="noopener">Design Patterns for Securing LLM Agents against Prompt Injections</a><span class="src">Beurer-Kellner 等 · 2025-06-10</span><span class="why">六种抗注入设计模式与 10 个案例。可配合 <a href="https://simonwillison.net/2025/Jun/13/prompt-injection-design-patterns/" target="_blank" rel="noopener">Simon Willison 的解读</a>（2025-06-13）。</span></li>
+  <li><span class="pill">选读</span><a href="https://arxiv.org/abs/2503.18813" target="_blank" rel="noopener">Defeating Prompt Injections by Design（CaMeL）</a><span class="src">Debenedetti 等 · Google DeepMind · 2025-03-24</span><span class="why">特权/隔离双模型 + 数据来源追踪的解释器，在不改模型的前提下给出可证明的保障。</span></li>
+  <li><span class="pill ok">必读</span><a href="https://genai.owasp.org/2025/12/09/owasp-top-10-for-agentic-applications-the-benchmark-for-agentic-security-in-the-age-of-autonomous-ai/" target="_blank" rel="noopener">OWASP Top 10 for Agentic Applications</a><span class="src">OWASP GenAI Security Project · 2025-12-09</span><span class="why">目标劫持、工具滥用、身份与权限滥用、记忆投毒、人机信任滥用等 10 类风险，做威胁建模的清单。</span></li>
+  <li><span class="pill">选读</span><a href="https://genai.owasp.org/llm-top-10/" target="_blank" rel="noopener">OWASP Top 10 for LLM Applications 2025</a><span class="src">OWASP GenAI Security Project</span><span class="why">提示注入、敏感信息泄露、过度代理、无界消耗等 LLM 应用的通用风险。</span></li>
+</ul>
+</section>
+
+<section data-topic="可靠执行">
+<h3>可靠执行与人工中断</h3>
+<ul class="res">
+  <li><span class="pill ok">必读</span><a href="https://microservices.io/patterns/data/transactional-outbox" target="_blank" rel="noopener">Pattern: Transactional outbox</a><span class="src">microservices.io</span><span class="why">状态与发送的一致性；至少一次投递意味着消费端必须幂等。</span></li>
+  <li><span class="pill ok">必读</span><a href="https://docs.stripe.com/api/idempotent_requests" target="_blank" rel="noopener">Idempotent requests</a><span class="src">Stripe · API 文档</span><span class="why">幂等键的标杆实现：重试返回首次响应，并标注是重放。</span></li>
+  <li><span class="pill">选读</span><a href="https://docs.langchain.com/oss/javascript/langgraph/interrupts" target="_blank" rel="noopener">LangGraph：Interrupts</a><span class="src">LangChain · 官方文档</span><span class="why">checkpointer 与 thread_id；恢复时整个节点重跑，中断前的副作用必须幂等。</span></li>
+  <li><span class="pill">选读</span><a href="https://openai.github.io/openai-agents-js/guides/human-in-the-loop/" target="_blank" rel="noopener">OpenAI Agents SDK（JS）：Human-in-the-loop</a><span class="src">OpenAI · 官方文档</span><span class="why">工具级 needsApproval、运行状态序列化与恢复；快照要放服务端并原子消费，防止重放。</span></li>
+  <li><span class="pill">选读</span><a href="https://temporal.io/blog/announcing-openai-agents-sdk-integration" target="_blank" rel="noopener">Temporal × OpenAI Agents SDK</a><span class="src">Temporal · 官方博客</span><span class="why">agent 循环跑在 Workflow 里、模型调用作为 Activity 的持久执行做法。</span></li>
+  <li><span class="pill">选读</span><a href="https://www.inngest.com/docs/ai-patterns/human-in-the-loop" target="_blank" rel="noopener">Inngest：Human in the loop</a><span class="src">Inngest · 官方文档</span><span class="why">waitForEvent 按审批 ID 等待、超时返回空，等待期间不占算力。</span></li>
+  <li><span class="pill">选读</span><a href="https://developers.cloudflare.com/workflows/examples/wait-for-event/" target="_blank" rel="noopener">Cloudflare Workflows：Wait for event</a><span class="src">Cloudflare · 官方文档</span><span class="why">另一种平台化的持久等待实现。</span></li>
+  <li><span class="pill">选读</span><a href="https://vercel.com/docs/workflows/concepts" target="_blank" rel="noopener">Vercel Workflow：Concepts</a><span class="src">Vercel · 官方文档</span><span class="why">用 workflow / step 指令把普通函数变成可暂停、可恢复的流程。</span></li>
+</ul>
+</section>
+
+<section data-topic="协议与生态">
+<h3>协议与生态</h3>
+<ul class="res">
+  <li><span class="pill ok">必读</span><a href="https://modelcontextprotocol.io/specification/2026-07-28/changelog" target="_blank" rel="noopener">MCP 规范 2026-07-28 变更日志</a><span class="src">Model Context Protocol · 2026-07-28 · <a href="https://modelcontextprotocol.io/specification/versioning" target="_blank" rel="noopener">版本说明</a></span><span class="why">当前版本：协议无状态化、server/discover、input_required、tasks 移为官方扩展、Roots/Sampling/Logging 废弃。</span></li>
+  <li><span class="pill">选读</span><a href="https://modelcontextprotocol.io/specification/2025-11-25/changelog" target="_blank" rel="noopener">MCP 2025-11-25 变更日志</a> · <a href="https://modelcontextprotocol.io/specification/2025-06-18/changelog" target="_blank" rel="noopener">2025-06-18 变更日志</a><span class="src">Model Context Protocol</span><span class="why">结构化工具输出与 elicitation（2025-06-18）、实验性 tasks 与授权改进（2025-11-25）的来龙去脉。</span></li>
+  <li><span class="pill">选读</span><a href="https://www.linuxfoundation.org/press/linux-foundation-announces-the-formation-of-the-agentic-ai-foundation" target="_blank" rel="noopener">Linux Foundation announces the Agentic AI Foundation</a><span class="src">Linux Foundation · 2025-12</span><span class="why">MCP、AGENTS.md 等项目的中立治理归属。</span></li>
+  <li><span class="pill ok">必读</span><a href="https://www.anthropic.com/engineering/equipping-agents-for-the-real-world-with-agent-skills" target="_blank" rel="noopener">Equipping agents for the real world with Agent Skills</a><span class="src">Barry Zhang、Keith Lazuka、Mahesh Murag · Anthropic · 2025-10-16</span><span class="why">SKILL.md 与三级渐进披露；已作为开放标准发布，见 <a href="https://agentskills.io" target="_blank" rel="noopener">agentskills.io</a>。</span></li>
+  <li><span class="pill">选读</span><a href="https://agents.md/" target="_blank" rel="noopener">AGENTS.md</a><span class="src">AAIF 托管</span><span class="why">"给 agent 看的 README"，嵌套放置、就近生效。</span></li>
+  <li><span class="pill">选读</span><a href="https://opensource.googleblog.com/2026/04/a-year-of-open-collaboration-celebrating-the-anniversary-of-a2a.html" target="_blank" rel="noopener">A year of open collaboration: celebrating the anniversary of A2A</a><span class="src">Google Open Source · 2026-04-16</span><span class="why">A2A 从发布到 v1.0（2026-03）的历程，以及它与 MCP 的分工。</span></li>
+</ul>
+</section>
+
+<section data-topic="长任务与编码 agent">
+<h3>长任务与编码 agent</h3>
+<ul class="res">
+  <li><span class="pill ok">必读</span><a href="https://www.anthropic.com/engineering/effective-harnesses-for-long-running-agents" target="_blank" rel="noopener">Effective harnesses for long-running agents</a><span class="src">Justin Young · Anthropic · 2025-11-26</span><span class="why">初始化 agent + 编码 agent、JSON 功能清单、进度文件、每次一个功能、用浏览器做端到端验证。</span></li>
+  <li><span class="pill">选读</span><a href="https://www.anthropic.com/research/harness-design-long-running-apps" target="_blank" rel="noopener">Harness design for long-running application development</a><span class="src">Prithvi Rajasekaran · Anthropic Engineering · 2026-03-24</span><span class="why">规划者、生成者、评估者三角色；模型变强后"拆掉不再承重的组件"。</span></li>
+  <li><span class="pill">选读</span><a href="https://code.claude.com/docs/en/agent-sdk/overview" target="_blank" rel="noopener">Claude Agent SDK 概览</a> · <a href="https://github.com/anthropics/claude-agent-sdk-typescript" target="_blank" rel="noopener">TypeScript 仓库</a><span class="src">Anthropic · 官方文档</span><span class="why">以库的形式使用编码 agent 的 harness：工具、hooks、子 agent、MCP、权限、会话。</span></li>
+  <li><span class="pill">选读</span><a href="https://code.claude.com/docs/en/headless" target="_blank" rel="noopener">Claude Code：Headless 模式</a><span class="src">Anthropic · 官方文档</span><span class="why">脚本化调用、JSON 输出、按 schema 输出结构化结果、续跑会话、权限参数。</span></li>
+  <li><span class="pill">选读</span><a href="https://code.claude.com/docs/en/hooks" target="_blank" rel="noopener">Claude Code：Hooks</a> · <a href="https://code.claude.com/docs/en/plugins-reference" target="_blank" rel="noopener">Plugins</a><span class="src">Anthropic · 官方文档</span><span class="why">生命周期事件、Stop hook 阻止停止与防死循环、退出码 2 才是阻断。</span></li>
+  <li><span class="pill">选读</span><a href="https://code.claude.com/docs/en/worktrees" target="_blank" rel="noopener">Claude Code：Worktrees</a> · <a href="https://code.claude.com/docs/en/agent-view" target="_blank" rel="noopener">Agent view</a><span class="src">Anthropic · 官方文档</span><span class="why">用 worktree 隔离并行会话、后台会话的管理方式。</span></li>
+  <li><span class="pill">选读</span><a href="https://learn.chatgpt.com/docs/non-interactive-mode" target="_blank" rel="noopener">Codex：非交互模式</a> · <a href="https://learn.chatgpt.com/docs/cloud" target="_blank" rel="noopener">Codex Cloud</a><span class="src">OpenAI · 官方文档</span><span class="why">只读沙箱默认、JSONL 事件流、按 schema 输出；云端任务的独立工作区与网络白名单。</span></li>
+</ul>
+</section>
+
+<section data-topic="评测">
+<h3>评测</h3>
+<ul class="res">
+  <li><span class="pill ok">必读</span><a href="https://www.anthropic.com/engineering/demystifying-evals-for-ai-agents" target="_blank" rel="noopener">Demystifying evals for AI agents</a><span class="src">Anthropic Engineering · 2026-01-09</span><span class="why">任务、试验、记录、结果；三类 grader；pass@k 与 pass^k；能力评测与回归评测。</span></li>
+  <li><span class="pill ok">必读</span><a href="https://hamel.dev/blog/posts/evals-faq/" target="_blank" rel="noopener">AI Evals FAQ</a><span class="src">Hamel Husain、Shreya Shankar · 2026-09-18</span><span class="why">错误分析先行、二元判定、每种失败模式一个判官并用 TPR/TNR 校准。</span></li>
+  <li><span class="pill">选读</span><a href="https://github.com/sierra-research/tau2-bench" target="_blank" rel="noopener">τ²-bench</a><span class="src">Sierra · τ-bench arXiv <a href="https://arxiv.org/abs/2406.12045" target="_blank" rel="noopener">2406.12045</a> · τ²-bench <a href="https://arxiv.org/abs/2506.07982" target="_blank" rel="noopener">2506.07982</a>（2025-06-09）</span><span class="why">pass^k 的出处；双控环境下 agent 表现明显下降。</span></li>
+</ul>
+</section>
+
+<section data-topic="可观测与成本">
+<h3>可观测与成本</h3>
+<ul class="res">
+  <li><span class="pill ok">必读</span><a href="https://platform.claude.com/docs/en/build-with-claude/prompt-caching" target="_blank" rel="noopener">Prompt caching</a><span class="src">Anthropic · 官方文档</span><span class="why">写入与读取的价格倍数、TTL、最小可缓存长度、断点、usage 字段。</span></li>
+  <li><span class="pill">选读</span><a href="https://developers.openai.com/api/docs/guides/prompt-caching" target="_blank" rel="noopener">Prompt caching</a><span class="src">OpenAI · 官方文档</span><span class="why">默认自动缓存、cached_tokens 字段、静态在前动态在后。</span></li>
+  <li><span class="pill">选读</span><a href="https://github.com/open-telemetry/semantic-conventions-genai" target="_blank" rel="noopener">OpenTelemetry GenAI semantic conventions</a><span class="src">OpenTelemetry · 仍为 Development 状态</span><span class="why">invoke_agent、execute_tool 等 span 与 gen_ai.* 属性；消息正文属于需显式开启的敏感属性。</span></li>
+</ul>
+</section>
+
+<section data-topic="书与路线图">
+<h3>书与路线图</h3>
+<ul class="res">
+  <li><span class="pill ok">必读</span><a href="https://github.com/chiphuyen/aie-book/blob/main/ToC.md" target="_blank" rel="noopener">AI Engineering（目录）</a><span class="src">Chip Huyen · O'Reilly · 2025-01</span><span class="why">10 章覆盖基础模型、评估方法、提示工程与防注入、RAG 与 agent、微调、数据集、推理优化、架构与用户反馈（护栏、路由、网关、缓存、监控）。是本课程之外最系统的一本书。</span></li>
+  <li><span class="pill">选读</span><a href="https://roadmap.sh/ai-agents" target="_blank" rel="noopener">AI Agents Roadmap</a><span class="src">roadmap.sh</span><span class="why">一张图看全 agent 工程师的知识点：LLM 基础、agent 循环、工具与 MCP、记忆、harness、评测、可观测、安全。可以和附录里的能力自测对照。</span></li>
+</ul>
+</section>
+
+<section data-topic="基准">
+<h3>基准</h3>
+<ul class="res">
+  <li><span class="pill">选读</span><a href="https://arxiv.org/abs/2410.10813" target="_blank" rel="noopener">LongMemEval</a><span class="src">Wu 等 · ICLR 2025</span><span class="why">500 题考长期记忆五种能力：信息抽取、跨会话推理、时间推理、知识更新、拒答。</span></li>
+  <li><span class="pill">选读</span><a href="https://arxiv.org/abs/2605.12493" target="_blank" rel="noopener">LongMemEval-V2</a><span class="src">2026-05-12</span><span class="why">面向 web agent；把轨迹当文件让 agent 自己查证，明显优于 RAG。</span></li>
+  <li><span class="pill">选读</span><a href="https://aclanthology.org/2024.acl-long.747" target="_blank" rel="noopener">LoCoMo</a><span class="src">Maharana 等 · ACL 2024</span><span class="why">超长多会话对话记忆，题型含单跳、多跳、时间、常识、对抗。</span></li>
+  <li><span class="pill">选读</span><a href="https://arxiv.org/abs/2602.22769" target="_blank" rel="noopener">AMA-Bench</a><span class="src">2026-02-26</span><span class="why">指出基于相似度的有损检索会丢失因果信息。</span></li>
+  <li><span class="pill">选读</span><a href="https://arxiv.org/abs/2507.05257" target="_blank" rel="noopener">MemoryAgentBench</a><span class="src">ICLR 2026</span><span class="why">考察记忆 agent 的四种能力，包括选择性遗忘。</span></li>
+  <li><span class="pill">选读</span><a href="https://openai.com/index/introducing-swe-bench-verified/" target="_blank" rel="noopener">SWE-bench Verified</a><span class="src">OpenAI · 2024-08</span><span class="why">从 1,699 条中人工筛出 500 条的编码基准。</span></li>
+  <li><span class="pill ok">必读</span><a href="https://openai.com/index/why-we-no-longer-evaluate-swe-bench-verified/" target="_blank" rel="noopener">Why we no longer evaluate SWE-bench Verified</a><span class="src">OpenAI · 2026-02-23</span><span class="why">基准污染与题目缺陷的真实案例：审计的难题中 59.4% 有缺陷、前沿模型能复述参考解。读完你会对任何榜单分数多一分警惕。</span></li>
+</ul>
+</section>
+
+<div class="takeaways"><b>读资料的方法</b>
+<ul>
+  <li>先读必读，再按手上的问题挑选读；不要按列表从头读到尾。</li>
+  <li>官方工程博客里的数字是在特定任务、特定模型上测的，借鉴方法，不要照搬数字。</li>
+  <li>厂商给出的基准分数不是独立测评；看基准时同时看它有没有被污染、有没有被停用。</li>
+</ul></div>
+</article>
+
+<script>
+window.addEventListener('DOMContentLoaded', () => {
+  const sections = [...document.querySelectorAll('section[data-topic]')];
+  const box = document.getElementById('r-filter');
+  const set = (topic) => {
+    sections.forEach((s) => s.classList.toggle('off', topic !== null && s.dataset.topic !== topic));
+    [...box.children].forEach((b) => b.classList.toggle('on', (b.dataset.topic || null) === topic));
+  };
+  const all = Course.el('button', { class: 'btn small on', type: 'button', text: '全部' });
+  all.addEventListener('click', () => set(null));
+  box.append(all);
+  sections.forEach((s) => {
+    const n = s.querySelectorAll('.res > li').length;
+    const b = Course.el('button', { class: 'btn small', type: 'button', text: `${s.dataset.topic}（${n}）`, 'data-topic': s.dataset.topic });
+    b.addEventListener('click', () => set(s.dataset.topic));
+    box.append(b);
+  });
+});
+</script>
+</body>
+</html>

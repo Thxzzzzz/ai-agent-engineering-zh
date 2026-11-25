@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>跟练项目总览 · AI Agent 工程</title>
+<meta name="description" content="一个持续生长的 TypeScript 仓库 agent-lab：从 100 行的最小 agent 一路长成带审批、记忆、MCP、评测和编码驾驭器的系统。环境准备、离线测试思路与作品集建议。">
+<link rel="stylesheet" href="assets/css/course.css">
+<script src="assets/js/manifest.js"></script>
+<script defer src="assets/js/course.js"></script>
+<style>
+  .roadmap a:hover .box { stroke-width: 3; }
+  .roadmap a { cursor: pointer; }
+</style>
+</head>
+<body data-page="projects">
+<article id="content">
+<div class="eyebrow">跟练项目 · 总览</div>
+<h1>跟练项目：一个仓库，长成一套 agent 系统</h1>
+<p class="lead">读懂原理只是一半。七个跟练项目都在同一个仓库 <code>agent-lab</code> 里累积：后一个项目直接复用前一个的代码，最后长成一个有审批、有记忆、接得上 MCP、有评测、能驾驭编码 agent 的系统——这就是你作品集里的第一件作品。</p>
+<div class="meta"><span>总计约 18 小时</span><span>语言：TypeScript（Bun 运行时）</span><span>全部可以离线跑测试</span></div>
+
+<div class="goals"><b>这一页帮你</b>
+<ul>
+  <li>看清七个项目的先后关系，以及各自练的是哪几章的能力</li>
+  <li>把开发环境搭好：Bun、TypeScript、zod、目录约定、环境变量</li>
+  <li>理解"假模型"测试法：为什么 agent 代码也能写确定性的单元测试</li>
+  <li>知道怎么接一个真实模型，以及怎么把这个仓库包装成作品</li>
+</ul></div>
+
+<h2>1 · 成长路线</h2>
+<p>点任意一个节点进入项目页。箭头方向就是推荐顺序：每个项目都假设你已经做完了它前面的那个。</p>
+<figure>
+<div class="diagram roadmap">
+<svg viewBox="0 0 760 270" width="760" role="img" aria-label="agent-lab 成长路线图">
+  <a href="p1-minimal-loop.html"><rect class="box a" x="20" y="30" width="160" height="72" rx="10"/><text class="tb" x="100" y="60" text-anchor="middle">P1 最小 Agent</text><text class="ts" x="100" y="82" text-anchor="middle">循环 · 工具 · 适配器</text></a>
+  <a href="p2-triage.html"><rect class="box a" x="200" y="30" width="160" height="72" rx="10"/><text class="tb" x="280" y="60" text-anchor="middle">P2 分诊管线</text><text class="ts" x="280" y="82" text-anchor="middle">结构化输出 · 路由</text></a>
+  <a href="p3-approval.html"><rect class="box r" x="380" y="30" width="160" height="72" rx="10"/><text class="tb" x="460" y="60" text-anchor="middle">P3 审批流</text><text class="ts" x="460" y="82" text-anchor="middle">状态机 · 幂等 · 策略</text></a>
+  <a href="p4-memory.html"><rect class="box v" x="560" y="30" width="180" height="72" rx="10"/><text class="tb" x="650" y="60" text-anchor="middle">P4 长期记忆</text><text class="ts" x="650" y="82" text-anchor="middle">抽取 · 失效 · 检索打分</text></a>
+  <a href="p5-mcp.html"><rect class="box b" x="560" y="170" width="180" height="72" rx="10"/><text class="tb" x="650" y="200" text-anchor="middle">P5 MCP</text><text class="ts" x="650" y="222" text-anchor="middle">写 server · 接 client</text></a>
+  <a href="p6-evals.html"><rect class="box g" x="380" y="170" width="160" height="72" rx="10"/><text class="tb" x="460" y="200" text-anchor="middle">P6 评测</text><text class="ts" x="460" y="222" text-anchor="middle">数据集 · 判官 · 回归</text></a>
+  <a href="p7-coding-harness.html"><rect class="box b" x="200" y="170" width="160" height="72" rx="10"/><text class="tb" x="280" y="200" text-anchor="middle">P7 编码驾驭器</text><text class="ts" x="280" y="222" text-anchor="middle">长任务 · 验收闸门</text></a>
+  <a href="capstone.html"><rect class="box w" x="20" y="170" width="160" height="72" rx="10"/><text class="tb" x="100" y="200" text-anchor="middle">毕业项目</text><text class="ts" x="100" y="222" text-anchor="middle">选题 · 作品集</text></a>
+  <path class="line" d="M180 66 H200" marker-end="url(#arr)"/>
+  <path class="line" d="M360 66 H380" marker-end="url(#arr)"/>
+  <path class="line" d="M540 66 H560" marker-end="url(#arr)"/>
+  <path class="line" d="M650 102 V170" marker-end="url(#arr)"/>
+  <path class="line" d="M560 206 H540" marker-end="url(#arr)"/>
+  <path class="line" d="M380 206 H360" marker-end="url(#arr)"/>
+  <path class="line" d="M200 206 H180" marker-end="url(#arr)"/>
+  <text class="ts" x="20" y="18">单进程、单会话</text>
+  <text class="ts" x="740" y="262" text-anchor="end">跨进程、跨会话、可度量</text>
+</svg>
+</div>
+<figcaption>蓝色是"基础能力"，红色是"可控与可靠"，紫色是"记忆"，橙色是"协作与规模"，绿色是"度量"，黄色是毕业项目。</figcaption>
+</figure>
+
+<div class="callout tip"><b>完整参考实现在仓库的 <code>agent-lab/</code> 目录</b>
+<p>P1–P7 的全部代码都已在一个统一的 <code>agent-lab</code> 项目里实现并跑通：<code>bun test</code> 全部通过、<code>tsc</code> 严格模式无错，各项目页里的代码就是从它直接生成的。建议先按页面自己写，卡住了再对照；运行方式见 <a href="agent-lab/README.md">agent-lab/README.md</a>。</p></div>
+
+<h2>2 · 七个项目一览</h2>
+<div class="cards">
+  <a class="card" href="p1-minimal-loop.html"><span class="tag">约 1.5 小时</span><b>P1 · 100 行写一个 Agent</b><small>练：agent loop、工具定义与参数校验、错误回灌、路径穿越防护、厂商适配器。<br>产出：能查时间、算数、读笔记的命令行 agent。</small></a>
+  <a class="card" href="p2-triage.html"><span class="tag">约 2 小时</span><b>P2 · 工单分诊管线</b><small>练：结构化输出、校验重试、路由、提示词版本、去抖合批。<br>产出：把一批工单变成"摘要 + 待办 + 追问 + 回复草稿"。</small></a>
+  <a class="card" href="p3-approval.html"><span class="tag">约 2.5 小时</span><b>P3 · 提案与审批</b><small>练：状态机、事务性发件箱、幂等键、崩溃恢复、自动化策略与护栏。<br>产出：一个"不批准就不发、批准两次也只发一条"的 CLI。</small></a>
+  <a class="card" href="p4-memory.html"><span class="tag">约 2.5 小时</span><b>P4 · 长期记忆模块</b><small>练：事实抽取、ADD/UPDATE/INVALIDATE、双时间轴、检索打分、反思提案。<br>产出：会记事、会改口、不乱记的记忆库。</small></a>
+  <a class="card" href="p5-mcp.html"><span class="tag">约 2 小时</span><b>P5 · MCP Server 与接入</b><small>练：MCP 协议、工具暴露、客户端接入、权限边界。<br>产出：把自己的能力做成任何 agent 都能用的 MCP 服务。</small></a>
+  <a class="card" href="p6-evals.html"><span class="tag">约 2.5 小时</span><b>P6 · 评测流水线</b><small>练：错误分析、评测集、代码判官与模型判官、pass^k、回归。<br>产出：改一行提示词就能看到分数变化的评测命令。</small></a>
+  <a class="card" href="p7-coding-harness.html"><span class="tag">约 2.5 小时</span><b>P7 · 编码 Agent 驾驭器</b><small>练：长任务驾驭、进度文件、验收闸门、隔离工作区。<br>产出：把任务派给编码 agent 并自动验收的驾驭器。</small></a>
+  <a class="card" href="capstone.html"><span class="tag">自定</span><b>毕业项目</b><small>把上面的部件组合成一个完整产品，配齐文档、评测数字与演示。</small></a>
+</div>
+
+<h3>每部分理论对应哪个项目</h3>
+<table>
+<tr><th>理论章节</th><th>学完后做</th><th>这个项目把理论落到了哪里</th></tr>
+<tr><td>第 1–4 章 · 基础</td><td>P1、P2</td><td>循环与停止条件、工具 schema、结构化输出的校验重试</td></tr>
+<tr><td>第 5–7 章 · 上下文与记忆</td><td>P4</td><td>上下文里放什么、记忆的写入策略、检索打分</td></tr>
+<tr><td>第 8–10 章 · 可控与可靠</td><td>P3</td><td>L4 审批者模式、提示注入的护栏、状态机与幂等</td></tr>
+<tr><td>第 11 章 · 协议</td><td>P5</td><td>MCP 的工具、资源与传输</td></tr>
+<tr><td>第 12 章 · 长任务</td><td>P7</td><td>进度文件、功能清单、验收闸门</td></tr>
+<tr><td>第 13–14 章 · 评测与可观测</td><td>P6</td><td>trace 变成用例、判官对齐、回归门槛</td></tr>
+</table>
+
+<h2>3 · 环境准备</h2>
+<ol class="steps">
+<li><strong>安装 Bun 1.3 以上。</strong>Bun 同时是运行时、包管理器和测试框架，TypeScript 不用编译就能直接跑。安装方式见 <a href="https://bun.sh" target="_blank" rel="noopener">bun.sh</a>，装好后 <code>bun --version</code> 确认版本。</li>
+<li><strong>初始化仓库。</strong>
+<pre data-title="终端"><code class="lang-bash">
+mkdir agent-lab &amp;&amp; cd agent-lab &amp;&amp; git init
+bun init -y                     # 生成 package.json、tsconfig.json；删掉它附带的 index.ts 和示例文件
+bun add zod                     # 参数与输出的 schema（zod 4，自带 z.toJSONSchema）
+bun add -d typescript @types/bun
+mkdir -p src/models src/triage src/store src/memory tests notes prompts
+</code></pre></li>
+<li><strong>用下面的 <code>tsconfig.json</code> 和 <code>package.json</code> 覆盖生成的版本。</strong>严格模式全开，<code>noUncheckedIndexedAccess</code> 会逼你处理"数组里可能没有这一项"——模型返回的数据尤其需要。
+<pre data-title="tsconfig.json"><code class="lang-json">
+{
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "Preserve",
+    "moduleResolution": "bundler",
+    "lib": ["ESNext"],
+    "types": ["bun"],
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "verbatimModuleSyntax": true,
+    "allowImportingTsExtensions": true,
+    "noEmit": true,
+    "skipLibCheck": true
+  },
+  "include": ["src", "tests", "mcp-server", "evals", "harness"]
+}
+</code></pre>
+<pre data-title="package.json"><code class="lang-json">
+{
+  "name": "agent-lab",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit -p .",
+    "agent": "bun run src/main.ts",
+    "triage": "bun run src/triage/main.ts",
+    "cli": "bun run src/cli.ts"
+  },
+  "dependencies": {
+    "zod": "^4"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^7.0.2"
+  }
+}
+</code></pre>
+<div class="callout warn"><b>TypeScript 6 起 <code>types</code> 默认为空</b><p>不写 <code>"types": ["bun"]</code> 的话，<code>tsc</code> 会报找不到 <code>process</code>、<code>fetch</code>、<code>AbortSignal</code>。Bun 运行时不看类型，所以 <code>bun test</code> 能过、<code>bun run typecheck</code> 却挂——两个都要跑。</p></div></li>
+<li><strong>准备环境变量。</strong>复制成 <code>.env</code> 并填好（Bun 会自动读取项目根目录的 <code>.env</code>）。<code>.env</code> 加进 <code>.gitignore</code>，密钥永远不进仓库。
+<pre data-title=".env.example"><code class="lang-bash">
+# 任意 OpenAI Chat Completions 兼容端点：云厂商、模型网关，或本机推理服务
+LLM_BASE_URL=https://api.example.com/v1
+LLM_API_KEY=替换成你的密钥
+LLM_MODEL=替换成模型名
+</code></pre></li>
+<li><strong>（可选）装一个格式化与检查工具</strong>，比如 Biome：<code>bun add -d @biomejs/biome</code>。不装也不影响任何项目。</li>
+</ol>
+
+<h3>目录约定</h3>
+<p>所有项目共用一套目录。现在不用一次建全，做到哪个项目就加哪个目录：</p>
+<pre data-title="agent-lab/"><code>
+src/
+  model.ts                 # 模型契约：Message、ToolCall、Model 接口（P1）
+  fake-model.ts            # 测试用的假模型（P1）
+  models/openai-compatible.ts  # 真实模型适配器（P1）
+  loop.ts  tools.ts  main.ts   # agent 循环、工具、命令行入口（P1）
+  structured.ts            # 结构化输出：单一工具 + 校验重试（P2）
+  triage/                  # 分诊管线（P2）
+  store/db.ts  store/migrations.ts  # SQLite 与迁移（P3 起）
+  proposals.ts  outbox.ts  policy.ts  cli.ts  # 提案、发件箱、策略、命令行（P3）
+  memory/                  # 长期记忆（P4）
+  mcp-client.ts            # 接入 MCP 服务器（P5）
+mcp-server/                # 自己写的 MCP 服务器（P5）
+evals/                     # 评测集与评测运行器（P6）
+harness/                   # 编码 agent 驾驭器（P7）
+prompts/                   # 提示词文件，第一行写版本号（P2 起）
+tests/                     # bun test
+</code></pre>
+
+<h2>4 · 假模型：让 agent 代码也能写确定性测试</h2>
+<p>agent 难测，是因为模型的输出不确定。但仔细看，你写的代码里<strong>真正需要测的几乎都不是模型</strong>，而是"模型回了某种东西之后，你的代码怎么处理"：工具名写错了怎么办、参数不合法怎么办、拒答怎么办、输出被截断怎么办、同一个动作批准两次怎么办。</p>
+<p>所以每个项目都依赖同一个 <code>FakeModel</code>：你给它一份"剧本"（第 1 次回什么、第 2 次回什么），它按顺序演出，同时把每次收到的请求存下来，测试再断言"模型第二轮看到了什么"。</p>
+
+<figure class="anim" data-dim>
+<div class="diagram">
+<svg viewBox="0 0 720 220" width="720" role="img" aria-label="假模型测试的工作方式">
+  <g data-k="test"><rect class="box g" x="20" y="80" width="140" height="64" rx="10"/><text class="tb" x="90" y="108" text-anchor="middle">测试用例</text><text class="ts" x="90" y="128" text-anchor="middle">写好剧本与断言</text></g>
+  <g data-k="code"><rect class="box a" x="290" y="80" width="140" height="64" rx="10"/><text class="tb" x="360" y="108" text-anchor="middle">被测代码</text><text class="ts" x="360" y="128" text-anchor="middle">runAgent 等</text></g>
+  <g data-k="fake"><rect class="box w" x="560" y="80" width="140" height="64" rx="10"/><text class="tb" x="630" y="108" text-anchor="middle">FakeModel</text><text class="ts" x="630" y="128" text-anchor="middle">按剧本逐条回复</text></g>
+  <g data-k="rec"><rect class="box m" x="560" y="170" width="140" height="40" rx="8"/><text class="t" x="630" y="195" text-anchor="middle">requests[]</text></g>
+  <g data-k="e1"><path class="line" d="M160 112 H290" marker-end="url(#arr)"/><text class="ts" x="225" y="104" text-anchor="middle">调用</text></g>
+  <g data-k="e2"><path class="line a" d="M430 104 H560" marker-end="url(#arr-a)"/><text class="ts" x="495" y="96" text-anchor="middle">generate()</text></g>
+  <g data-k="e3"><path class="line b" d="M560 124 H430" marker-end="url(#arr-b)"/><text class="ts" x="495" y="142" text-anchor="middle">剧本里的下一条</text></g>
+  <g data-k="e4"><path class="line" d="M630 144 V170" marker-end="url(#arr)"/></g>
+  <g data-k="e5"><path class="line g dash" d="M560 190 C300 190 120 190 90 144" marker-end="url(#arr-g)"/><text class="ts" x="330" y="210" text-anchor="middle">断言：第 2 轮的上下文里有工具结果吗？</text></g>
+</svg>
+</div>
+<ol class="anim-steps">
+  <li data-show="test" data-hl="test">测试先写好剧本：第 1 次回一个工具调用，第 2 次回一句最终答复。剧本可以故意"使坏"：写错工具名、给不合法的参数、直接拒答。</li>
+  <li data-show="code e1" data-hl="code e1">测试调用被测代码，比如 <code>runAgent(目标, { model: fake, … })</code>。被测代码不知道对面是假的。</li>
+  <li data-show="fake e2" data-hl="e2 fake">被测代码按正常流程请求模型。</li>
+  <li data-show="e3" data-hl="e3 code">FakeModel 返回剧本里的下一条。剧本用完了还被调用，它会直接报错——"多调了一次模型"本身就是 bug。</li>
+  <li data-show="rec e4" data-hl="e4 rec">每次收到的请求都存一份快照（注意要复制，否则之后的 push 会改到它）。</li>
+  <li data-show="e5" data-hl="e5 test">测试断言请求快照与最终结果。这样测的是<strong>你的代码</strong>，完全确定，毫秒级跑完，不花一分钱。</li>
+</ol>
+<figcaption>真实模型只在两个地方出现：手动实跑，以及 P6 的评测。单元测试一律用假模型。</figcaption>
+</figure>
+
+<div class="callout tip"><b>写测试前先说清它拦什么</b>
+<p>每个项目页的测试都写明了"这个测试拦的是哪种 bug"。好测试的标准是：一个合理的错误改动会让它失败，而一次正确的重构不会。说不出它拦什么的测试，就不写。</p></div>
+
+<h2>5 · 接一个真实模型</h2>
+<p>P1 会写一个 OpenAI Chat Completions 兼容接口的适配器。这套接口是事实上的通用格式：大多数模型厂商、模型网关，以及 Ollama、vLLM、LM Studio 这类本机推理服务都提供它。你有三种选择：</p>
+<table>
+<tr><th>方式</th><th>LLM_BASE_URL 示例</th><th>适合</th></tr>
+<tr><td>云端模型服务</td><td>厂商文档给出的 <code>…/v1</code> 地址</td><td>效果最好，按量付费；评测时用它</td></tr>
+<tr><td>模型网关</td><td>网关地址</td><td>一个密钥切换多家模型，方便做模型对比</td></tr>
+<tr><td>本机推理服务</td><td>Ollama 默认 <code>http://localhost:11434/v1</code></td><td>零成本、数据不出本机；小模型的工具调用能力弱，适合调通流程</td></tr>
+</table>
+<div class="callout warn"><b>选一个支持工具调用的模型</b><p>P1 起所有项目都依赖工具调用（function calling）。本机小模型要确认它的模型卡写明支持 tools；不支持的模型会直接无视工具定义，你会看到 agent 一轮就"答完"了。</p></div>
+
+<h2>6 · 把仓库变成作品</h2>
+<p>面试官和合作者看作品时，最想知道的是三件事：你解决了什么问题、你的设计取舍、你怎么证明它是好的。做完七个项目后，按下面的清单整理 <code>agent-lab</code>：</p>
+<ul class="checklist" data-key="portfolio">
+  <li><strong>README 第一屏</strong>：一句话说清它做什么、一张架构图、一段 30 秒的演示录屏或 GIF。</li>
+  <li><strong>设计决策记录（ADR）</strong>：每个关键取舍一页，写"背景、选项、决定、后果"。比如"为什么用单一工具做结构化输出""为什么自动更新用失效而不是删除"。</li>
+  <li><strong>评测数字</strong>：P6 的评测集规模、通过率、pass^k，以及一次"改了什么、分数怎么变"的前后对比。</li>
+  <li><strong>失败故事</strong>：挑两三个你在 trace 里抓到的真实失败，写清现象、根因和修法。这比任何功能列表都更能说明你的水平。</li>
+  <li><strong>安全与边界</strong>：写明哪些动作需要审批、哪些数据不出本机、提示注入怎么防。</li>
+  <li><strong>一键复现</strong>：<code>bun install && bun test</code> 不需要任何密钥就能全绿。</li>
+</ul>
+
+<div class="quiz" data-answer="3">
+<p class="q">P3 里有一个测试叫"同一条提案批准两次，只发出一条"。下面哪种改动会让它失败——也就是说，它拦的是哪种 bug？</p>
+<ol>
+  <li>把提案 id 从 8 位改成 12 位</li>
+  <li>把发件箱的表名从 outbox 改成 send_queue（同时改好所有引用）</li>
+  <li>批准时不再检查提案当前状态，并且幂等键改成每次随机生成</li>
+  <li>把发送失败的退避时间从 200ms 改成 500ms</li>
+</ol>
+<div class="explain">前两个和最后一个是正确的重构或调参，测试不该、也不会失败。第三个让第二次批准又写进一条新的发件记录，对方会收到两条——这正是这个测试要拦的 bug。它锁的是<strong>行为</strong>（"只发一条"），不是实现细节（表名、id 长度）。</div>
+</div>
+
+<div class="takeaways"><b>本页要点</b>
+<ul>
+  <li>七个项目在同一个仓库里逐步生长，后一个复用前一个。</li>
+  <li>单元测试一律用 FakeModel：测的是你的代码如何应对模型的各种输出，确定且免费。</li>
+  <li>真实模型走 OpenAI 兼容接口，云端、网关、本机推理服务都能接；选支持工具调用的模型。</li>
+  <li>作品集的核心是：问题、取舍、证据（评测数字与失败故事）。</li>
+</ul></div>
+
+<h2>参考资料</h2>
+<ul class="refs">
+  <li><a href="https://bun.sh/docs" target="_blank" rel="noopener">Bun 文档</a> <span class="src">运行时、包管理、bun test、bun:sqlite</span></li>
+  <li><a href="https://zod.dev/json-schema" target="_blank" rel="noopener">Zod：JSON Schema</a> <span class="src">z.toJSONSchema 的用法与选项</span></li>
+  <li><a href="https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create" target="_blank" rel="noopener">Chat Completions API 参考</a> <span class="src">OpenAI · tools、tool_calls 与 finish_reason 的字段定义</span></li>
+  <li><a href="https://www.anthropic.com/engineering/building-effective-agents" target="_blank" rel="noopener">Building effective agents</a> <span class="src">Anthropic · 2024-12-19 · "先直接用 API 写"的建议</span></li>
+</ul>
+</article>
+</body>
+</html>

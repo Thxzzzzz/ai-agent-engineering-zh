@@ -1,0 +1,499 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>评测 · AI Agent 工程</title>
+<meta name="description" content="用错误分析、二元判定、对齐过的 LLM judge、pass^k 与回放，把 agent 的质量从“感觉不错”变成可度量、可回归的数字。">
+<link rel="stylesheet" href="assets/css/course.css">
+<script src="assets/js/manifest.js"></script>
+<script defer src="assets/js/course.js"></script>
+<style>
+  .judge-table td, .judge-table th { font-size: 13.5px; }
+  .judge-table button { min-width: 64px; }
+  .cm { display: grid; grid-template-columns: auto 1fr 1fr; gap: 4px; max-width: 360px; font-size: 13px; text-align: center; }
+  .cm div { padding: 8px 6px; border-radius: 6px; background: var(--surface-2); }
+  .cm .h { background: transparent; color: var(--muted); }
+  .cm .ok { background: var(--ok-soft); }
+  .cm .bad { background: var(--danger-soft); }
+  .cm b { display: block; font-size: 18px; }
+  .judge-stats { display: flex; flex-wrap: wrap; gap: 14px 24px; }
+  .judge-stats .stat { min-width: 150px; }
+</style>
+</head>
+<body data-page="ch13">
+<article id="content">
+<div class="eyebrow">第四部分 · 协作与规模 · 第 13 章</div>
+<h1>评测：让 Agent 可度量地变好</h1>
+<p class="lead">没有评测的 agent 开发，就是在调一个看不见指针的仪表：改一句提示词，这个例子好了，另外三个悄悄坏了，你却要等用户投诉才知道。这一章讲怎么把"感觉不错"变成可以回归、可以进 CI 的数字。</p>
+<div class="meta"><span>约 45 分钟</span><span>前置：第 3、4 章</span><span>含 1 个分步动画、2 个交互、4 道小测</span></div>
+
+<div class="goals"><b>学完你能</b>
+<ul>
+  <li>说清 task、trial、transcript、outcome、grader 这几个术语，并据此设计评测</li>
+  <li>用错误分析（open coding → axial coding）从真实 trace 里找出失败模式</li>
+  <li>写出二元判定的 LLM judge，并用 TPR / TNR 和人工标注对齐</li>
+  <li>区分 pass@k 与 pass^k，知道面向用户的 agent 应该看哪个</li>
+  <li>搭一个最小评测运行器，接进 CI，做能力评测和回归评测</li>
+</ul></div>
+
+<h2>1 · 为什么 agent 必须有评测</h2>
+<p>传统软件的测试建立在"同样的输入得到同样的输出"之上。agent 打破了这个前提，至少有三个原因：</p>
+<ul>
+  <li><strong>非确定性</strong>：同一个任务跑三次，可能走出三条不同的轨迹。一次通过说明不了什么。</li>
+  <li><strong>长尾</strong>：demo 里的十个例子都对，线上第一千条消息里总会冒出一种你没想到的写法——带附件的、半句话的、两件事混在一起的。</li>
+  <li><strong>改动的副作用不可见</strong>：提示词是一个整体，你为修 A 加的一句话，会改变模型在 B、C、D 上的行为。没有回归集，你根本看不到"按下葫芦浮起瓢"。</li>
+</ul>
+<p>Hamel Husain 和 Shreya Shankar 在他们的 AI Evals FAQ（2026-09）里提到，他们大约把 <strong>60–80% 的开发时间</strong>花在评测相关的工作上。这不是夸张：对 agent 而言，"写功能"往往只是改几行提示词，真正的工程量在于<em>知道这几行改得对不对</em>。</p>
+
+<div class="callout warn"><b>反模式：靠"感觉"迭代</b>
+<p>手动试五个例子、觉得"好像好一点了"就上线。这样迭代的系统通常会在几周后陷入一种状态：谁也不敢再改提示词，因为没人知道会坏掉什么。评测集是让你<strong>敢改</strong>的东西。</p></div>
+
+<h2>2 · 术语：先把名字叫对</h2>
+<p>Anthropic 在《Demystifying evals for AI agents》（2026-01-09）里给出了一套清晰的术语，本章沿用：</p>
+<table>
+<tr><th>术语</th><th>含义</th><th>例子</th></tr>
+<tr><td><strong>task</strong>（任务）</td><td>一个评测用例：输入、初始环境、成功标准</td><td>"把下周三的周会挪到周四并通知参会人"，日历里有一个 6 人的周会</td></tr>
+<tr><td><strong>trial</strong>（试验）</td><td>对同一个 task 的一次完整运行；因为非确定性，一个 task 要跑多次</td><td>同一任务跑 5 次</td></tr>
+<tr><td><strong>transcript</strong>（记录）</td><td>一次 trial 的完整轨迹：每轮的上下文、模型输出、工具调用和结果</td><td>3 轮模型调用、3 次工具调用的完整日志</td></tr>
+<tr><td><strong>outcome</strong>（结果）</td><td>trial 结束时环境的最终状态</td><td>日历里周会在周四，6 位参会人各收到一封通知</td></tr>
+<tr><td><strong>grader</strong>（评分器）</td><td>判断 outcome（或 transcript）是否合格的程序或人</td><td>查日历 API 确认时间；检查发件记录覆盖全部参会人</td></tr>
+</table>
+
+<h3>三类 grader 的取舍</h3>
+<table>
+<tr><th>类型</th><th>优点</th><th>缺点</th><th>适合判什么</th></tr>
+<tr><td>代码 grader</td><td>快、便宜、可复现</td><td>脆弱：只能判能写成规则的东西，规则写死容易误杀合理的变体</td><td>状态是否正确、格式是否合法、工具是否被调用、参数是否在范围内</td></tr>
+<tr><td>模型 grader（LLM judge）</td><td>灵活，能判语气、完整性、是否答非所问</td><td>本身不确定，<strong>必须用人工标注校准</strong>后才可信</td><td>回复是否礼貌得体、摘要是否遗漏要点、是否做了不该做的承诺</td></tr>
+<tr><td>人工</td><td>金标准</td><td>贵、慢、难规模化</td><td>建立标注集、校准 judge、抽检</td></tr>
+</table>
+<p>原则是：<strong>能用代码判的就用代码判</strong>。LLM judge 是为那些"必须要人的判断"准备的，而且它只是人工判断的一个廉价近似——近似得好不好，要用数字证明（第 5 节）。</p>
+
+<div class="callout tip"><b>评结果，不评路径</b>
+<p>Anthropic 的建议之一：优先判 outcome，而不是要求 agent 走某条固定路径。模型可能用一种你没想到的、同样正确的方式完成任务；按路径打分会把这些合理的变体判成失败，还会诱导你把系统调成"按你的想象做事"。路径只在它本身就是要求时才判（例如"发送前必须先征求审批"）。</p></div>
+
+<h2>3 · 第一步永远是错误分析</h2>
+<p>很多人做评测的第一步是"选一个指标"。Hamel 和 Shreya 的方法反过来：<strong>先看数据，再定指标</strong>。你不知道系统会怎么失败，就不知道该测什么；通用指标（如 ROUGE、"有用性 1–5 分"）测的往往不是你的系统真正的问题。</p>
+
+<ol class="steps">
+  <li><strong>收集真实 trace</strong>：线上运行记录，或者在还没上线时用接近真实分布的输入跑一批。</li>
+  <li><strong>Open coding（开放编码）</strong>：逐条读，对每条有问题的 trace 写一句自由笔记，描述你看到的<em>第一个</em>出错点。不要预设分类，像写读书笔记一样写："把'周五前'理解成了本周五，其实对方说的是下周五"。</li>
+  <li><strong>Axial coding（轴向编码）</strong>：把笔记归类，合并同类，得到一个失败分类表，例如"时间理解错误""遗漏参会人""做了无权做的承诺""答非所问"，并统计每类的频次。</li>
+  <li><strong>读到饱和</strong>：至少亲自看 30 条；持续看，直到新读的 trace 不再产生新的失败类别（理论饱和），通常建议 100 条以上。</li>
+  <li><strong>按频次和严重程度排序</strong>，决定先修什么、先为哪几类失败建自动化 grader。</li>
+</ol>
+
+<div class="callout note"><b>谁来定标准？</b>
+<p>"这条回复算不算合格"往往有争议。Hamel 和 Shreya 的建议是指定一位<strong>"仁慈独裁者"</strong>（benevolent dictator）——最懂这个领域的人，由他最终裁定标准，而不是让一个委员会投票。标准不统一，后面所有的标注和 judge 都没有意义。</p></div>
+
+<div class="quiz" data-answer="3">
+<p class="q">你刚做完一个会议纪要整理 agent，准备建评测。按本节的方法，第一件事应该是？</p>
+<ol>
+  <li>选定 ROUGE 作为主指标，和人写的纪要比对</li>
+  <li>写一个"纪要质量 1–5 分"的 LLM judge 先跑起来</li>
+  <li>拿 30 条以上真实运行结果逐条读，记下每条的第一个出错点，再归类</li>
+  <li>先找 1000 条数据，量大才有统计意义</li>
+</ol>
+<div class="explain">不先做错误分析，你就不知道这个 agent 实际上怎么失败，指标和 judge 都可能测错东西。量也不是先决条件：读 30–100 条、读到不再出现新的失败类型，比盲目堆数据有用得多。</div>
+</div>
+
+<h2>4 · 写出好的评测任务</h2>
+<p>有了失败分类，就可以把它们变成 task。Anthropic 的文章给了几条非常实用的经验：</p>
+<ul>
+  <li><strong>从小处起步</strong>：从真实失败里收集 <strong>20–50 个</strong>简单任务就够开始了。不必等凑齐几百个。</li>
+  <li><strong>无歧义</strong>：每个任务附参考解，标准是"两位领域专家看了会给出同样的判断"。专家都会争论的任务，不适合当自动化评测。</li>
+  <li><strong>正反例都要有</strong>：只测"该做的做了"，会把 agent 调成什么都做；还要测"不该做的没做"（不该回复的消息没回、无权承诺的没承诺）。</li>
+  <li><strong>每次 trial 从干净环境开始</strong>：上一次 trial 留下的日历事件、文件、记忆，会污染下一次的结果。</li>
+  <li><strong>一定要读 transcript</strong>：分数只告诉你"多少失败了"，transcript 才告诉你"为什么"。</li>
+  <li><strong>多次 trial 都接近 0%，先怀疑任务本身</strong>：通常是任务描述有歧义、环境没准备好、或者 grader 写错了，而不是 agent 无能。</li>
+</ul>
+
+<div class="callout deep"><b>案例：grader 的 bug 比模型的 bug 更隐蔽</b>
+<p>Anthropic 在同一篇文章里举过一个例子：修掉评分程序里的 bug 之后，某个模型在 CORE-Bench 上的成绩从 <strong>42% 升到了 95%</strong>。评测本身也是代码，也会有 bug；分数异常低的时候，先读几条被判失败的 transcript，确认它们真的失败了。</p></div>
+
+<h3>能力评测与回归评测</h3>
+<table>
+<tr><th></th><th>能力评测（capability）</th><th>回归评测（regression）</th></tr>
+<tr><td>目的</td><td>衡量系统还不会做什么，指引改进方向</td><td>保证已经会的不被改坏</td></tr>
+<tr><td>预期通过率</td><td>一开始就应该偏低</td><td>应该接近 100%</td></tr>
+<tr><td>什么时候跑</td><td>迭代某个能力时</td><td>每次改提示词、换模型、改工具时，进 CI</td></tr>
+<tr><td>流转</td><td colspan="2">能力评测里的任务通过率稳定升上来之后，<strong>"毕业"</strong>转入回归集，此后一直守着</td></tr>
+</table>
+
+<h2>5 · LLM judge：二元判定，并且要对齐</h2>
+<p>需要判语气、完整性、分寸这类东西时，就要用 LLM judge。三条纪律：</p>
+<ol>
+  <li><strong>二元 pass/fail，不用 1–5 分。</strong>"3 分和 4 分的区别是什么"谁也说不清，打分会漂移；二元判定逼你把标准写清楚，结果也能直接算准确率。</li>
+  <li><strong>一个失败模式一个 judge。</strong>不要写一个"整体质量"judge，而是"是否做了无权的承诺""是否遗漏了参会人"各一个。每个 judge 的提示词聚焦一件事，才判得准，也才知道该修哪里。</li>
+  <li><strong>用人工标注校准。</strong>每个 judge 准备 100–200 条人工标注，切成 train / dev / test：train 里挑例子放进 judge 提示词，dev 上迭代 judge，最后在 test 上报告一次。衡量指标是 <strong>TPR</strong>（人工判通过的，judge 也判通过的比例）和 <strong>TNR</strong>（人工判失败的，judge 也判失败的比例）。</li>
+</ol>
+<p>Anthropic 还建议给 judge 一个 <strong>"Unknown"</strong> 选项：信息不足以判断时，宁可说不知道，也不要被迫瞎猜。Unknown 的样本交给人看。</p>
+
+<div class="widget" id="judge">
+<div class="w-title">练习：一个 judge 到底准不准？</div>
+<p style="margin-top:0;font-size:14px">下面是 10 条工单回复，"人工"列是领域专家的判定。点"judge"列的按钮可以翻转 judge 的判定，模拟你在调 judge 提示词。观察混淆矩阵和 TPR / TNR 怎么变——尤其注意：<strong>准确率 70% 时，judge 放过了几条真失败？</strong></p>
+<div class="table-wrap"><table class="judge-table"><thead><tr><th>#</th><th>agent 的回复（摘要）</th><th>人工</th><th>judge</th></tr></thead><tbody data-rows></tbody></table></div>
+<div class="w-row" style="align-items:start">
+  <div class="cm" data-cm></div>
+  <div class="judge-stats" data-stats></div>
+</div>
+<div class="w-out" data-verdict></div>
+</div>
+
+<pre data-title="一个二元 judge 的提示词骨架（只判一个失败模式）"><code>
+你在检查一条工单回复是否做出了"无权做出的承诺"。
+
+定义：
+- 失败：回复对修复时间、退款金额、功能上线日期做了确定承诺，
+  而上下文里没有任何负责人确认过这一点。
+- 通过：没有承诺，或承诺有明确依据（引用了负责人的确认）。
+
+先写出判断理由（指出回复中的哪句话，依据上下文哪条信息），
+再给结论：pass / fail / unknown。
+信息不足以判断时选 unknown，不要猜。
+
+例子（来自 train 集）：
+[通过] ……
+[失败] ……
+</code></pre>
+
+<div class="quiz" data-answer="2">
+<p class="q">一个 judge 在 dev 集上和人工的总体一致率是 90%。但 dev 集里 90% 的样本人工判为通过，judge 把所有样本都判为通过。这个 judge 的问题是？</p>
+<ol>
+  <li>没问题，90% 已经很高</li>
+  <li>TNR 为 0：它一条失败都抓不住，等于没有 judge</li>
+  <li>TPR 太低，误杀了太多好回复</li>
+  <li>样本太少，无法判断</li>
+</ol>
+<div class="explain">总体一致率会被类别比例掩盖。人工判失败的 10% 里，judge 一条都没判出来，TNR = 0。这正是要分别看 TPR 和 TNR 的原因：你建 judge 的目的恰恰是抓那 10% 的失败。</div>
+</div>
+
+<h2>6 · pass@k 与 pass^k：用户体验到的是哪个？</h2>
+<p>因为非确定性，每个 task 要跑 k 次 trial。汇总时有两种完全不同的问法：</p>
+<ul>
+  <li><strong>pass@k</strong>：k 次里<em>至少一次</em>成功的概率。k 越大越高。适合"可以多试几次、挑一个最好的"的场景，比如生成候选代码再跑测试筛选。</li>
+  <li><strong>pass^k</strong>（读作 pass-hat-k）：k 次<em>全部</em>成功的概率。k 越大越低。它来自 Sierra 的 τ-bench，衡量的是<strong>一致性</strong>：用户每次来都要它做对。</li>
+</ul>
+<p>面向用户的 agent 应该看 pass^k。如果单次成功率是 p，且各次独立，那么 pass@k = 1 − (1 − p)<sup>k</sup>，pass^k = p<sup>k</sup>。Anthropic 的文章给过一个直观数字：<strong>单次 75%，pass^3 只有约 42%</strong>。τ-bench 论文里，当时的强模型在零售场景单次成功率不到 50%，pass^8 低于 25%。</p>
+
+<div class="widget" id="passk">
+<div class="w-title">pass@k / pass^k 计算器</div>
+<div class="w-row">
+  <label>单次成功率 p：<b data-pv></b><input type="range" min="0.05" max="0.99" step="0.01" value="0.75" data-p></label>
+  <label>试验次数 k：<b data-kv></b><input type="range" min="1" max="20" step="1" value="3" data-k></label>
+</div>
+<svg data-chart viewBox="0 0 640 260" width="640" style="width:100%;height:auto;display:block" role="img" aria-label="pass@k 与 pass^k 随 k 变化的曲线"></svg>
+<div class="w-out" data-out></div>
+</div>
+
+<div class="callout note"><b>"独立"是个近似</b>
+<p>上面的公式假设每次 trial 独立。现实中失败往往是相关的：某个任务描述本身有歧义，模型就会稳定地做错。所以实际评测里直接数——k 次 trial 全部通过的任务占多少——而不是用单次成功率去推算。</p></div>
+
+<div class="quiz" data-answer="1">
+<p class="q">你在做一个替用户安排日程的 agent，用户每天会用它十几次。评测报告里你最应该盯的数字是？</p>
+<ol>
+  <li>pass^k：每次都要做对，一致性才是用户体验</li>
+  <li>pass@k：只要多试几次有一次对就行</li>
+  <li>单次 trial 的最高分</li>
+  <li>平均 token 用量</li>
+</ol>
+<div class="explain">用户不会帮你"多试几次挑最好的"。他每次使用都是一次独立的 trial，任何一次做错都会损害信任——这正是 pass^k 衡量的东西。</div>
+</div>
+
+<h2>7 · 评测飞轮：评测数据从哪里来</h2>
+<p>评测集不是一次性建好的，它应该和线上系统一起转起来。点"下一步"看这个飞轮：</p>
+
+<figure class="anim" data-dim>
+<div class="diagram">
+<svg viewBox="0 0 760 370" width="760" role="img" aria-label="评测飞轮分步动画">
+  <g data-k="center">
+    <circle cx="380" cy="190" r="62" class="box m"/>
+    <text class="tb" x="380" y="186" text-anchor="middle">评测飞轮</text>
+    <text class="ts" x="380" y="206" text-anchor="middle">每转一圈，评测集更大</text>
+  </g>
+  <g data-k="n1"><rect class="box a" x="305" y="25" width="150" height="50" rx="10"/><text class="tb" x="380" y="47" text-anchor="middle">线上 trace</text><text class="ts" x="380" y="65" text-anchor="middle">真实输入与轨迹</text></g>
+  <g data-k="n2"><rect class="box v" x="532" y="78" width="150" height="50" rx="10"/><text class="tb" x="607" y="100" text-anchor="middle">错误分析</text><text class="ts" x="607" y="118" text-anchor="middle">逐条读、写笔记</text></g>
+  <g data-k="n3"><rect class="box v" x="588" y="196" width="150" height="50" rx="10"/><text class="tb" x="663" y="218" text-anchor="middle">失败分类</text><text class="ts" x="663" y="236" text-anchor="middle">归类、计频次</text></g>
+  <g data-k="n4"><rect class="box b" x="431" y="291" width="150" height="50" rx="10"/><text class="tb" x="506" y="313" text-anchor="middle">建任务与 grader</text><text class="ts" x="506" y="331" text-anchor="middle">20–50 个起步</text></g>
+  <g data-k="n5"><rect class="box w" x="179" y="291" width="150" height="50" rx="10"/><text class="tb" x="254" y="313" text-anchor="middle">改系统</text><text class="ts" x="254" y="331" text-anchor="middle">改方法，不改答案</text></g>
+  <g data-k="n6"><rect class="box g" x="22" y="196" width="150" height="50" rx="10"/><text class="tb" x="97" y="218" text-anchor="middle">回归评测</text><text class="ts" x="97" y="236" text-anchor="middle">CI 里跑 pass^k</text></g>
+  <g data-k="n7"><rect class="box g" x="78" y="78" width="150" height="50" rx="10"/><text class="tb" x="153" y="100" text-anchor="middle">上线与监控</text><text class="ts" x="153" y="118" text-anchor="middle">收集用户信号</text></g>
+  <g data-k="e1"><path class="line" d="M455 55 L530 88" marker-end="url(#arr)"/></g>
+  <g data-k="e2"><path class="line" d="M625 128 L650 194" marker-end="url(#arr)"/></g>
+  <g data-k="e3"><path class="line" d="M630 246 L565 290" marker-end="url(#arr)"/></g>
+  <g data-k="e4"><path class="line" d="M431 316 L331 316" marker-end="url(#arr)"/></g>
+  <g data-k="e5"><path class="line" d="M200 291 L132 247" marker-end="url(#arr)"/></g>
+  <g data-k="e6"><path class="line" d="M105 196 L130 130" marker-end="url(#arr)"/></g>
+  <g data-k="e7"><path class="line" d="M228 90 L303 55" marker-end="url(#arr)"/></g>
+</svg>
+</div>
+<ol class="anim-steps">
+  <li data-show="center n1" data-hl="n1">起点是<strong>线上 trace</strong>：每次模型调用的完整输入输出、工具调用和结果都记录下来（第 14 章讲怎么记）。真实分布永远比你想象的更奇怪。</li>
+  <li data-show="e1 n2" data-hl="e1 n2">定期抽一批做<strong>错误分析</strong>。优先抽"有信号"的：用户改写了草稿、拒绝了提案、撤回了自动动作、自己亲手处理了 agent 本该处理的事——这些都是免费的人工标注。</li>
+  <li data-show="e2 n3" data-hl="e2 n3">把笔记归成<strong>失败分类</strong>并计频次。新出现的类别说明系统遇到了新情况；某类频次上涨说明最近的改动带来了回归。</li>
+  <li data-show="e3 n4" data-hl="e3 n4">为高频、高严重度的类别<strong>建任务和 grader</strong>：把那条真实 trace 的输入固定下来成为 task，能用代码判就写代码 grader，否则写一个对齐过的 judge。</li>
+  <li data-show="e4 n5" data-hl="e4 n5"><strong>改系统</strong>：改提示词、改上下文组装、改工具描述、加护栏。关键是找到失败的<em>原因</em>并修方法，而不是把这条用例的正确答案写进提示词（第 8 节）。</li>
+  <li data-show="e5 n6" data-hl="e5 n6">跑<strong>回归评测</strong>：新任务和全部老任务一起跑，每个任务多次 trial，看 pass^k。修好一类、没弄坏别的，才算改完。</li>
+  <li data-show="e6 n7" data-hl="e6 n7"><strong>上线并监控</strong>：上线后继续收集信号。用户的改写率、拒绝率、撤回率本身就是线上指标。</li>
+  <li data-show="e7" data-hl="e7 center">回到起点。每转一圈，评测集都多了一批来自真实失败的任务——这就是评测集"长大"的方式，而不是坐下来凭空编用例。</li>
+</ol>
+<figcaption>图 13-1 评测飞轮。评测集的增长来自线上真实失败，而不是想象。</figcaption>
+</figure>
+
+<h3>线上信号：免费的标注</h3>
+<p>一个经人审批的 agent，用户的每次操作都是一条标注：</p>
+<table>
+<tr><th>用户行为</th><th>含义</th><th>怎么用</th></tr>
+<tr><td>原样批准</td><td>草稿可用</td><td>正例；也是"放权"的依据（第 8 章）</td></tr>
+<tr><td>改写后批准</td><td>方向对，细节不对</td><td>改前 / 改后是最好的风格样本；差异本身值得做错误分析</td></tr>
+<tr><td>拒绝</td><td>不该这么做，或根本不该做</td><td>重点分析；如果用户写了原因，那是直接的规则</td></tr>
+<tr><td>亲自处理</td><td>agent 没跟上，或用户不信任它</td><td>最强的样本：用户实际是怎么做的</td></tr>
+<tr><td>撤回自动动作</td><td>自动化做错了事</td><td>最高严重度；应触发降级与回归任务</td></tr>
+</table>
+
+<h2>8 · 回放与盲测：改方法，不改答案</h2>
+<p>修一个失败时，最省事的做法是把这条用例的正确答案或特征写进提示词（"如果有人问月报导出，就回答……"）。这样这条用例马上就过了，但你修的是<strong>答案</strong>，不是<strong>方法</strong>：换一种问法、换一个场景，同样的错误照犯，提示词还越来越像一张补丁清单。</p>
+<p>正确的流程是：</p>
+<ol class="steps">
+  <li><strong>回放（replay）</strong>：拿 trace 里记录的完整输入重新跑一次，确认能复现。复现不了就先别改——可能是偶发，也可能是上下文里有你没注意到的东西。</li>
+  <li><strong>找原因</strong>：读 transcript，问"模型为什么会这样判断"。是上下文缺了关键信息？工具描述有歧义？规则之间互相矛盾？还是任务本身超出了能力边界？</li>
+  <li><strong>改方法</strong>：修正原因——补上缺失的上下文、澄清规则、改工具描述——而不是写死结论。</li>
+  <li><strong>盲测</strong>：用<em>没有参与修改</em>的同类用例验证。只在你盯着修的那条用例上通过，说明你可能只是过拟合了它。这也是要留出 test 集、并且只在最后看一次的原因。</li>
+</ol>
+<p>当用户确实给了一个"正确答案"（比如"这个群里的事归 A 组管"），它应该作为<strong>数据</strong>进入记忆或配置，和提示词里的方法分开存放。方法管"怎么判断"，数据管"这个具体事实是什么"。</p>
+
+<div class="quiz" data-answer="4">
+<p class="q">agent 把"下周五前"理解成了本周五，导致承诺的时间错了。下面哪个修法最好？</p>
+<ol>
+  <li>在提示词里加一句"'下周五前'指的是下一个周五"</li>
+  <li>把这条消息和正确答案作为 few-shot 例子塞进提示词</li>
+  <li>换一个更强的模型</li>
+  <li>先回放确认复现，再检查上下文里有没有给出"今天是星期几"；补上当前日期与时区，用一批没见过的相对时间表达盲测</li>
+</ol>
+<div class="explain">模型无法知道"今天"是哪天，除非你告诉它——这是方法层面的缺陷。选项 1、2 只修了这一种说法；选项 3 也无法凭空知道日期。补上缺失的上下文后，用一批没参与修改的表达（"月底前""下下周一"……）盲测，才能确认方法真的修好了。</div>
+</div>
+
+<h2>9 · 一个最小评测运行器</h2>
+<p>下面是一个不依赖任何评测框架的运行器骨架：每个任务跑 k 次、每次干净环境、代码 grader 和 judge 组合、保存 transcript、汇总 pass@k 与 pass^k。真实项目里可以换成现成工具，但自己写一遍能让你清楚每个数字是怎么来的。跟练项目 P6 会把它扩展成完整的评测流水线。</p>
+
+<pre data-title="eval/runner.ts"><code class="lang-ts">
+type Verdict = 'pass' | 'fail' | 'unknown';
+
+interface Outcome {
+  finalText: string;
+  toolCalls: { name: string; args: Record&lt;string, unknown&gt; }[];
+  env: Env;                      // trial 结束时的环境，用于判结果而不是判路径
+}
+
+interface Grader {
+  name: string;
+  grade(task: Task, out: Outcome): Promise&lt;{ verdict: Verdict; reason: string }&gt;;
+}
+
+interface Task {
+  id: string;
+  input: string;
+  setup: () =&gt; Promise&lt;Env&gt;;     // 每次 trial 构造一个干净环境
+  graders: Grader[];
+  suite: 'capability' | 'regression';
+}
+
+// 代码 grader：直接查最终状态
+const allAttendeesNotified: Grader = {
+  name: 'all-attendees-notified',
+  async grade(_task, out) {
+    const expected = new Set(out.env.calendar.event('weekly').attendees);
+    const sent = new Set(out.env.mailbox.sent().flatMap((m) =&gt; m.to));
+    const missing = [...expected].filter((a) =&gt; !sent.has(a));
+    return missing.length === 0
+      ? { verdict: 'pass', reason: '全部参会人已通知' }
+      : { verdict: 'fail', reason: `漏通知：${missing.join('、')}` };
+  },
+};
+
+// 模型 grader：只判一个失败模式，必须先和人工标注对齐过
+function judge(name: string, prompt: string): Grader {
+  return {
+    name,
+    async grade(task, out) {
+      const r = await completeStructured(judgeModel, {
+        schema: JudgeSchema,          // { reason: string; verdict: 'pass'|'fail'|'unknown' }
+        system: prompt,
+        user: `任务：${task.input}\n\n最终回复：${out.finalText}`,
+      });
+      return { verdict: r.value.verdict, reason: r.value.reason };
+    },
+  };
+}
+
+export async function runEval(tasks: Task[], agent: Agent, k = 3) {
+  const rows = [];
+  for (const task of tasks) {
+    const trials: Verdict[] = [];
+    for (let i = 0; i &lt; k; i++) {
+      const env = await task.setup();                 // 干净环境，避免 trial 之间互相污染
+      const out = await agent.run(task.input, env);
+      const results = await Promise.all(task.graders.map((g) =&gt; g.grade(task, out)));
+      const verdict: Verdict = results.some((r) =&gt; r.verdict === 'fail')
+        ? 'fail'
+        : results.some((r) =&gt; r.verdict === 'unknown') ? 'unknown' : 'pass';
+      trials.push(verdict);
+      await Bun.write(`eval/runs/${task.id}.${i}.json`, JSON.stringify({ out, results }, null, 2));
+    }
+    rows.push({ id: task.id, suite: task.suite, trials });
+  }
+  const passAtK = rows.filter((r) =&gt; r.trials.includes('pass')).length / rows.length;
+  const passHatK = rows.filter((r) =&gt; r.trials.every((t) =&gt; t === 'pass')).length / rows.length;
+  const unknown = rows.filter((r) =&gt; r.trials.includes('unknown')).map((r) =&gt; r.id); // 交给人看
+  return { rows, passAtK, passHatK, unknown };
+}
+</code></pre>
+
+<div class="callout tip"><b>把运行器接进 CI</b>
+<p>回归集进 CI：每次改提示词、改工具、换模型都跑，pass^k 低于阈值就挂掉。能力集不进门禁（它本来就该偏低），但每次跑完把分数记下来画趋势。LLM 相关的单元测试用"假模型"（脚本化的固定回复）跑，不打真实接口；真实模型的评测作为单独的、可手动或定时触发的任务。</p></div>
+
+<h2>10 · 基准会过期，也会被污染</h2>
+<p>公开基准是比较模型的通用语言，但要清醒地看它们：</p>
+<ul>
+  <li><strong>SWE-bench Verified</strong> 是 OpenAI 在 2024-08 从 1,699 条样本里人工筛出的 500 条编码任务，一度是编码 agent 的标杆。2026-02-23，OpenAI 宣布不再报告这项成绩：他们审计了 138 道难题，<strong>59.4%</strong> 存在测试或描述缺陷，而且前沿模型都能复述参考解——题目已经进了训练数据。OpenAI 转而推荐 SWE-bench Pro。</li>
+  <li><strong>τ²-bench</strong>（2025-06）引入了"双控"环境：用户也会用工具改变共享状态。agent 从单方操作切换到和用户共同操作时，表现明显下降——这更接近真实的办公协作。它的仓库现在建议改用 τ³-bench，且不同版本之间的分数不可比。</li>
+</ul>
+<p>结论：<strong>公开基准用来选模型，自己的评测集用来做产品</strong>。你的用户、你的工具、你的失败模式，任何公开基准都覆盖不到。</p>
+
+<h2>11 · 评测集的工程化</h2>
+<table>
+<tr><th>问题</th><th>做法</th></tr>
+<tr><td>评测集会变</td><td>和代码放在同一个仓库、同样走评审；每个任务记录来源（哪条 trace、哪次失败）和加入日期</td></tr>
+<tr><td>分数不可比</td><td>报告里写清评测集版本、模型、提示词版本、k 值；改了 grader 要重跑基线</td></tr>
+<tr><td>含真实数据</td><td>来自线上的输入可能含个人信息，脱敏或只在本地保存，不要原样提交到公开仓库</td></tr>
+<tr><td>跑得太慢太贵</td><td>回归集保持精简（每类失败几条代表性任务）；大集合定时跑，不进每次提交的门禁</td></tr>
+<tr><td>judge 自己会漂</td><td>换 judge 模型或改 judge 提示词后，在 test 集上重新报告 TPR / TNR</td></tr>
+</table>
+
+<div class="callout case review-link"><b>真实项目复盘</b>
+<p>本章的知识点在两个真实项目里缺位时发生了什么，以及"有这块知识"时会怎么设计：</p>
+<ul><li><a href="review.html#f-N4">N4</a> · niuma 87 个改提示词的提交里只有 17 个附了回放数据，一天内四次修同一个判断</li><li><a href="review.html#f-N5">N5</a> · niuma 的结清判断一致率没达标就上线</li><li><a href="review.html#f-D13">D13</a> · devtask 482 个单测里没有一条测 agent 的决策</li></ul></div>
+
+<div class="takeaways"><b>本章要点</b>
+<ul>
+  <li>agent 的非确定性和长尾让评测成为必需品；没有回归集，就没人敢改提示词。</li>
+  <li>先做错误分析（open coding → axial coding，读到饱和），再决定测什么。</li>
+  <li>能用代码判就用代码判；LLM judge 用二元判定、一个失败模式一个，并用 TPR / TNR 和人工标注对齐。</li>
+  <li>面向用户的 agent 看 pass^k（一致性），不是 pass@k；单次 75% 时 pass^3 约 42%。</li>
+  <li>评测数据来自线上真实失败与用户信号，形成飞轮；修失败要改方法，并用盲测验证。</li>
+  <li>公开基准会失效和被污染：用来选模型，不用来代替你自己的评测集。</li>
+</ul></div>
+
+<h2>参考资料</h2>
+<ul class="refs">
+  <li><a href="https://www.anthropic.com/engineering/demystifying-evals-for-ai-agents" target="_blank" rel="noopener">Demystifying evals for AI agents</a> <span class="src">Anthropic · 2026-01-09 · 术语、grader 类型、pass^k、任务设计</span></li>
+  <li><a href="https://hamel.dev/blog/posts/evals-faq/" target="_blank" rel="noopener">AI Evals FAQ</a> <span class="src">Hamel Husain &amp; Shreya Shankar · 2026-09 · 错误分析、二元 judge、对齐</span></li>
+  <li><a href="https://github.com/sierra-research/tau2-bench" target="_blank" rel="noopener">τ²-bench</a> <span class="src">Sierra · pass^k 与双控环境</span></li>
+  <li><a href="https://openai.com/index/introducing-swe-bench-verified/" target="_blank" rel="noopener">Introducing SWE-bench Verified</a> <span class="src">OpenAI · 2024-08</span></li>
+  <li><a href="https://openai.com/index/why-we-no-longer-evaluate-swe-bench-verified/" target="_blank" rel="noopener">Why we no longer evaluate SWE-bench Verified</a> <span class="src">OpenAI · 2026-02-23 · 基准缺陷与污染</span></li>
+  <li><a href="https://www.anthropic.com/engineering/multi-agent-research-system" target="_blank" rel="noopener">How we built our multi-agent research system</a> <span class="src">Anthropic · 2025-06-13 · 从约 20 条查询起步的评测实践</span></li>
+</ul>
+</article>
+
+<script>
+window.addEventListener('DOMContentLoaded', () => {
+  // ---------- judge 对齐练习 ----------
+  const samples = [
+    ['用户问月报导出能否按部门筛选，回复给出了正确的菜单路径', 'pass', 'pass'],
+    ['回复承诺"今天下班前修好"，但没有任何负责人确认过', 'fail', 'pass'],
+    ['会议改期通知漏掉了一位参会人', 'fail', 'fail'],
+    ['语气有些生硬，但信息完整正确', 'pass', 'fail'],
+    ['客户要发票，回复引用了错误的订单号', 'fail', 'fail'],
+    ['简短确认"已收到，周三前给你"，与日程一致', 'pass', 'pass'],
+    ['回复里贴了内部系统链接，外部客户打不开', 'fail', 'pass'],
+    ['把英文邮件准确翻译，并保留了原有格式', 'pass', 'pass'],
+    ['回答的是另一张工单的问题（串单）', 'fail', 'fail'],
+    ['引用了知识库里正确的条目并附上链接', 'pass', 'pass'],
+  ];
+  const box = document.getElementById('judge');
+  const tbody = box.querySelector('[data-rows]');
+  const label = (v) => (v === 'pass' ? '<span class="pill ok">通过</span>' : '<span class="pill danger">失败</span>');
+  const render = () => {
+    tbody.innerHTML = '';
+    samples.forEach((s, i) => {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td>${i + 1}</td><td>${s[0]}</td><td>${label(s[1])}</td><td></td>`;
+      const btn = Course.el('button', { class: 'btn small', type: 'button', text: s[2] === 'pass' ? '通过' : '失败' });
+      btn.style.color = s[2] === 'pass' ? 'var(--ok)' : 'var(--danger)';
+      btn.addEventListener('click', () => { s[2] = s[2] === 'pass' ? 'fail' : 'pass'; render(); });
+      tr.lastChild.append(btn);
+      tbody.append(tr);
+    });
+    let tp = 0, fn = 0, tn = 0, fp = 0;
+    for (const [, h, j] of samples) {
+      if (h === 'pass' && j === 'pass') tp++;
+      else if (h === 'pass') fn++;
+      else if (j === 'fail') tn++;
+      else fp++;
+    }
+    const tpr = tp / (tp + fn || 1), tnr = tn / (tn + fp || 1), acc = (tp + tn) / samples.length;
+    box.querySelector('[data-cm]').innerHTML = `
+      <div class="h"></div><div class="h">judge：通过</div><div class="h">judge：失败</div>
+      <div class="h">人工：通过</div><div class="ok"><b>${tp}</b>TP</div><div class="bad"><b>${fn}</b>FN 误杀</div>
+      <div class="h">人工：失败</div><div class="bad"><b>${fp}</b>FP 放过</div><div class="ok"><b>${tn}</b>TN</div>`;
+    box.querySelector('[data-stats]').innerHTML = `
+      <div class="stat"><b>${(acc * 100).toFixed(0)}%</b><small>总体一致率</small></div>
+      <div class="stat"><b>${(tpr * 100).toFixed(0)}%</b><small>TPR = TP / (TP + FN)</small></div>
+      <div class="stat"><b>${(tnr * 100).toFixed(0)}%</b><small>TNR = TN / (TN + FP)</small></div>`;
+    const v = box.querySelector('[data-verdict]');
+    if (fp > 0) v.innerHTML = `judge 放过了 <b>${fp}</b> 条真正的失败（FP）。这些失败会被当成"通过"计入分数，让你误以为系统没问题——对于 judge 来说，这通常比误杀更危险。看看是哪几条，想想 judge 提示词缺了什么定义。`;
+    else if (fn > 0) v.innerHTML = `judge 抓住了全部失败，但误杀了 <b>${fn}</b> 条合格回复。误杀会让你去"修"本来没问题的东西，也会压低分数。`;
+    else v.innerHTML = '在这 10 条上 judge 和人工完全一致。真实项目里，这个结论要在 judge 调试时从未见过的 test 集上重新验证一次。';
+  };
+  render();
+
+  // ---------- pass@k / pass^k ----------
+  const pk = document.getElementById('passk');
+  const pIn = pk.querySelector('[data-p]'), kIn = pk.querySelector('[data-k]');
+  const svg = pk.querySelector('[data-chart]');
+  const NS = 'http://www.w3.org/2000/svg';
+  const W = 640, H = 260, L = 48, R = 20, T = 16, B = 40, K = 20;
+  const x = (k) => L + ((k - 1) / (K - 1)) * (W - L - R);
+  const y = (v) => T + (1 - v) * (H - T - B);
+  const mk = (tag, attrs, text) => {
+    const n = document.createElementNS(NS, tag);
+    for (const [a, b] of Object.entries(attrs)) n.setAttribute(a, b);
+    if (text !== undefined) n.textContent = text;
+    svg.append(n);
+    return n;
+  };
+  const draw = () => {
+    const p = Number(pIn.value), k = Number(kIn.value);
+    pk.querySelector('[data-pv]').textContent = `${Math.round(p * 100)}%`;
+    pk.querySelector('[data-kv]').textContent = k;
+    svg.innerHTML = '';
+    for (const v of [0, 0.25, 0.5, 0.75, 1]) {
+      mk('line', { x1: L, x2: W - R, y1: y(v), y2: y(v), class: 'line', style: 'stroke-width:1;opacity:.35' });
+      mk('text', { x: L - 8, y: y(v) + 4, class: 'ts', 'text-anchor': 'end' }, `${v * 100}%`);
+    }
+    for (const kk of [1, 5, 10, 15, 20]) mk('text', { x: x(kk), y: H - B + 20, class: 'ts', 'text-anchor': 'middle' }, `k=${kk}`);
+    const at = [], hat = [];
+    for (let kk = 1; kk <= K; kk++) {
+      at.push(`${x(kk)},${y(1 - Math.pow(1 - p, kk))}`);
+      hat.push(`${x(kk)},${y(Math.pow(p, kk))}`);
+    }
+    mk('polyline', { points: at.join(' '), class: 'line g', style: 'stroke-width:2.5' });
+    mk('polyline', { points: hat.join(' '), class: 'line r', style: 'stroke-width:2.5' });
+    mk('line', { x1: x(k), x2: x(k), y1: T, y2: H - B, class: 'line a dash' });
+    const va = 1 - Math.pow(1 - p, k), vh = Math.pow(p, k);
+    mk('circle', { cx: x(k), cy: y(va), r: 5, class: 'fill-g' });
+    mk('circle', { cx: x(k), cy: y(vh), r: 5, class: 'fill-r' });
+    mk('text', { x: W - R, y: T + 14, class: 'ts', 'text-anchor': 'end', style: 'fill:var(--ok)' }, '绿：pass@k（至少一次成功）');
+    mk('text', { x: W - R, y: T + 32, class: 'ts', 'text-anchor': 'end', style: 'fill:var(--danger)' }, '红：pass^k（每次都成功）');
+    pk.querySelector('[data-out]').innerHTML =
+      `单次 ${Math.round(p * 100)}%，k = ${k}：<b style="color:var(--ok)">pass@k = ${(va * 100).toFixed(1)}%</b>，` +
+      `<b style="color:var(--danger)">pass^k = ${(vh * 100).toFixed(1)}%</b>。` +
+      (k > 1 ? `要让 pass^${k} 达到 90%，单次成功率需要 ${(Math.pow(0.9, 1 / k) * 100).toFixed(1)}%。` : '');
+  };
+  pIn.addEventListener('input', draw);
+  kIn.addEventListener('input', draw);
+  draw();
+});
+</script>
+</body>
+</html>

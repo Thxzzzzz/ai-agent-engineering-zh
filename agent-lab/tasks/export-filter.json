@@ -1,0 +1,15 @@
+{
+  "id": "export-filter",
+  "title": "月报导出支持按部门筛选",
+  "repo": "/Users/you/code/report-service",
+  "base": "main",
+  "agent": "claude",
+  "acceptance": [
+    "导出接口接受 department 参数，只导出该部门的数据",
+    "不传 department 时导出全部部门，与现在的行为一致",
+    "导出文件名包含筛选的部门名"
+  ],
+  "verify": ["bun", "test"],
+  "maxSessions": 6,
+  "maxCostUsd": 5
+}

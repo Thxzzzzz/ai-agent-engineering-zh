@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>术语表 · AI Agent 工程</title>
+<meta name="description" content="AI Agent 工程常用术语中英对照，100 余条，可即时搜索、按类别和首字母筛选，每条链接到首次讲解它的章节。">
+<link rel="stylesheet" href="assets/css/course.css">
+<script src="assets/js/manifest.js"></script>
+<script defer src="assets/js/course.js"></script>
+<style>
+  .g-tools { position: sticky; top: 0; z-index: 5; background: var(--bg); padding: 10px 0 8px; }
+  @media (max-width: 860px) { .g-tools { top: 49px; } }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 0; }
+  .chips button.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .letters button { min-width: 30px; padding: 2px 6px; font-family: var(--mono); }
+  .term-list { display: grid; gap: 10px; margin-top: 14px; }
+  .term { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 12px 16px; }
+  .term-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 10px; }
+  .term-head b { font-size: 16px; }
+  .term-head .pill { margin-left: auto; }
+  .term p { margin: 6px 0 0; font-size: 15px; }
+  .term .ch-link { font-size: 13px; }
+  .g-count { font-size: 13px; color: var(--muted); margin-top: 8px; }
+</style>
+</head>
+<body data-page="glossary">
+<article id="content">
+<div class="eyebrow">附录</div>
+<h1>术语表</h1>
+<p class="lead">课程里出现的关键术语，中英对照。英文术语在中文社区里常常直接使用（如 MCP、Skills、harness），课程正文也保留原词；这里给出一句话解释和首次详细讲解它的章节。</p>
+<div class="meta"><span>100 余条</span><span>可搜索中文、英文或解释里的词</span></div>
+
+<h2>1 · 怎么用</h2>
+<p>在下面的搜索框输入关键词即时过滤；点类别或首字母进一步筛选，再点一次取消。点"→ 第 N 章"跳到讲解它的地方。</p>
+<noscript><p class="callout warn">术语表需要启用 JavaScript 才能显示。</p></noscript>
+
+<h2>2 · 术语</h2>
+<div class="g-tools">
+  <input type="text" id="g-search" placeholder="搜索术语，例如：缓存、injection、幂等" aria-label="搜索术语" style="font:15px var(--font); color:var(--text); background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:8px 12px; width:100%">
+  <div class="chips" id="g-cats"></div>
+  <div class="chips letters" id="g-letters"></div>
+  <div class="g-count" id="g-count"></div>
+</div>
+<div class="term-list" id="g-list"></div>
+</article>
+
+<script>
+window.addEventListener('DOMContentLoaded', () => {
+  const CATS = {
+    base: '基础与模型', tools: '工具与编排', context: '上下文与记忆', retrieval: '检索',
+    control: '可控与安全', reliable: '可靠执行', eco: '协议与长任务', eval: '评测与可观测',
+  };
+  // [英文, 中文, 类别, 首次讲解章节 id, 解释]
+  const TERMS = [
+    ['Agent', '智能体', 'base', 'ch01', '模型在循环里调用工具、根据环境反馈自行决定下一步的程序。模型只做决策，动作由你的代码执行。'],
+    ['Workflow', '工作流', 'base', 'ch01', '用预先写好的代码路径编排模型和工具，控制流由代码决定。与 agent 是一条谱系的两端。'],
+    ['Augmented LLM', '增强型 LLM', 'base', 'ch01', '接上检索、工具和记忆的模型，是构建 agent 的基本单元。'],
+    ['Agent loop', 'Agent 循环', 'base', 'ch01', '读上下文 → 输出动作 → 执行 → 结果追加回上下文 → 再决策，直到模型不再调用工具。'],
+    ['Autonomy levels', '自主度分级', 'control', 'ch01', '按用户角色把自主度分为五级：操作者、协作者、顾问、审批者、旁观者。自主度是设计选择，而不是能力指标。'],
+    ['Token', '词元', 'base', 'ch02', '模型读写文本的基本单位。计费、上下文长度、速度都按 token 计算。'],
+    ['Context window', '上下文窗口', 'base', 'ch02', '单次请求里模型能看到的最大 token 数，输入与输出共享。'],
+    ['Temperature', '温度', 'base', 'ch02', '控制采样随机性的参数，越高输出越发散，越低越确定。'],
+    ['Reasoning / Thinking', '推理（思考）', 'base', 'ch02', '模型先生成一段内部推理再作答。难题上效果更好，代价是更高的延迟和输出 token。'],
+    ['Prompt caching', '提示缓存', 'base', 'ch02', '提供商缓存请求前缀的计算结果，命中部分以大幅折扣计费、延迟更低。按 tools → system → messages 的顺序匹配，前面任何改动都会让后面全部失效。'],
+    ['Cache breakpoint', '缓存断点', 'base', 'ch02', '在请求里标记"缓存到这里为止"的位置，用来控制哪些前缀被缓存。'],
+    ['KV cache', 'KV 缓存', 'context', 'ch05', '推理时缓存注意力的键值。前缀保持不变才能复用，因此它的命中率是长循环 agent 的关键成本指标。'],
+    ['Tool calling / Function calling', '工具调用', 'tools', 'ch03', '模型输出结构化的"调用哪个工具、参数是什么"，由你的代码执行，再把结果作为 tool_result 回传。'],
+    ['Structured output', '结构化输出', 'tools', 'ch03', '让模型按给定 JSON Schema 输出结果，便于程序直接使用。'],
+    ['Strict mode', '严格模式', 'tools', 'ch03', '提供商用约束解码保证输出符合 schema。常见限制：所有字段 required、对象 additionalProperties:false、可选语义用 null 联合表达。'],
+    ['JSON Schema', 'JSON Schema', 'tools', 'ch03', '描述 JSON 结构的标准，工具参数和结构化输出都用它定义。'],
+    ['Refusal', '拒答', 'tools', 'ch03', '模型拒绝执行请求。结构化输出遇到拒答或输出被截断时可能不符合 schema，解析前要先检查。'],
+    ['ACI (Agent-Computer Interface)', 'Agent-计算机接口', 'tools', 'ch03', '工具的名称、描述、参数和返回构成的"界面"。值得像设计人机界面一样认真设计和测试。'],
+    ['Poka-yoke', '防呆设计', 'tools', 'ch03', '让工具难以被误用，例如强制参数使用绝对路径。'],
+    ['ReAct', 'ReAct 范式', 'tools', 'ch04', '推理与行动交错进行：Thought → Action → Observation 循环。现代 agent loop 的思想源头之一。'],
+    ['Max steps', '最大步数', 'tools', 'ch04', 'agent 循环的上限，防止绕圈和失控花费。超限后要求模型直接作答或报错。'],
+    ['Prompt chaining', '提示链', 'tools', 'ch01', '把任务拆成固定几步，前一步的输出是后一步的输入，中间可加代码检查。'],
+    ['Routing', '路由', 'tools', 'ch01', '先分类，再交给专门的下游处理（不同提示词、模型或流程）。'],
+    ['Parallelization', '并行化', 'tools', 'ch01', '分段（独立子任务并行）或投票（同一任务多跑几次取多数）。'],
+    ['Orchestrator-workers', '编排者-工作者', 'tools', 'ch01', '编排者在运行时决定如何拆分子任务，分派给工作者，再综合结果。'],
+    ['Evaluator-optimizer', '评估-优化', 'tools', 'ch01', '一个模型生成，另一个按标准评审并给出意见，循环直到通过。'],
+    ['Sub-agent', '子 agent', 'tools', 'ch05', '由主 agent 派出、拥有独立上下文的 agent，完成后只回传精简摘要，用来隔离上下文。'],
+    ['Handoff', '移交', 'tools', 'ch11', '一个 agent 把对话控制权交给另一个 agent。OpenAI Agents SDK 的基本原语之一。'],
+    ['Multi-agent system', '多智能体系统', 'tools', 'ch11', '多个 agent 协作完成任务。适合可并行的读型任务，代价是数倍 token 和更难调试。'],
+    ['Context engineering', '上下文工程', 'context', 'ch05', '在每次推理时挑选并维护最优的 token 集合（系统提示、工具、示例、历史、检索结果、记忆），范围大于提示词工程。'],
+    ['Context rot', '上下文腐化', 'context', 'ch05', '上下文越长，模型对其中信息的召回越差。'],
+    ['Attention budget', '注意力预算', 'context', 'ch05', '把模型的注意力看作有限资源：每多一个 token 都在消耗它，所以上下文要精。'],
+    ['Just-in-time retrieval', '即用即取', 'context', 'ch05', '上下文里只保存路径、查询等引用，用到时再取内容，而不是预先塞满。'],
+    ['Compaction', '压缩', 'context', 'ch05', '上下文接近上限时，把历史总结成摘要后继续。好的压缩可恢复：保留路径或 URL 以便取回原文。'],
+    ['Structured note-taking', '结构化笔记', 'context', 'ch05', 'agent 把进度与要点写到上下文之外的文件里，需要时再读回。'],
+    ['System prompt', '系统提示', 'context', 'ch05', '定义角色、规则、可用工具的指令。要写在合适的"高度"：既不是硬编码分支，也不是空泛口号。'],
+    ['Few-shot', '少样本示例', 'context', 'ch05', '在提示里给几个示例。要少而多样，过于同质的示例会让模型机械模仿。'],
+    ['Memory', '记忆', 'context', 'ch06', '跨会话保留的知识，与单次请求的上下文相对。'],
+    ['Semantic memory', '语义记忆', 'context', 'ch06', '事实与偏好，例如"用户习惯先看结论"。'],
+    ['Episodic memory', '情景记忆', 'context', 'ch06', '过去发生过的具体经历，常用作 few-shot 示例。'],
+    ['Procedural memory', '程序性记忆', 'context', 'ch06', '"怎么做事"的规则，常以改写系统提示的方式保存。'],
+    ['Memory stream', '记忆流', 'context', 'ch06', 'Generative Agents 用自然语言按时间记录全部经历的结构，是检索与反思的原料。'],
+    ['Recency / Importance / Relevance', '近因 / 重要性 / 相关性', 'context', 'ch06', 'Generative Agents 的检索打分三项：时间衰减、写入时打的重要性分、与查询的语义相似度，归一化后加权求和。'],
+    ['Reflection', '反思', 'context', 'ch06', '定期把近期记忆提炼成更高层的洞见，并引用证据来源。'],
+    ['Core / Archival memory', '核心记忆 / 归档记忆', 'context', 'ch06', 'MemGPT / Letta 的分层：核心记忆常驻上下文且可编辑，归档记忆在上下文外、靠工具检索。'],
+    ['Sleep-time compute', '睡眠时计算', 'context', 'ch06', '在用户不在时由后台 agent 整理记忆、预先推理，降低在线请求的计算量。'],
+    ['ADD / UPDATE / DELETE / NOOP', '记忆更新操作', 'context', 'ch06', 'Mem0 式记忆写入：新信息与相似旧记忆比对后，由模型选择新增、补充、删除或不变。'],
+    ['Bi-temporal', '双时间轴', 'context', 'ch06', '同时记录"事实在现实中何时有效"和"系统何时写入"。出现矛盾时给旧事实设失效时间，而不是删除。'],
+    ['Persona / User profile', '用户档案', 'context', 'ch06', '描述"用户是谁、偏好什么、底线在哪"的常驻小段上下文，应当短小、可读、可改。'],
+    ['RAG', '检索增强生成', 'retrieval', 'ch07', '先检索相关资料放进上下文，再让模型作答。'],
+    ['Embedding', '向量嵌入', 'retrieval', 'ch07', '把文本映射为向量，用余弦相似度衡量语义接近程度。'],
+    ['BM25', 'BM25', 'retrieval', 'ch07', '经典的关键词检索打分算法，擅长精确词、编号、专有名词。'],
+    ['Hybrid search', '混合检索', 'retrieval', 'ch07', '同时用关键词（BM25）和向量检索，再融合两路结果。'],
+    ['RRF (Reciprocal Rank Fusion)', '倒数排名融合', 'retrieval', 'ch07', '按排名融合多路检索：score = Σ 1/(k + rank)，原论文建议 k = 60，无需校准各路分数。'],
+    ['Reranking', '重排', 'retrieval', 'ch07', '对初步召回的结果用更精细的模型重新排序。'],
+    ['Chunking', '分块', 'retrieval', 'ch07', '把长文档切成适合检索的片段。切得不好会丢失上下文。'],
+    ['Contextual retrieval', '上下文化检索', 'retrieval', 'ch07', '给每个分块补上 50–100 token 的说明其所在文档背景的文字，再做嵌入和 BM25 索引，显著降低检索失败率。'],
+    ['Agentic search', '智能体式检索', 'retrieval', 'ch07', '让 agent 自己用 grep、glob、读文件等工具查找信息。准确、总是最新，但更慢更贵。'],
+    ['HITL (Human-in-the-loop)', '人在回路', 'control', 'ch08', '在关键节点让人参与决策或审批。'],
+    ['Proposal', '提案', 'control', 'ch08', 'agent 不直接执行对外动作，而是生成一条待审批的动作描述；批准后才执行。'],
+    ['Guardrail', '护栏', 'control', 'ch08', '在输入、输出或工具调用处的检查规则，例如敏感词、频率上限、白名单、分类器。'],
+    ['Approval fatigue', '审批疲劳', 'control', 'ch08', '审批太多、太像，人就开始不看就点"批准"，审批形同虚设。'],
+    ['Human-agent trust exploitation', '人机信任滥用', 'control', 'ch09', 'OWASP Agentic Top 10 中的 ASI09：利用一段头头是道的解释诱导审批人批准有害动作。'],
+    ['Prompt injection', '提示注入', 'control', 'ch09', '攻击者把指令混进模型会读到的内容里，让模型执行非用户本意的动作。OWASP LLM Top 10 第一位。'],
+    ['Indirect prompt injection', '间接提示注入', 'control', 'ch09', '注入指令藏在网页、邮件、文档、工具返回等 agent 读取的数据中，而不是用户的输入里。'],
+    ['Lethal trifecta', '致命三要素', 'control', 'ch09', '能读私有数据 + 会接触不可信内容 + 能对外通信。三者同时具备时，攻击者就能让 agent 把数据发出去。'],
+    ['Agents Rule of Two', 'Agent 二选规则', 'control', 'ch09', '一个会话里，处理不可信输入、访问敏感数据、改变状态或对外通信三项最多占两项；三项都要时必须有人审批或换新上下文。'],
+    ['Dual LLM', '双 LLM 模式', 'control', 'ch09', '特权模型只看可信输入并能调用工具；隔离模型处理不可信内容，只返回符号引用。'],
+    ['Plan-then-execute', '先计划后执行', 'control', 'ch09', '在接触不可信内容之前把动作计划定死，之后读到的内容无法改变要做什么。'],
+    ['CaMeL', 'CaMeL', 'control', 'ch09', 'Google DeepMind 提出的防注入架构：特权模型生成代码计划，解释器追踪每个值的数据来源，调用工具前按策略检查。'],
+    ['Least privilege', '最小权限', 'control', 'ch09', '只授予完成任务所必需的工具、数据和凭证；对 agent 还包括只给必需的自主度。'],
+    ['Excessive agency', '过度代理', 'control', 'ch09', 'OWASP LLM Top 10 的 LLM06：给了 agent 超出需要的功能、权限或自主度。'],
+    ['Sandbox', '沙箱', 'control', 'ch12', '隔离 agent 执行代码与命令的环境，限制文件、网络和资源；凭证不应放进沙箱。'],
+    ['State machine', '状态机', 'reliable', 'ch10', '用有限的状态和明确的转移描述任务生命周期，是对外动作可靠执行的骨架。'],
+    ['Idempotency key', '幂等键', 'reliable', 'ch10', '随请求发送的唯一键，服务端据此识别重复请求并返回首次结果，保证重试不会重复执行。'],
+    ['Transactional outbox', '事务性发件箱', 'reliable', 'ch10', '在同一个数据库事务里写业务状态和"待发送"记录，再由独立发送器投递，避免状态与发送不一致。'],
+    ['At-least-once delivery', '至少一次投递', 'reliable', 'ch10', '消息保证不丢，但可能重复，因此消费端必须去重或幂等。'],
+    ['Durable execution', '持久执行', 'reliable', 'ch10', '把长流程的每一步持久化，进程崩溃后能从断点继续，而不是从头再来。'],
+    ['Checkpoint', '检查点', 'reliable', 'ch10', '持久化保存的执行状态快照，用于恢复与人工中断后继续。'],
+    ['Interrupt', '中断', 'reliable', 'ch10', '在流程中暂停等待人工输入。LangGraph 恢复时会让整个节点从头重跑，所以中断前的副作用必须幂等。'],
+    ['MCP (Model Context Protocol)', '模型上下文协议', 'eco', 'ch11', '标准化 agent 接入工具和数据的开放协议，现由 Linux Foundation 下的 AAIF 托管；当前规范版本为 2026-07-28。'],
+    ['Host / Client / Server', 'MCP 三种角色', 'eco', 'ch11', 'host 是 agent 应用，client 是它内部与某个 server 的连接，server 提供工具、资源和提示。'],
+    ['Tools / Resources / Prompts', 'MCP 三类能力', 'eco', 'ch11', 'tools 由模型调用以执行动作，resources 是可读取的数据，prompts 是可复用的提示模板。'],
+    ['Elicitation', '信息征询', 'eco', 'ch11', 'MCP server 在执行中向用户索要补充信息。2026-07-28 版改为返回 input_required，由客户端带答案重试。'],
+    ['A2A (Agent2Agent)', 'A2A 协议', 'eco', 'ch11', 'agent 之间协作的开放协议，与 MCP 互补：MCP 管工具接入，A2A 管 agent 间协作。v1.0 于 2026-03 发布。'],
+    ['Agent Card', 'Agent 名片', 'eco', 'ch11', 'A2A 中描述 agent 能力与接入方式的元数据，v1.0 支持签名。'],
+    ['Agent Skills', 'Skills', 'eco', 'ch11', '一个含 SKILL.md（frontmatter 必填 name 与 description）的文件夹，可附脚本与资料，按需加载；已作为开放标准发布。'],
+    ['Progressive disclosure', '渐进披露', 'eco', 'ch11', '先只给模型看元数据，相关时再读正文，需要时再读附带文件，节省上下文。'],
+    ['AGENTS.md', 'AGENTS.md', 'eco', 'ch11', '"给 agent 看的 README"，没有必填字段；monorepo 里离被编辑文件最近的那份生效。'],
+    ['AAIF', 'Agentic AI Foundation', 'eco', 'ch11', 'Linux Foundation 于 2025-12 成立的基金会，托管 MCP、AGENTS.md 等项目。'],
+    ['Code execution with MCP', '以代码调用 MCP', 'eco', 'ch11', '把 MCP server 呈现为代码 API，让 agent 写代码调用并在代码里过滤数据，大幅减少进入上下文的 token。'],
+    ['Harness', '驾驭器（运行框架）', 'eco', 'ch12', '包在模型外面的那层：循环、工具、上下文管理、权限、hook、会话持久化。决定了同一个模型能发挥出多少。'],
+    ['Hook', '钩子', 'eco', 'ch12', '在 agent 生命周期事件（如调用工具前后、停止前）运行的自定义逻辑，可放行、阻断或补充上下文。'],
+    ['Stop hook', '停止钩子', 'eco', 'ch12', 'agent 准备停下时触发的 hook，可阻止停止并给出理由（例如还有未提交的改动）。要检查 stop_hook_active 防止无限续跑。'],
+    ['Git worktree', 'Git 工作树', 'eco', 'ch12', '同一仓库的多个独立检出目录，让多个编码 agent 并行工作而互不干扰。'],
+    ['Headless mode', '无交互模式', 'eco', 'ch12', '在脚本里以非交互方式运行编码 agent，输出 JSON 或事件流，便于程序化编排。'],
+    ['Initializer agent', '初始化 agent', 'eco', 'ch12', '长任务驾驭器里的首个会话：搭环境、写启动脚本、把需求展开成功能清单、做首个提交。'],
+    ['Feature list', '功能清单', 'eco', 'ch12', '用 JSON 记录的待实现功能及是否通过；后续会话只允许修改通过状态，用来防止过早宣布完成。'],
+    ['Eval', '评测', 'eval', 'ch13', '用一组任务和评分规则衡量 agent 表现，是改提示词、换模型、拆组件之前的安全网。'],
+    ['Task / Trial / Transcript / Outcome', '任务 / 试验 / 记录 / 结果', 'eval', 'ch13', '评测的基本术语：一个任务可多次试验，每次试验留下完整记录，并产生一个可评分的结果。'],
+    ['Grader', '评分器', 'eval', 'ch13', '判定结果好坏的方法，分代码、模型、人工三类。能用确定性代码判的就用代码。'],
+    ['LLM-as-judge', '模型判官', 'eval', 'ch13', '用模型按标准评分。建议每种失败模式一个二元判官，并用人工标注校准。'],
+    ['TPR / TNR', '真阳性率 / 真阴性率', 'eval', 'ch13', '衡量模型判官与人工标注一致性的指标：真正失败的抓到多少，真正通过的放过多少。'],
+    ['pass@k', 'pass@k', 'eval', 'ch13', 'k 次尝试中至少成功一次的概率，k 越大越高。'],
+    ['pass^k', 'pass^k', 'eval', 'ch13', 'k 次尝试全部成功的概率，k 越大越低，反映稳定性。单次 75% 时 pass^3 约为 42%。'],
+    ['Error analysis', '错误分析', 'eval', 'ch13', '读真实 trace、写自由笔记、归纳失败分类，再决定测什么、修什么。评测工作的第一步。'],
+    ['Open / Axial coding', '开放编码 / 轴心编码', 'eval', 'ch13', '错误分析的两步：先对每条 trace 自由记录问题，再把笔记归并成失败类别。'],
+    ['Capability vs. regression eval', '能力评测 / 回归评测', 'eval', 'ch13', '能力评测通过率起初应偏低、用来推动进步；回归评测应接近 100%、用来防止退化。'],
+    ['Benchmark contamination', '基准污染', 'eval', 'ch13', '基准题目及答案进入了训练数据，分数不再反映真实能力。SWE-bench Verified 因此被停止报告。'],
+    ['Trace / Span', '链路 / 跨度', 'eval', 'ch14', 'trace 记录一次完整运行，span 是其中一个步骤（一次模型调用、一次工具调用），可以嵌套。'],
+    ['OTel GenAI semantic conventions', 'OTel 生成式 AI 语义约定', 'eval', 'ch14', 'OpenTelemetry 为模型与 agent 调用定义的 span 名称和属性（gen_ai.*），目前仍处于 Development 状态。'],
+    ['TTFT (Time to first token)', '首 token 时间', 'eval', 'ch14', '从发出请求到收到第一个输出 token 的时间，决定交互"感觉快不快"。'],
+    ['Model routing', '模型路由', 'eval', 'ch14', '按任务难度把请求分给不同模型，简单任务用便宜的模型。'],
+    ['Model fallback', '模型回退', 'eval', 'ch14', '遇到认证、限流、服务端或网络错误时切换到备用模型；输出不符合格式不应触发回退。'],
+    ['Budget cap', '预算上限', 'eval', 'ch14', '按日、按月限制花费，超限时降级运行而不是继续烧钱。'],
+  ];
+
+  const fileOf = Object.fromEntries(window.COURSE.parts.flatMap((p) => p.items).map((i) => [i.id, i.file]));
+  const letterOf = (en) => { const c = en.trim()[0].toUpperCase(); return /[A-Z]/.test(c) ? c : '#'; };
+  const items = TERMS.map(([en, zh, cat, ch, desc]) => ({ en, zh, cat, ch, desc, letter: letterOf(en) }))
+    .sort((a, b) => a.en.localeCompare(b.en, 'en', { sensitivity: 'base' }));
+
+  const list = document.getElementById('g-list');
+  const nodes = items.map((t) => {
+    const no = Number(t.ch.slice(2));
+    const node = Course.el('div', { class: 'term' });
+    node.innerHTML =
+      `<div class="term-head"><b>${Course.escape(t.zh)}</b><code>${Course.escape(t.en)}</code><span class="pill accent">${CATS[t.cat]}</span></div>` +
+      `<p>${Course.escape(t.desc)} <a class="ch-link" href="${fileOf[t.ch]}">→ 第 ${no} 章</a></p>`;
+    list.append(node);
+    return { t, node, hay: (t.en + ' ' + t.zh + ' ' + t.desc).toLowerCase() };
+  });
+
+  let cat = null;
+  let letter = null;
+  const search = document.getElementById('g-search');
+  const count = document.getElementById('g-count');
+  const apply = () => {
+    const q = search.value.trim().toLowerCase();
+    let n = 0;
+    nodes.forEach(({ t, node, hay }) => {
+      const show = (!q || q.split(/\s+/).every((w) => hay.includes(w))) && (!cat || t.cat === cat) && (!letter || t.letter === letter);
+      node.style.display = show ? '' : 'none';
+      if (show) n++;
+    });
+    count.textContent = n ? `显示 ${n} / ${nodes.length} 条` : '没有匹配的术语，换个关键词试试';
+  };
+
+  const makeChips = (box, entries, get, set) => {
+    entries.forEach(([value, label]) => {
+      const b = Course.el('button', { class: 'btn small', type: 'button', text: label });
+      b.addEventListener('click', () => {
+        set(get() === value ? null : value);
+        [...box.children].forEach((x) => x.classList.remove('on'));
+        if (get() === value) b.classList.add('on');
+        apply();
+      });
+      box.append(b);
+    });
+  };
+  makeChips(document.getElementById('g-cats'), Object.entries(CATS), () => cat, (v) => (cat = v));
+  const letters = [...new Set(items.map((t) => t.letter))].sort();
+  makeChips(document.getElementById('g-letters'), letters.map((l) => [l, l]), () => letter, (v) => (letter = v));
+  search.addEventListener('input', apply);
+  apply();
+});
+</script>
+</body>
+</html>

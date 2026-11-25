@@ -1,0 +1,20 @@
+name: evals
+on:
+  pull_request:
+    paths: ['src/**', 'prompts/**', 'evals/**']   # 只在可能影响行为的改动上跑，省钱
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - run: bun test
+      - run: bun evals/cli.ts --suite regression --k 3 --min-pass 0.98
+        env:
+          LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_MODEL: ${{ secrets.LLM_MODEL }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: eval-report, path: evals/results/ }

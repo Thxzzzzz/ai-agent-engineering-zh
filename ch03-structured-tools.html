@@ -1,0 +1,418 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>结构化输出与工具调用 · AI Agent 工程</title>
+<meta name="description" content="JSON Schema strict 模式的约束、可移植的“单工具 + 校验 + 错误回灌”模式、拒答与截断处理，以及给 agent 设计工具的原则。">
+<link rel="stylesheet" href="assets/css/course.css">
+<script src="assets/js/manifest.js"></script>
+<script defer src="assets/js/course.js"></script>
+<style>
+  .sv-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; }
+  @media (max-width: 700px) { .sv-grid { grid-template-columns: minmax(0, 1fr); } }
+  .sv-grid textarea { min-height: 300px; }
+  .sv-presets { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+  .sv-ok { color: var(--ok); font-weight: 650; }
+  .sv-bad { color: var(--danger); font-weight: 650; }
+  .sv-out ul { margin: 6px 0; }
+  .anim svg text.ts { paint-order: stroke; stroke: var(--surface); stroke-width: 6px; stroke-linejoin: round; }
+  .sv-feedback { margin-top: 8px; border-left: 3px solid var(--accent-2); padding: 6px 10px; background: var(--accent-2-soft); border-radius: 6px; font: 13px/1.6 var(--mono); white-space: pre-wrap; word-break: break-word; }
+</style>
+</head>
+<body data-page="ch03">
+<article id="content">
+<div class="eyebrow">第一部分 · 基础 · 第 3 章</div>
+<h1>结构化输出与工具调用</h1>
+<p class="lead">agent 能做事，靠的是模型输出"机器能读的东西"：一个合法的 JSON、一次参数正确的工具调用。这一章讲两件事：怎么让模型<strong>可靠地</strong>输出结构化数据，以及怎么设计让模型<strong>用得好</strong>的工具。</p>
+<div class="meta"><span>约 40 分钟</span><span>前置：第 2 章</span><span>含 1 个分步动画、1 个 schema 校验演示器、3 道小测</span></div>
+
+<div class="goals"><b>学完你能</b>
+<ul>
+  <li>说出 strict 模式对 JSON Schema 的约束，并据此设计兼容各家 API 的 schema</li>
+  <li>实现"单一工具 + 校验 + 错误回灌重试"的结构化输出函数</li>
+  <li>正确处理拒答、截断、枚举大小写和语义层面的校验失败</li>
+  <li>按官方最佳实践设计工具：粒度、命名、返回格式、错误信息</li>
+</ul></div>
+
+<h2>1 · 为什么需要结构化输出</h2>
+<p>办公助理读完一封邮件，要产出：一句话摘要、紧急程度、是否需要回复、提炼出的待办。如果让模型自由发挥，你会收到"这封邮件比较紧急，建议回复……"之类的散文，然后不得不用正则去捞字段——格式稍有变化就崩。</p>
+<p>结构化输出把模型的产出变成<strong>一个有类型的对象</strong>，下游代码可以直接分支、入库、渲染卡片。它也是工具调用的本质：12-Factor Agents 的第 4 条说得直接——"工具只是结构化输出"。模型说"我要调用 <code>send_email</code>，参数是……"，和模型说"摘要是……，紧急程度是……"，在机制上是同一件事。</p>
+
+<h2>2 · 三种做法与它们的可靠性</h2>
+<table>
+<tr><th>做法</th><th>原理</th><th>可靠性</th><th>适用</th></tr>
+<tr><td>提示词里要求"只输出 JSON"</td><td>纯靠模型听话</td><td>低：会夹带解释文字、漏字段、写错类型</td><td>原型阶段</td></tr>
+<tr><td>结构化输出 / JSON 模式（response format）</td><td>服务端按 schema 约束解码</td><td>高：strict 模式下语法层面保证符合 schema</td><td>单一 API、schema 在其支持范围内</td></tr>
+<tr><td>工具调用（function calling）</td><td>把 schema 当成一个工具的参数定义</td><td>高：strict 工具同样受约束解码保护</td><td>需要跨厂商一致行为、或本来就在工具循环里</td></tr>
+</table>
+<p>OpenAI 在 2024-08-06 发布 Structured Outputs 时公布的内部评测是：开启 strict 后，模型遵循复杂 schema 的比例达到 100%，而更早的模型只靠提示词不到 40%。Anthropic 在 2025-11-13 推出结构化输出公测，现在已经稳定，支持 JSON 输出和工具上的 <code>strict: true</code> 两种方式。</p>
+<div class="callout note"><b>"语法上合法"不等于"语义上正确"</b>
+<p>约束解码保证的是"JSON 能解析、字段齐全、类型对"，不保证"摘要准确"、"日期没有写成过去"、"引用的邮件 ID 真实存在"。所以即使用了 strict 模式，你的代码<strong>仍然要做校验</strong>，只是校验的重点从格式转向了语义。</p></div>
+
+<h2>3 · strict 模式的约束：写出兼容的 schema</h2>
+<p>约束解码要求 schema 足够"规整"，所以各家 strict 模式都只支持 JSON Schema 的一个子集。下面是 2026-11 核实的主要约束：</p>
+<table>
+<tr><th>约束</th><th>OpenAI Structured Outputs</th><th>Anthropic 结构化输出</th></tr>
+<tr><td>必填</td><td>所有字段都必须列进 <code>required</code></td><td>支持可选参数，但有数量上限</td></tr>
+<tr><td>可选语义</td><td>用 null 联合表达：<code>"type": ["string", "null"]</code></td><td>同左也可用</td></tr>
+<tr><td>额外字段</td><td>每个对象都要 <code>additionalProperties: false</code></td><td>对象必须 <code>additionalProperties: false</code></td></tr>
+<tr><td>根节点</td><td>必须是 object，不能是 anyOf</td><td>—</td></tr>
+<tr><td>组合关键字</td><td>不支持 allOf / not / if-then-else；支持 <code>$defs</code> 与递归</td><td>不支持递归与 oneOf，也不支持数值、长度约束</td></tr>
+<tr><td>规模上限</td><td>最多 5,000 个属性、10 层嵌套、1,000 个枚举值</td><td>单次请求最多 20 个 strict 工具、24 个可选参数、16 个联合类型参数</td></tr>
+<tr><td>其他</td><td>模型拒答时返回 <code>refusal</code>，解析前要先检查</td><td>编译后的语法缓存 24 小时；不能和 citations、prefill 同用；枚举大小写不保证</td></tr>
+</table>
+
+<div class="callout tip"><b>可移植的写法：取交集</b>
+<p>如果你的系统要能在多家模型之间切换，就按最严格的交集来设计 schema：<strong>所有字段必填、每个对象 additionalProperties:false、可选语义一律用"类型或 null"、不用递归、不用 oneOf/allOf、不依赖 minLength/maximum 这类约束</strong>（这些约束改到你自己的校验代码里做）。这样一份 schema 走遍各家的 strict 模式。</p></div>
+
+<p>用 Zod 4 写 schema，再用 <code>z.toJSONSchema()</code> 转成 JSON Schema 发给模型，类型和运行时校验都从同一处来。Zod 4 的 <code>z.object()</code> 在转换时默认带 <code>additionalProperties: false</code>，<code>.nullable()</code> 转出来是 <code>["string", "null"]</code>，正好符合上面的交集：</p>
+
+<pre data-title="schemas/triage.ts：邮件分诊的输出 schema"><code class="lang-ts">
+import * as z from 'zod';
+
+export const TaskItem = z.object({
+  title: z.string().describe('一句话的待办，动词开头'),
+  owner: z.string().nullable().describe('负责人姓名；邮件里没说时为 null'),
+  due_date: z.string().nullable().describe('YYYY-MM-DD；没有明确期限时为 null'),
+});
+
+export const Triage = z.object({
+  summary: z.string().describe('不超过 50 字的摘要'),
+  urgency: z.enum(['low', 'normal', 'high']),
+  needs_reply: z.boolean().describe('对方是否在等我答复'),
+  tasks: z.array(TaskItem),
+  evidence: z.array(z.string()).describe('支持判断的原文引用编号，如 m1、m3'),
+});
+export type Triage = z.infer&lt;typeof Triage&gt;;
+</code></pre>
+
+<div class="callout warn"><b>"全部必填"会不会让模型乱填？</b>
+<p>会，如果你不给它一个合法的"没有"。<code>owner</code> 设成必填的 string，邮件里没提负责人时模型就会编一个名字。设成 <code>string | null</code> 并在描述里写明"没说时为 null"，模型就有了诚实表达"不知道"的出口。这也是为什么评测里建议给 LLM 判官一个"Unknown"选项（第 13 章）。</p></div>
+
+<h2>4 · 可移植的模式：单一工具 + 校验 + 错误回灌</h2>
+<p>各家的 response format 参数写法不同、支持的 schema 子集不同、"强制调用某个工具"（tool choice）的语义也不完全一致。一个在实践中跨厂商行为最稳定的做法是：</p>
+<ol>
+  <li>把输出 schema 包装成<strong>唯一</strong>的工具 <code>emit_result</code>（开启 strict），系统提示末尾写明"必须且只能通过调用该工具提交结果"。</li>
+  <li>收到响应后找到 <code>emit_result</code> 的调用，用 Zod 校验参数（含语义校验）。</li>
+  <li>没调用工具：追加一条用户消息要求调用。参数不合法：追加一条 <code>isError</code> 的工具结果，<strong>把具体的校验错误告诉模型</strong>，让它修正。</li>
+  <li>重试到上限仍失败就抛错，把这次的 trace 留作评测用例。</li>
+</ol>
+<p>点"下一步"看一次带修正的完整往返：</p>
+
+<figure class="anim" data-dim>
+<div class="diagram">
+<svg viewBox="0 0 760 430" width="760" role="img" aria-label="结构化输出的一次往返：校验失败、错误回灌、修正通过">
+  <rect class="box m" x="40" y="14" width="150" height="40" rx="8"/><text class="tb" x="115" y="39" text-anchor="middle">你的程序</text>
+  <rect class="box a" x="305" y="14" width="150" height="40" rx="8"/><text class="tb" x="380" y="39" text-anchor="middle">模型 API</text>
+  <rect class="box v" x="570" y="14" width="150" height="40" rx="8"/><text class="tb" x="645" y="39" text-anchor="middle">Zod 校验</text>
+  <path class="line dash" d="M115 54 V420"/><path class="line dash" d="M380 54 V420"/><path class="line dash" d="M645 54 V420"/>
+  <g data-k="s1"><path class="line a" d="M115 85 H378" marker-end="url(#arr-a)"/><text class="ts" x="246" y="78" text-anchor="middle">messages + tools: [emit_result]（strict）</text></g>
+  <g data-k="s2"><path class="line a" d="M380 125 H117" marker-end="url(#arr-a)"/><text class="ts" x="246" y="118" text-anchor="middle">tool_call emit_result {urgency: "High", …}</text></g>
+  <g data-k="s3"><path class="line" d="M115 160 H643" marker-end="url(#arr)"/><text class="ts" x="380" y="153" text-anchor="middle">Triage.safeParse(args)</text></g>
+  <g data-k="s4"><path class="line r" d="M645 195 H117" marker-end="url(#arr-r)"/><text class="ts" x="380" y="188" text-anchor="middle">✗ urgency：应为 "low" | "normal" | "high"</text></g>
+  <g data-k="s5"><path class="line b" d="M115 240 H378" marker-end="url(#arr-b)"/><text class="ts" x="246" y="226" text-anchor="middle">追加 assistant(tool_call) + tool_result</text><text class="ts" x="246" y="258" text-anchor="middle">isError: true，内容是具体的校验错误</text></g>
+  <g data-k="s6"><path class="line a" d="M380 295 H117" marker-end="url(#arr-a)"/><text class="ts" x="246" y="288" text-anchor="middle">tool_call emit_result {urgency: "high", …}</text></g>
+  <g data-k="s7"><path class="line" d="M115 330 H643" marker-end="url(#arr)"/><text class="ts" x="380" y="323" text-anchor="middle">再次校验</text><path class="line g" d="M645 360 H117" marker-end="url(#arr-g)"/><text class="ts" x="380" y="353" text-anchor="middle">✓ 通过，得到类型为 Triage 的对象</text></g>
+  <g data-k="s8"><rect class="box g" x="40" y="380" width="300" height="36" rx="8"/><text class="t" x="190" y="403" text-anchor="middle">返回 value，attempts = 2，usage 两次累加</text></g>
+</svg>
+</div>
+<ol class="anim-steps">
+  <li data-show="s1" data-hl="s1">程序发出请求：消息列表 + 唯一的工具 <code>emit_result</code>，参数 schema 由 <code>z.toJSONSchema(Triage)</code> 生成。系统提示末尾要求"必须且只能通过调用该工具提交结果"。</li>
+  <li data-show="s2" data-hl="s2">模型返回一次工具调用。假设它把枚举值写成了首字母大写的 <code>"High"</code>——Anthropic 文档明确提醒枚举大小写不保证；非 strict 模式下各种偏差就更常见了。</li>
+  <li data-show="s3" data-hl="s3">程序<strong>不信任</strong>模型的输出，交给 Zod 做完整校验（包括 schema 表达不了的语义规则，比如日期格式、引用编号是否存在）。</li>
+  <li data-show="s4" data-hl="s4">校验失败，拿到一条具体的、指向字段路径的错误信息。</li>
+  <li data-show="s5" data-hl="s5">关键一步：把模型那次工具调用原样追加进历史，再追加一条 <code>isError: true</code> 的工具结果，内容就是这条错误信息。<strong>错误信息写给模型看</strong>，要说清哪个字段、错在哪、合法值是什么。</li>
+  <li data-show="s6" data-hl="s6">模型看到自己的错误，修正后重新调用。大多数格式错误一次回灌就能修好。</li>
+  <li data-show="s7" data-hl="s7">再次校验通过。</li>
+  <li data-show="s8" data-hl="s8">返回结果，同时记录尝试次数与累计用量。尝试次数是一个很好的监控指标：某个提示词的平均尝试次数突然上升，往往意味着模型或输入分布变了。</li>
+</ol>
+<figcaption>图 3-1 校验失败时的错误回灌。同样的机制也用于普通工具调用的参数错误（第 4 章）。</figcaption>
+</figure>
+
+<pre data-title="llm/structured.ts：可移植的结构化输出（接口定义见第 4 章）"><code class="lang-ts">
+import * as z from 'zod';
+import type { Message, Model, ToolCall, Usage } from './types';
+
+const TOOL = 'emit_result';
+
+export class StructuredOutputError extends Error {
+  constructor(message: string, readonly attempts: number, readonly lastCall?: ToolCall) {
+    super(message);
+  }
+}
+
+export async function completeStructured&lt;S extends z.ZodType&gt;(
+  model: Model,
+  schema: S,
+  req: { system: string; user: string },
+  opts: { maxAttempts?: number; signal?: AbortSignal } = {},
+): Promise&lt;{ value: z.infer&lt;S&gt;; attempts: number; usage: Usage }&gt; {
+  const { $schema: _ignored, ...inputSchema } = z.toJSONSchema(schema) as Record&lt;string, unknown&gt;;
+  const tools = [{ name: TOOL, description: '提交最终结果。必须且只能调用一次。', inputSchema }];
+  const messages: Message[] = [
+    { role: 'system', content: `${req.system}\n\n必须且只能通过调用 ${TOOL} 工具提交结果，不要输出其他文字。` },
+    { role: 'user', content: req.user },
+  ];
+  const usage: Usage = { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0 };
+  const maxAttempts = opts.maxAttempts ?? 2;
+  let lastCall: ToolCall | undefined;
+
+  for (let attempt = 1; attempt &lt;= maxAttempts; attempt++) {
+    const res = await model.generate({ messages, tools, signal: opts.signal });
+    usage.inputTokens += res.usage.inputTokens;
+    usage.outputTokens += res.usage.outputTokens;
+    usage.cachedInputTokens += res.usage.cachedInputTokens;
+
+    // 拒答与截断不是"格式错误"，重试通常没用，直接上报
+    if (res.stopReason === 'refusal') throw new StructuredOutputError('模型拒绝回答', attempt);
+    if (res.stopReason === 'max_tokens') throw new StructuredOutputError('输出被截断，调大 max_tokens 或缩小输出', attempt);
+
+    messages.push({ role: 'assistant', content: res.content, toolCalls: res.toolCalls });
+    const call = res.toolCalls.find((c) =&gt; c.name === TOOL);
+    if (!call) {
+      messages.push({ role: 'user', content: `你没有调用 ${TOOL}。请调用它提交结果。` });
+      continue;
+    }
+    lastCall = call;
+    const parsed = schema.safeParse(call.args);
+    if (parsed.success) return { value: parsed.data, attempts: attempt, usage };
+    messages.push({
+      role: 'tool',
+      toolCallId: call.id,
+      isError: true,
+      content: `参数校验失败，请修正后重新调用 ${TOOL}：\n${z.prettifyError(parsed.error)}`,
+    });
+  }
+  throw new StructuredOutputError(`${maxAttempts} 次尝试后仍未得到合法结果`, maxAttempts, lastCall);
+}
+</code></pre>
+
+<p>几个容易忽略的细节：</p>
+<ul>
+  <li><strong>先追加 assistant 消息，再追加 tool_result</strong>：工具结果必须能对应到上一条 assistant 消息里的某个 tool call id，否则大多数 API 会直接报错。</li>
+  <li><strong>语义校验写进 schema</strong>：用 Zod 的 <code>.refine()</code> 或在 safeParse 之后再查一遍（"<code>evidence</code> 里的编号是否都在本批邮件里"），失败时走同样的回灌路径。</li>
+  <li><strong>可以有"修复"步骤，但要克制</strong>：如果某种偏差反复出现且意思毫无歧义（比如枚举大小写），可以在校验前做一次规范化。不要写成"什么都能宽松解析"——那会掩盖真正的问题。</li>
+</ul>
+
+<div class="quiz" data-answer="3">
+<p class="q">模型返回了一个结构化结果，但因为 stop_reason 是 max_tokens，JSON 在中间被截断了。最合适的处理是？</p>
+<ol>
+  <li>带着"JSON 解析失败"的错误回灌，让模型重新输出</li>
+  <li>用容错的 JSON 解析器补全括号</li>
+  <li>当作独立的失败类型处理：调大输出上限或缩小要求输出的内容，并把这次记录下来</li>
+  <li>换一个模型重试</li>
+</ol>
+<div class="explain">截断说明输出本身就超出了上限，回灌重试大概率再次被截断，白白多花一次钱；补全括号会得到缺字段的"假合法"结果。截断、拒答和格式错误是三种不同的失败，应该分开处理和统计。</div>
+</div>
+
+<h2>5 · 动手：schema 校验演示器</h2>
+<p>左边是邮件分诊的输出 schema（JSON Schema 形式），右边是模拟的模型输出。选一个预设或直接改右边的内容，点"校验"，看看校验器报什么错，以及按上一节的模式，<strong>会把什么样的修正提示回灌给模型</strong>。</p>
+
+<div class="widget" id="sv">
+<div class="w-title">Schema 校验演示器</div>
+<div class="sv-presets" data-presets></div>
+<div class="sv-grid">
+  <label>JSON Schema<textarea data-schema spellcheck="false"></textarea></label>
+  <label>模型输出（emit_result 的参数）<textarea data-output spellcheck="false"></textarea></label>
+</div>
+<div style="margin-top:10px"><button class="btn primary" type="button" data-run>校验</button></div>
+<div class="w-out sv-out" data-result>点"校验"查看结果。</div>
+</div>
+
+<p>这个演示器实现了 strict 子集里最常用的关键字：<code>type</code>（含类型数组）、<code>properties</code>、<code>required</code>、<code>additionalProperties</code>、<code>enum</code>、<code>items</code>、<code>anyOf</code>。你可以试着把 schema 里的 <code>"additionalProperties": false</code> 删掉，再校验"多余字段"那个预设，体会它为什么是 strict 模式的硬性要求——没有它，模型多写的字段会悄悄混进你的数据。</p>
+
+<h2>6 · 给 agent 设计工具</h2>
+<p>结构化输出解决了"模型怎么说"，工具设计解决的是"模型拿什么做事"。Anthropic 把这一层叫做 <strong>ACI（agent-computer interface）</strong>，并建议在它上面投入和 HCI（人机界面）同样多的精力。下面是《Writing effective tools for agents》（2025-09-11）的核心原则：</p>
+
+<table>
+<tr><th>原则</th><th>反例</th><th>正例</th></tr>
+<tr><td><strong>按任务设计，不按 API 逐个包装</strong></td><td><code>list_contacts</code>：返回全部联系人让模型自己找</td><td><code>search_contacts(query)</code>：一次拿到要的人</td></tr>
+<tr><td><strong>工具少而精</strong></td><td>把 30 个内部接口全挂上去</td><td>按用户任务合并成几个高层工具；"工具多不等于效果好"</td></tr>
+<tr><td><strong>命名空间</strong></td><td><code>search</code>、<code>get</code></td><td><code>mail_search</code>、<code>calendar_events_search</code>，避免混淆</td></tr>
+<tr><td><strong>参数名无歧义</strong></td><td><code>user</code></td><td><code>user_id</code> 或 <code>user_email</code></td></tr>
+<tr><td><strong>返回语义字段</strong></td><td>一堆 UUID 和内部编码</td><td>名字、标题、可读的时间；需要 ID 时也给，但别只给 ID</td></tr>
+<tr><td><strong>控制返回量</strong></td><td>一次返回几万 token 的原始 JSON</td><td>分页、过滤、截断，并告诉模型"还有更多，用 page=2 继续"</td></tr>
+<tr><td><strong>提供详略开关</strong></td><td>永远返回完整详情</td><td><code>response_format: "concise" | "detailed"</code>；文中实例里简洁版约省 2/3 token</td></tr>
+<tr><td><strong>错误信息可执行</strong></td><td><code>Error 400</code></td><td>"日期格式应为 YYYY-MM-DD，你传入的是 '下周三'。可先调用 calendar_resolve_date 解析相对日期。"</td></tr>
+</table>
+
+<pre data-title="一个按原则设计的工具定义"><code class="lang-ts">
+export const calendarEventsSearch = {
+  name: 'calendar_events_search',
+  description:
+    '按时间范围和关键词搜索当前用户日历中的会议。返回会议标题、时间、参会人姓名。' +
+    '相对日期（如"下周三"）请先调用 calendar_resolve_date 转成具体日期。结果最多 20 条，超出时用 page 翻页。',
+  inputSchema: {
+    type: 'object',
+    additionalProperties: false,
+    required: ['start_date', 'end_date', 'keyword', 'page', 'response_format'],
+    properties: {
+      start_date: { type: 'string', description: 'YYYY-MM-DD，含当天' },
+      end_date: { type: 'string', description: 'YYYY-MM-DD，含当天' },
+      keyword: { type: ['string', 'null'], description: '标题关键词；不限时为 null' },
+      page: { type: 'integer', description: '从 1 开始' },
+      response_format: { type: 'string', enum: ['concise', 'detailed'], description: 'concise 只返回标题、时间与 event_id' },
+    },
+  },
+};
+</code></pre>
+
+<h3>防呆设计（poka-yoke）</h3>
+<p>《Building effective agents》里有一个经典例子：Anthropic 发现模型在切换目录后经常用错相对路径，于是把工具改成<strong>只接受绝对路径</strong>，这类错误就消失了。思路是<strong>改工具让错误不可能发生</strong>，而不是在提示词里反复叮嘱。常见手法：</p>
+<ul>
+  <li><strong>用短引用代替长 ID</strong>：给模型看的邮件编号为 <code>m1</code>、<code>m2</code>，代码里再映射回真实的消息 ID。模型抄错 36 位的 UUID 的概率远高于抄错 <code>m3</code>，而且一旦抄错，校验时能立刻发现"<code>m9</code> 不存在"。</li>
+  <li><strong>用枚举代替自由文本</strong>：动作类型、状态、优先级都用 enum。</li>
+  <li><strong>危险参数不暴露</strong>：发件人、抄送范围由代码决定，不让模型填。</li>
+  <li><strong>让工具幂等</strong>：同一个请求重复调用不会产生两份结果（第 10 章）。</li>
+</ul>
+
+<div class="callout deep"><b>把工具当成产品来测</b>
+<p>Anthropic 推荐的流程是：本地快速做出工具原型 → 构造一批需要多次工具调用、结果可验证的真实任务 → 让 agent 跑 → <strong>读 transcript</strong> 看它在哪里困惑、哪个参数总填错 → 改描述或改工具 → 再跑。他们在多智能体研究系统里仅靠改写工具描述，就让任务完成时间下降了 40%。工具描述本身就是提示词，值得同样的迭代。</p></div>
+
+<div class="quiz" data-answer="2">
+<p class="q">agent 调用 <code>mail_send</code> 时经常把收件人写成同事的中文名而不是邮箱地址，导致发送失败。最好的改进是？</p>
+<ol>
+  <li>在系统提示里加粗强调"收件人必须是邮箱"</li>
+  <li>改工具：收件人参数改为联系人引用（由 <code>contacts_search</code> 返回的短编号），代码负责映射成邮箱；错误时返回"请先用 contacts_search 查找此人"</li>
+  <li>换一个更强的模型</li>
+  <li>捕获异常后静默重试三次</li>
+</ol>
+<div class="explain">这是典型的防呆问题：与其要求模型记住格式，不如让错误的输入形态不可能出现，并在出错时给出可执行的下一步。提示词强调可以作为补充，但不应该是唯一的防线。</div>
+</div>
+
+<div class="quiz" data-answer="4">
+<p class="q">下面哪个 schema 片段最符合跨厂商 strict 模式的"交集"写法？</p>
+<ol>
+  <li><code>{"type":"object","properties":{"owner":{"type":"string"}}}</code></li>
+  <li><code>{"type":"object","properties":{"owner":{"type":"string","minLength":1}},"required":["owner"]}</code></li>
+  <li><code>{"oneOf":[{"type":"object"},{"type":"null"}]}</code></li>
+  <li><code>{"type":"object","additionalProperties":false,"required":["owner"],"properties":{"owner":{"type":["string","null"]}}}</code></li>
+</ol>
+<div class="explain">交集写法：对象带 additionalProperties:false、所有字段 required、可选用"类型或 null"、不用 oneOf、不依赖 minLength 这类约束（改在自己的校验代码里做）。①缺 required 与 additionalProperties，②用了长度约束，③根节点不是 object 且用了 oneOf。</div>
+</div>
+
+<div class="callout case review-link"><b>真实项目复盘</b>
+<p>本章的知识点在两个真实项目里缺位时发生了什么，以及"有这块知识"时会怎么设计：</p>
+<ul><li><a href="review.html#f-D3">D3</a> · devtask 让模型自己填 <code>user_confirmed</code> 来"证明"用户已同意</li><li><a href="review.html#f-D4">D4</a> · devtask 的模型编造过不存在的 open_id、漏传 task_id</li><li><a href="review.html#f-N3">N3</a> · niuma 的一次分析调用要同时输出十几个判断</li></ul></div>
+
+<div class="takeaways"><b>本章要点</b>
+<ul>
+  <li>工具调用就是结构化输出；两者共用 schema、校验和回灌机制。</li>
+  <li>strict 模式保证语法合法，不保证语义正确，代码里永远要校验。</li>
+  <li>可移植 schema 取各家交集：全必填、additionalProperties:false、null 联合表达可选、不用递归与组合关键字。</li>
+  <li>"单一工具 + 校验 + 错误回灌"是跨厂商最稳定的结构化输出模式；拒答、截断、格式错误分开处理。</li>
+  <li>工具按任务设计、少而精、命名空间、语义化返回、控制返回量、错误信息可执行；用防呆设计消灭错误而不是叮嘱模型。</li>
+</ul></div>
+
+<h2>参考资料</h2>
+<ul class="refs">
+  <li><a href="https://www.anthropic.com/engineering/writing-tools-for-agents" target="_blank" rel="noopener">Writing effective tools for agents — with agents</a> <span class="src">Anthropic · 2025-09-11 · 工具设计原则</span></li>
+  <li><a href="https://www.anthropic.com/engineering/building-effective-agents" target="_blank" rel="noopener">Building effective agents</a> <span class="src">Anthropic · 2024-12-19 · ACI 与 poka-yoke</span></li>
+  <li><a href="https://openai.com/index/introducing-structured-outputs-in-the-api/" target="_blank" rel="noopener">Introducing Structured Outputs in the API</a> <span class="src">OpenAI · 2024-08-06</span></li>
+  <li><a href="https://developers.openai.com/api/docs/guides/structured-outputs" target="_blank" rel="noopener">Structured Outputs 指南</a> <span class="src">OpenAI 文档 · strict 模式限制</span></li>
+  <li><a href="https://platform.claude.com/docs/en/build-with-claude/structured-outputs" target="_blank" rel="noopener">Structured outputs</a> <span class="src">Anthropic 文档 · 2025-11-13 起公测，现已稳定</span></li>
+  <li><a href="https://github.com/humanlayer/12-factor-agents" target="_blank" rel="noopener">12-Factor Agents</a> <span class="src">HumanLayer · 第 4 条"工具只是结构化输出"</span></li>
+</ul>
+</article>
+
+<script>
+window.addEventListener('DOMContentLoaded', () => {
+  const schema = {
+    type: 'object',
+    additionalProperties: false,
+    required: ['summary', 'urgency', 'needs_reply', 'tasks'],
+    properties: {
+      summary: { type: 'string' },
+      urgency: { type: 'string', enum: ['low', 'normal', 'high'] },
+      needs_reply: { type: 'boolean' },
+      tasks: {
+        type: 'array',
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['title', 'owner', 'due_date'],
+          properties: {
+            title: { type: 'string' },
+            owner: { type: ['string', 'null'] },
+            due_date: { type: ['string', 'null'] },
+          },
+        },
+      },
+    },
+  };
+  const good = { summary: '同事询问月报导出能否按部门筛选，希望本周内答复', urgency: 'normal', needs_reply: true, tasks: [{ title: '评估月报导出按部门筛选的工作量', owner: null, due_date: '2026-11-27' }] };
+  const presets = [
+    ['合法输出', JSON.stringify(good, null, 2)],
+    ['缺少字段', JSON.stringify({ ...good, tasks: [{ title: '评估月报导出按部门筛选的工作量', owner: null }] }, null, 2)],
+    ['多余字段', JSON.stringify({ ...good, confidence_reason: '因为对方用了"尽快"' }, null, 2)],
+    ['枚举大小写', JSON.stringify({ ...good, urgency: 'High' }, null, 2)],
+    ['类型错误', JSON.stringify({ ...good, needs_reply: 'yes', tasks: '评估工作量' }, null, 2)],
+    ['输出被截断', JSON.stringify(good, null, 2).slice(0, 120)],
+  ];
+  const box = document.getElementById('sv');
+  const sEl = box.querySelector('[data-schema]');
+  const oEl = box.querySelector('[data-output]');
+  const out = box.querySelector('[data-result]');
+  sEl.value = JSON.stringify(schema, null, 2);
+  oEl.value = presets[0][1];
+  presets.forEach(([name, text]) => {
+    const b = Course.el('button', { class: 'btn small', type: 'button', text: name });
+    b.addEventListener('click', () => { oEl.value = text; run(); });
+    box.querySelector('[data-presets]').append(b);
+  });
+
+  const typeOf = (v) => (v === null ? 'null' : Array.isArray(v) ? 'array' : Number.isInteger(v) ? 'integer' : typeof v);
+  const matches = (t, v) => t === typeOf(v) || (t === 'number' && typeof v === 'number');
+  function validate(s, v, path, errs) {
+    if (s.anyOf) {
+      const ok = s.anyOf.some((sub) => { const e = []; validate(sub, v, path, e); return e.length === 0; });
+      if (!ok) errs.push([path, `不符合 anyOf 中的任何一个分支`]);
+      return;
+    }
+    if (s.type) {
+      const types = [].concat(s.type);
+      if (!types.some((t) => matches(t, v))) {
+        errs.push([path, `类型应为 ${types.join(' 或 ')}，实际是 ${typeOf(v)}${typeof v === 'string' ? `（"${v.slice(0, 20)}"）` : ''}`]);
+        return;
+      }
+    }
+    if (s.enum && !s.enum.includes(v)) {
+      const near = typeof v === 'string' ? s.enum.find((e) => String(e).toLowerCase() === v.toLowerCase()) : undefined;
+      errs.push([path, `应为 ${s.enum.map((e) => JSON.stringify(e)).join(' | ')} 之一，实际是 ${JSON.stringify(v)}${near ? `（注意大小写，应为 ${JSON.stringify(near)}）` : ''}`]);
+    }
+    if (typeOf(v) === 'object') {
+      for (const k of s.required || []) if (!(k in v)) errs.push([`${path}.${k}`, '缺少必填字段']);
+      for (const [k, sub] of Object.entries(s.properties || {})) if (k in v) validate(sub, v[k], `${path}.${k}`, errs);
+      if (s.additionalProperties === false) {
+        for (const k of Object.keys(v)) if (!(s.properties || {})[k]) errs.push([`${path}.${k}`, '不允许的额外字段']);
+      }
+    }
+    if (typeOf(v) === 'array' && s.items) v.forEach((item, i) => validate(s.items, item, `${path}[${i}]`, errs));
+  }
+  const esc = (t) => Course.escape(t);
+  function run() {
+    let s;
+    try { s = JSON.parse(sEl.value); } catch (e) { out.innerHTML = `<span class="sv-bad">Schema 本身不是合法 JSON：</span>${esc(e.message)}`; return; }
+    let v;
+    try { v = JSON.parse(oEl.value); } catch (e) {
+      out.innerHTML = `<span class="sv-bad">✗ 输出无法解析为 JSON</span>（${esc(e.message)}）
+        <p style="margin:8px 0 0">这通常是<b>截断</b>（stop_reason = max_tokens）而不是格式错误。不要回灌重试，而是：调大输出上限、精简要求输出的内容，并把这次记为"截断"类失败。</p>`;
+      return;
+    }
+    const errs = [];
+    validate(s, v, '$', errs);
+    if (!errs.length) {
+      out.innerHTML = `<span class="sv-ok">✓ 校验通过</span>：可以作为类型安全的对象交给下游代码。<br><span style="color:var(--muted);font-size:13px">别忘了还有语义校验：摘要长度、日期是否在合理范围、引用编号是否存在……</span>`;
+      return;
+    }
+    const list = errs.map(([p, m]) => `<li><code>${esc(p)}</code>：${esc(m)}</li>`).join('');
+    const feedback = `参数校验失败，请修正后重新调用 emit_result：\n${errs.map(([p, m]) => `✖ ${m}\n  → 位置 ${p}`).join('\n')}`;
+    out.innerHTML = `<span class="sv-bad">✗ ${errs.length} 处错误</span><ul>${list}</ul>
+      <b style="font-size:13px">回灌给模型的 tool_result（isError: true）：</b><div class="sv-feedback">${esc(feedback)}</div>`;
+  }
+  box.querySelector('[data-run]').addEventListener('click', run);
+});
+</script>
+</body>
+</html>

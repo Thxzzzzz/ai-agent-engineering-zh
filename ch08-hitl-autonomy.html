@@ -1,0 +1,563 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>人在回路与自主度 · AI Agent 工程</title>
+<meta name="description" content="提案模式、审批界面设计、按动作×对象分级放权的信任矩阵、auto 模式护栏、何时打扰用户，以及主流框架里的 human-in-the-loop。">
+<link rel="stylesheet" href="assets/css/course.css">
+<script src="assets/js/manifest.js"></script>
+<script defer src="assets/js/course.js"></script>
+<style>
+  .tm-grid { width: 100%; border-collapse: separate; border-spacing: 4px; font-size: 13.5px; }
+  .tm-grid th { background: none; font-weight: 600; color: var(--muted); padding: 4px; white-space: normal; border: 0; text-align: center; }
+  .tm-grid th.rowh { text-align: left; color: var(--text); }
+  .tm-grid td { border: 0; padding: 0; }
+  .tm-cell { width: 100%; border: 1px solid var(--border); border-radius: 7px; padding: 6px 4px; cursor: pointer; font: 600 13px var(--font); color: var(--text); background: var(--surface-2); }
+  .tm-cell[data-l="0"] { background: var(--surface-2); color: var(--muted); }
+  .tm-cell[data-l="1"] { background: var(--accent-soft); color: var(--accent); border-color: color-mix(in srgb, var(--accent) 35%, transparent); }
+  .tm-cell[data-l="2"] { background: var(--warn-soft); color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, transparent); }
+  .tm-cell[data-l="3"] { background: var(--ok-soft); color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, transparent); }
+  .ev { display: grid; grid-template-columns: 1fr auto; gap: 4px 10px; padding: 9px 12px; border: 1px solid var(--border); border-radius: 8px; margin: 6px 0; background: var(--bg); font-size: 14px; }
+  .ev > .pill { align-self: start; white-space: nowrap; }
+  .ev .why { grid-column: 1 / -1; font-size: 12.5px; color: var(--muted); }
+  .ev .src { color: var(--muted); font-size: 12.5px; }
+  .tm-legend { display: flex; flex-wrap: wrap; gap: 6px 12px; font-size: 12.5px; color: var(--muted); margin: 6px 0 10px; }
+  .guards { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 14px; margin: 8px 0; }
+  .guards label { display: inline-flex; gap: 6px; align-items: center; }
+</style>
+</head>
+<body data-page="ch08">
+<article id="content">
+<div class="eyebrow">第三部分 · 可控与可靠 · 第 8 章</div>
+<h1>人在回路与自主度</h1>
+<p class="lead">一个替你处理邮件、日程和工单的 agent，最先遇到的不是"它够不够聪明"，而是"我敢不敢让它替我发出去"。这一章讲怎么把"人"设计进系统：哪些动作必须经你批准，审批界面怎样才不会沦为走过场，以及怎样随着信任积累一格一格地放权。</p>
+<div class="meta"><span>约 40 分钟</span><span>前置：第 1、4 章</span><span>含 1 个分步动画、2 个交互、3 道小测</span></div>
+
+<div class="goals"><b>学完你能</b>
+<ul>
+  <li>用"提案模式"设计 agent 的对外动作，保证系统里不存在"直接发"的代码路径</li>
+  <li>设计一张不会被"无脑批准"的审批卡，并把用户的改写与拒绝变成学习信号</li>
+  <li>用"动作 × 对象"的信任矩阵按风险分级放权，并写出升级与降级规则</li>
+  <li>为自动模式配齐护栏，并用期望成本判断"这件事值不值得打扰用户"</li>
+  <li>在 OpenAI Agents SDK、LangGraph 这类框架里正确实现中断与恢复</li>
+</ul></div>
+
+<h2>1 · 为什么"人"必须是架构的一部分</h2>
+<p>对外动作和普通工具调用有三点本质差异，决定了它们不能像"查一下日历"那样随手执行：</p>
+<ul>
+  <li><strong>不可撤回或撤回有代价。</strong>邮件发出去就被读了，日程改了别人就收到通知了。即使系统支持撤回，对方也可能已经看见。</li>
+  <li><strong>它代表的是你。</strong>agent 发出的每句话，在收件人眼里都是你说的。语气不对、承诺了做不到的时间，损失的是你的信用。</li>
+  <li><strong>错误代价不对称。</strong>少回一封"收到"几乎没有成本；对客户错报一个价格可能很贵。同一个准确率，放在不同动作上意义完全不同。</li>
+</ul>
+<p>所以"要不要人工审批"不是一个产品开关，而是一个<strong>按动作风险分配控制权</strong>的架构问题。第 1 章介绍的五级自主度（Feng、McDonald、Zhang，《Levels of Autonomy for AI Agents》，v2 2025-07-28）给了我们描述它的语言：</p>
+
+<table>
+<tr><th>等级</th><th>用户角色</th><th>用户能做什么</th><th>典型动作</th></tr>
+<tr><td>L1</td><td>操作者 Operator</td><td>主导每一步，agent 按指令执行</td><td>高风险场景，如转账、签约</td></tr>
+<tr><td>L2</td><td>协作者 Collaborator</td><td>共同规划，随时可以接管</td><td>结对写文档、写代码</td></tr>
+<tr><td>L3</td><td>顾问 Consultant</td><td>agent 主导，用户只能给反馈</td><td>agent 写方案，你提意见</td></tr>
+<tr><td>L4</td><td>审批者 Approver</td><td>预设审批条件，只批有后果的动作</td><td>回复邮件、建工单、改日程</td></tr>
+<tr><td>L5</td><td>旁观者 Observer</td><td>只看日志，必要时紧急停止</td><td>自动回"收到"、整理归档</td></tr>
+</table>
+
+<p>论文强调了一个容易被忽略的观点：<strong>自主度是设计选择，与模型能力无关</strong>。一个能力很强的模型也完全可以运行在 L4。同时作者把 L4 的一个核心难题列为开放问题：<em>如何避免审批变成走过场</em>。这正是本章大部分篇幅要解决的。</p>
+
+<div class="callout danger"><b>OWASP ASI09：人对 agent 的过度信任</b>
+<p>OWASP 在 2025-12-09 发布的 <em>Top 10 for Agentic Applications</em> 里，把 "Human-Agent Trust Exploitation" 列为第 9 项：agent 给出一段头头是道的解释，审批人看着有理就点了"批准"。攻击者（或者只是模型自己的幻觉）可以利用这一点，让危险动作带着"合理的理由"通过审批。<strong>审批界面的设计本身就是安全边界。</strong></p></div>
+
+<h2>2 · 提案模式：系统里不存在"直接发"</h2>
+<p>最重要的一条架构约束只有一句话：<strong>一切对外动作皆提案（Proposal）</strong>。模型永远不直接调用"发送邮件"；它只产出一个"建议发送这封邮件"的提案对象，落库，等待策略或用户做决定。执行器只读取状态为 <code>approved</code> 的提案。</p>
+<p>这样做的好处是全局性的：</p>
+<ul>
+  <li><strong>审批、自动执行、撤回走同一条路。</strong>所谓"自动模式"只是"提案被策略自动批准"，而不是另一条绕过审批的代码路径。代码审查时只要盯住执行器一个入口。</li>
+  <li><strong>天然可审计。</strong>每个对外动作都有提案记录：依据哪条消息、模型给了几个选项、谁批的、改了什么、执行结果如何。</li>
+  <li><strong>天然可学习。</strong>"原样批准 / 改写后批准 / 拒绝 / 我自己回了"本身就是最高质量的反馈数据（第 13 章评测会用到）。</li>
+</ul>
+
+<figure class="anim" data-dim>
+<div class="diagram">
+<svg viewBox="0 0 760 300" width="760" role="img" aria-label="一条消息从分析到反馈学习的完整过程">
+  <g data-k="msg"><rect class="box" x="20" y="40" width="110" height="60" rx="10"/><text class="tb" x="75" y="66" text-anchor="middle">新邮件</text><text class="ts" x="75" y="86" text-anchor="middle">客户问报价进度</text></g>
+  <g data-k="ana"><rect class="box a" x="160" y="40" width="120" height="60" rx="10"/><text class="tb" x="220" y="66" text-anchor="middle">分析（LLM）</text><text class="ts" x="220" y="86" text-anchor="middle">摘要 · 是否需回复</text></g>
+  <g data-k="prop"><rect class="box v" x="310" y="40" width="120" height="60" rx="10"/><text class="tb" x="370" y="66" text-anchor="middle">提案</text><text class="ts" x="370" y="86" text-anchor="middle">reply · 两个草稿</text></g>
+  <g data-k="pol"><rect class="box w" x="460" y="40" width="120" height="60" rx="10"/><text class="tb" x="520" y="66" text-anchor="middle">策略</text><text class="ts" x="520" y="86" text-anchor="middle">矩阵 + 护栏</text></g>
+  <g data-k="card"><rect class="box b" x="610" y="40" width="130" height="60" rx="10"/><text class="tb" x="675" y="66" text-anchor="middle">审批卡</text><text class="ts" x="675" y="86" text-anchor="middle">批准 · 改写 · 拒绝</text></g>
+  <g data-k="exec"><rect class="box g" x="610" y="200" width="130" height="60" rx="10"/><text class="tb" x="675" y="226" text-anchor="middle">执行器</text><text class="ts" x="675" y="246" text-anchor="middle">只读 approved</text></g>
+  <g data-k="fb"><rect class="box m" x="420" y="200" width="150" height="60" rx="10"/><text class="tb" x="495" y="226" text-anchor="middle">结果与反馈</text><text class="ts" x="495" y="246" text-anchor="middle">原样 / 改写 / 拒绝</text></g>
+  <g data-k="learn"><rect class="box v" x="200" y="200" width="170" height="60" rx="10"/><text class="tb" x="285" y="226" text-anchor="middle">学习</text><text class="ts" x="285" y="246" text-anchor="middle">示例库 · 偏好 · 放权建议</text></g>
+  <g data-k="e1"><path class="line" d="M130 70 H160" marker-end="url(#arr)"/></g>
+  <g data-k="e2"><path class="line" d="M280 70 H310" marker-end="url(#arr)"/></g>
+  <g data-k="e3"><path class="line" d="M430 70 H460" marker-end="url(#arr)"/></g>
+  <g data-k="e4"><path class="line b" d="M580 70 H610" marker-end="url(#arr-b)"/></g>
+  <g data-k="e5"><path class="line g" d="M675 100 V200" marker-end="url(#arr-g)"/><text class="ts" x="684" y="155">批准</text></g>
+  <g data-k="auto"><path class="line g dash" d="M520 100 C520 170 560 215 610 215" marker-end="url(#arr-g)"/><text class="ts" x="508" y="158" text-anchor="end">L2+ 且护栏全过</text></g>
+  <g data-k="e6"><path class="line" d="M610 230 H570" marker-end="url(#arr)"/></g>
+  <g data-k="e7"><path class="line" d="M420 230 H370" marker-end="url(#arr)"/></g>
+  <g data-k="loop"><path class="line a dash" d="M240 200 C240 160 220 130 220 100" marker-end="url(#arr-a)"/><text class="ts" x="210" y="160" text-anchor="end">带进下一次上下文</text></g>
+</svg>
+</div>
+<ol class="anim-steps">
+  <li data-show="msg" data-hl="msg">客户发来邮件："上周说的报价单什么时候能给？"系统先把它落库、去重，再交给分析。</li>
+  <li data-show="ana e1" data-hl="ana e1">分析是一次结构化输出调用（第 3 章）：摘要、紧急度、<code>needs_reply = true</code>，并起草两个不同语气的回复。注意：这一步<strong>不产生任何对外效果</strong>。</li>
+  <li data-show="prop e2" data-hl="prop e2">代码（不是模型）根据分析结果生成提案：<code>kind = reply</code>、两个候选草稿、依据的消息 ID、置信度。提案以 <code>pending</code> 状态写入数据库。</li>
+  <li data-show="pol e3" data-hl="pol e3">策略层查这类动作对这个人的放权等级（信任矩阵），再过一遍护栏：是否命中敏感词"报价"？是否在静默时段？这一格默认是 L1——出卡。</li>
+  <li data-show="card e4" data-hl="card e4">审批卡推给你：原邮件摘录、草稿、模型的依据、风险提示。你把"明天"改成"周四前"，点"改写后发送"。</li>
+  <li data-show="exec e5" data-hl="e5 exec">提案变成 <code>approved</code>（带上你改写的正文）。执行器只认这个状态，带着幂等键调用邮件 API（第 10 章）。</li>
+  <li data-show="auto" data-hl="auto pol exec">另一条路：如果这一格被放权到 L2 以上、且所有护栏都通过，策略直接把提案置为 <code>approved(auto)</code>。它走的是<strong>同一个执行器</strong>，没有第二条发送路径。</li>
+  <li data-show="fb e6" data-hl="exec e6 fb">执行结果写回提案。"原样批准 / 改写 / 拒绝 / 你自己回了"被记录下来——这比任何人工标注都真实。</li>
+  <li data-show="learn e7 loop" data-hl="fb e7 learn loop">改写前后的对比成为下一次起草的示例；连续多次原样批准的那一格，会触发一张"以后这类直接发？"的放权建议卡。闭环完成。</li>
+</ol>
+<figcaption>图 8-1 提案的一生。自动执行与人工批准共用同一个执行器，这是提案模式的核心。</figcaption>
+</figure>
+
+<p>落到代码，提案是一个普通的领域对象，状态机由代码维护（状态迁移的完整细节见第 10 章）：</p>
+<pre data-title="proposal.ts"><code class="lang-ts">
+export type ProposalKind = 'reply' | 'create_task' | 'update_event' | 'send_external_email';
+export type ProposalStatus = 'pending' | 'approved' | 'executing' | 'done' | 'failed' | 'rejected' | 'expired';
+
+export interface Proposal {
+  id: string;
+  kind: ProposalKind;
+  target: { personId: string | null; conversationId: string };
+  options: string[];            // 模型给出的候选（如两个不同语气的草稿）
+  evidence: string[];           // 依据的消息 ID，审批卡上可跳转原文
+  confidence: number;           // 模型自评，只作为护栏之一，不作为唯一依据
+  status: ProposalStatus;
+  autoApproved: boolean;
+  chosen: { index: number; text: string | null; reason: string | null } | null; // 用户改写与理由
+}
+
+// 执行器只有一个入口，只接受 approved；没有"直接发"的函数
+export async function executeApproved(p: Proposal, deps: Deps): Promise&lt;void&gt; {
+  if (p.status !== 'approved') throw new Error(`提案 ${p.id} 状态为 ${p.status}，拒绝执行`);
+  const text = p.chosen?.text ?? p.options[p.chosen?.index ?? 0];
+  await deps.store.transition(p.id, 'approved', 'executing');
+  try {
+    await deps.sender.send({ to: p.target, text, idempotencyKey: `proposal:${p.id}` });
+    await deps.store.transition(p.id, 'executing', 'done');
+  } catch (err) {
+    await deps.store.fail(p.id, String(err)); // 回到可重试状态，由人决定，见第 10 章
+  }
+}
+</code></pre>
+
+<div class="callout tip"><b>一个可以写进代码审查清单的规则</b>
+<p>在代码库里搜索所有"发送类"API 的调用点（发邮件、发消息、改日程、建工单），每一个都必须只出现在执行器里。任何在分析、工具循环或回调里直接调用的地方，都是绕过审批的后门。</p></div>
+
+<h2>3 · 审批界面：让"批准"是一次真正的判断</h2>
+<p>如果审批卡只显示一段草稿和一个"发送"按钮，用户在第三十张卡时一定会开始无脑点批准。走过场的审批比没有审批更危险——它给了系统"有人把关"的错觉。好的审批卡要让判断<strong>又快又真</strong>：</p>
+<table>
+<tr><th>要素</th><th>为什么</th><th>反模式</th></tr>
+<tr><td>原文摘录 + 跳转链接</td><td>用户要判断的是"这样回对不对"，必须看到对方原话，而不是模型的转述</td><td>只给模型写的摘要——摘要本身可能就是错的</td></tr>
+<tr><td>依据与不确定点</td><td>模型应列出它拿不准的地方（"不确定报价是否含税"）</td><td>一段自信流畅的解释（ASI09 的温床）</td></tr>
+<tr><td>多个候选</td><td>两个不同语气的草稿让用户做"选择题"，比判断一段文本对不对更快</td><td>只有一个草稿，不对就只能拒绝</td></tr>
+<tr><td>改写后发送</td><td>大多数时候草稿"差一点"，改一个词就能发</td><td>只能批准或拒绝，导致用户为了省事批准不完美的草稿</td></tr>
+<tr><td>风险标记</td><td>命中敏感词、对象是外部、首次联系，用醒目的标记提醒放慢</td><td>所有卡长得一样，高风险卡淹没在日常卡里</td></tr>
+<tr><td>可选的拒绝理由</td><td>"太正式了""这个不用回"是可以直接写进规则的反馈</td><td>拒绝就是拒绝，没有信息量</td></tr>
+<tr><td>失效机制</td><td>用户已经亲自回复了，卡片应自动作废，避免重复发送</td><td>旧卡一直挂着，几小时后被误点批准</td></tr>
+</table>
+
+<div class="callout deep"><b>把改写当作最好的训练数据</b>
+<p>用户对提案的四种处理，信息量从低到高：原样批准（模型做对了）＜ 拒绝（不该这样做）＜ 改写后批准（差在哪里一目了然）＜ 用户绕过卡片自己回复（最真实的"标准答案"）。即时用法是把最近的改写对（改前 / 改后）作为起草示例直接放进上下文；定期用法是让模型从一批信号中归纳"稳定的偏好"，生成一条<strong>同样需要审批</strong>的"修改偏好"提案。注意：被新提案取代而作废的、和原样批准的，都不应当作负面信号。</p></div>
+
+<div class="quiz" data-answer="3">
+<p class="q">你的审批卡上线一个月后，数据显示 98% 的卡被原样批准，平均停留时间 1.2 秒。最合理的解读是？</p>
+<ol>
+  <li>模型已经足够好，可以把所有动作都改成自动执行</li>
+  <li>用户很满意，不需要任何改动</li>
+  <li>审批很可能已经流于形式：应该按动作与对象拆开看数据，把真正低风险的格子放权，让剩下的卡更少、更值得认真看</li>
+  <li>应该增加更多确认弹窗，强迫用户认真阅读</li>
+</ol>
+<div class="explain">1.2 秒连原文都看不完。整体放权会把高风险动作一起放出去；加弹窗只会让用户更快地连点。正确做法是<strong>按格子</strong>（动作 × 对象）分析：给"对同事回'收到'"这类格子放权，减少卡片总量，让剩下的卡片（对外部、带金额、首次联系）重新获得注意力。</div>
+</div>
+
+<h2>4 · 信任矩阵：按"动作 × 对象"一格一格放权</h2>
+<p>"这个会话开自动回复"是一个太粗的开关：同一个会话里，"收到"和"报价是 X 元"风险完全不同；同一个动作，对同事和对外部客户也不同。更好的建模是一个二维矩阵：</p>
+<ul>
+  <li><strong>行是动作</strong>：简短应答（"收到""好的"）、实质性回复、创建任务、修改日程、发外部邮件……</li>
+  <li><strong>列是对象</strong>：上级、同事、外部联系人、没有档案的陌生人……（对象由人物档案判断，见第 6 章）</li>
+  <li><strong>每格一个等级</strong>：</li>
+</ul>
+<table>
+<tr><th>等级</th><th>含义</th><th>对应自主度</th></tr>
+<tr><td>L0 不碰</td><td>连提案都不生成</td><td>—</td></tr>
+<tr><td>L1 出卡</td><td>生成提案，等你批准（<strong>所有格子的默认值</strong>）</td><td>审批者</td></tr>
+<tr><td>L2 做了记账</td><td>自动执行，进日报"替你做了什么"，一段时间内可撤回</td><td>旁观者（有通知）</td></tr>
+<tr><td>L3 静默做</td><td>自动执行，不单独通知，日报里只计数</td><td>旁观者</td></tr>
+</table>
+
+<h3>升级与降级规则</h3>
+<p>放权应该由<strong>数据驱动、由人确认</strong>，而不是让 agent 自己给自己升级：</p>
+<ul>
+  <li><strong>升级建议</strong>：某格在观察窗口内（例如 30 天）有足够多已有结论的卡（例如 ≥ 10 张），原样批准率达到阈值（例如 ≥ 90%），且没有撤回记录 → 生成一张"这类事以后直接做？"的设置卡。<strong>批准这张卡才真正改格子</strong>；被拒绝的格子在一个窗口内不再提。</li>
+  <li><strong>降级</strong>：用户撤回了一条自动执行的动作 → 那一格<strong>立即降一级，不需要询问</strong>，并在撤回回执里说明。收紧权限可以单方面做，放宽权限必须经同意。</li>
+</ul>
+<div class="callout note"><b>为什么收和放不对称</b>
+<p>错误放权的代价（对外说错话）远高于错误收权的代价（多看几张卡）。不对称规则让系统在出错后迅速回到安全状态，同时把每一次放权都变成一次显式的、可追溯的人类决定。</p></div>
+
+<h3>动手：信任矩阵模拟器</h3>
+<p>点格子在 L0–L3 之间切换，调整护栏，然后看下方事件流的处理结果。自动执行的事件可以点"撤回"，观察对应格子被降级。</p>
+
+<div class="widget" id="tm">
+<div class="w-title">信任矩阵 + 护栏模拟器</div>
+<div class="tm-legend"><span>点击格子循环切换：</span><span class="pill">L0 不碰</span><span class="pill accent">L1 出卡</span><span class="pill warn">L2 做了记账</span><span class="pill ok">L3 静默做</span></div>
+<div style="overflow-x:auto"><table class="tm-grid" data-grid></table></div>
+<div class="guards">
+  <label><input type="checkbox" data-g="quiet"> 现在是静默时段（23:00–08:00）</label>
+  <label><input type="checkbox" data-g="mention" checked> 群聊须点名我</label>
+  <label><input type="checkbox" data-g="keywords" checked> 敏感词拦截（合同 / 报价 / 付款 / 薪资 / 密码）</label>
+  <label><input type="checkbox" data-g="rate" checked> 每会话每小时最多自动 2 次</label>
+</div>
+<label>置信度阈值：<b data-conf-val>0.80</b></label>
+<input type="range" min="0.5" max="0.99" step="0.01" value="0.8" data-conf>
+<div style="display:flex; gap:8px; margin:10px 0"><button class="btn small" type="button" data-preset>一键：给"对同事的简短应答"放权到 L3</button><button class="btn small" type="button" data-reset>全部恢复默认 L1</button></div>
+<div data-events></div>
+</div>
+
+<div class="quiz" data-answer="2">
+<p class="q">在模拟器里，你把"简短应答 × 同事"设为 L3，但事件"同事在群里说'大家周会改到周四'"仍然被出卡了。最可能的原因是？</p>
+<ol>
+  <li>L3 只对私聊生效</li>
+  <li>群聊消息没有点名你，触发了"群聊须点名我"的护栏，自动执行被降级为出卡</li>
+  <li>置信度永远达不到阈值</li>
+  <li>模拟器坏了</li>
+</ol>
+<div class="explain">矩阵决定"最高能放到哪一级"，护栏决定"这一次能不能真的自动"。任何一条护栏不通过，自动执行都要<strong>降级为出卡</strong>而不是直接丢弃——提案仍然存在，只是需要你看一眼。</div>
+</div>
+
+<h2>5 · 自动模式的护栏</h2>
+<p>即使某一格已经放权，每一次自动执行之前仍要逐条检查护栏。护栏是<strong>确定性代码</strong>，不是提示词里的一句"请谨慎"：</p>
+<table>
+<tr><th>护栏</th><th>防的是什么</th></tr>
+<tr><td>全局暂停开关</td><td>出事时一键止血，所有自动执行立即回到出卡</td></tr>
+<tr><td>会话 / 发件人白名单</td><td>放权只在明确选定的范围生效，新会话默认不自动</td></tr>
+<tr><td>群聊须被点名</td><td>群里大多数消息不是对你说的，自动插话很尴尬</td></tr>
+<tr><td>置信度阈值</td><td>模型自己拿不准时交给人；但置信度只能作为<strong>之一</strong>，模型对错误也可能很自信</td></tr>
+<tr><td>频率上限</td><td>防止失控循环刷屏（例如每会话每小时最多 N 条）</td></tr>
+<tr><td>静默时段</td><td>深夜自动回复既不像本人，也容易在无人监督时出错</td></tr>
+<tr><td>敏感词</td><td>钱、合同、审批、人事、密码类话题一律交给人，同时检查<strong>入站消息和草稿</strong>两侧</td></tr>
+<tr><td>疑似机器人对话</td><td>对方也是自动回复时，两个 agent 会互相回复形成乒乓，必须检测并停止</td></tr>
+<tr><td>特殊来源永远审批</td><td>例如"告诉需求方任务已完成"这类交付通知，内容事关承诺，不进自动化</td></tr>
+</table>
+
+<pre data-title="policy.ts —— 矩阵给上限，护栏决定这一次"><code class="lang-ts">
+type Level = 0 | 1 | 2 | 3;
+type Decision =
+  | { kind: 'drop' }
+  | { kind: 'card'; failed: string[] }       // 出卡等审批，记录未通过的护栏
+  | { kind: 'auto'; notify: boolean };       // L2 通知记账，L3 静默
+
+export function decide(p: Proposal, ctx: PolicyContext): Decision {
+  const level: Level = ctx.matrix.get(actionOf(p), objectOf(p, ctx.people)) ?? 1;
+  if (level === 0) return { kind: 'drop' };
+  if (level === 1) return { kind: 'card', failed: [] };
+
+  const failed: string[] = [];
+  if (ctx.paused) failed.push('全局暂停');
+  if (!ctx.allowConversations.has(p.target.conversationId)) failed.push('会话不在白名单');
+  if (ctx.isGroup &amp;&amp; !ctx.mentionedMe) failed.push('群聊未点名');
+  if (p.confidence &lt; ctx.minConfidence) failed.push(`置信度 ${p.confidence} 低于阈值`);
+  if (ctx.autoCountLastHour(p.target.conversationId) &gt;= ctx.maxPerHour) failed.push('超过每小时上限');
+  if (ctx.inQuietHours(ctx.now)) failed.push('静默时段');
+  if (hitsKeywords([...ctx.inboundTexts, ...p.options], ctx.denyKeywords)) failed.push('命中敏感词');
+  if (ctx.botPingPongSuspected) failed.push('疑似机器人对话');
+
+  return failed.length ? { kind: 'card', failed } : { kind: 'auto', notify: level === 2 };
+}
+</code></pre>
+<p>两个细节：护栏失败时把原因写进日志和卡片（"本可自动，但命中敏感词"），用户才能理解系统的行为；自动执行的只取<strong>第一个</strong>候选，多选一本来就是人的工作。</p>
+
+<h2>6 · 什么时候值得打扰用户</h2>
+<p>人在回路还有另一面：agent 主动找你（推送提醒、请求确认、追问）也是在消耗你的注意力。打扰太多，用户会关掉通知；打扰太少，重要的事被漏掉。这是一个有几十年研究积累的问题。</p>
+<ul>
+  <li><strong>Horvitz 的混合主动原则</strong>（CHI 1999）：自动动作应该按期望效用来权衡——收益乘以"用户真的需要"的概率，减去打扰的成本；拿不准时，发起一次<strong>简短的澄清</strong>，而不是猜。</li>
+  <li><strong>Amershi 等《Guidelines for Human-AI Interaction》</strong>（CHI 2019）的 18 条准则里，与此直接相关的有：G3 根据情境把握服务时机；G15 鼓励细粒度反馈；G18 系统行为变化时通知用户（比如"我从今天起会自动回复这类消息"）。</li>
+  <li><strong>主动式 agent 的评测</strong>：ProactiveBench（ICLR 2025）以"用户是否接受"作为主动提示是否成功的标准；ChatGPT Pulse（2025-09-25）采用夜间异步研究、次日推送卡片、用 👍/👎 调整的形式。</li>
+</ul>
+<p>2026 年的 PRISM 工作把这件事形式化成一个清晰的阈值规则：估计两个概率——用户<strong>需要</strong>帮助的概率 p<sub>need</sub>、用户<strong>接受</strong>这次打扰的概率 p<sub>accept</sub>——再结合误报成本 C<sub>FA</sub>（打扰了但没必要）和漏报成本 C<sub>FN</sub>（该提醒没提醒）：</p>
+<p style="text-align:center; font: 600 17px var(--mono)">打扰 ⇔ p<sub>accept</sub> ≥ τ = C<sub>FA</sub> / (C<sub>FA</sub> + p<sub>need</sub> · C<sub>FN</sub>)</p>
+<p>直觉：漏报越贵、越可能被需要，门槛越低；误报越贵，门槛越高。论文报告这种做法把误报率从 50.22% 降到 22.94%。拖动下面的滑块感受一下：</p>
+
+<div class="widget" id="prism">
+<div class="w-title">打扰决策计算器</div>
+<div class="w-row">
+  <div><label>p<sub>need</sub> 需要帮助的概率：<b data-v="need"></b></label><input type="range" min="0" max="1" step="0.01" value="0.6" data-k="need"></div>
+  <div><label>p<sub>accept</sub> 会接受打扰的概率：<b data-v="accept"></b></label><input type="range" min="0" max="1" step="0.01" value="0.5" data-k="accept"></div>
+  <div><label>C<sub>FA</sub> 误报成本（打扰的代价）：<b data-v="fa"></b></label><input type="range" min="1" max="10" step="0.5" value="2" data-k="fa"></div>
+  <div><label>C<sub>FN</sub> 漏报成本（错过的代价）：<b data-v="fn"></b></label><input type="range" min="1" max="20" step="0.5" value="5" data-k="fn"></div>
+</div>
+<div class="w-out" data-out></div>
+<p style="font-size:13px; color:var(--muted); margin-bottom:0">试试：把 C<sub>FN</sub> 拉到最大，模拟"截止前一小时还没交的报表"；再把 C<sub>FA</sub> 拉高，模拟"用户在开会"。</p>
+</div>
+
+<div class="callout tip"><b>落到工程上的几条做法</b>
+<ul style="margin:0">
+  <li><strong>分级推送</strong>：紧急的立刻推送，普通的攒进早晚两次简报，纯通知类只进日报。</li>
+  <li><strong>用户不在时换策略</strong>：休假或开会期间只推送高紧急度的卡；对私聊里在等你答复的人，可以发一条<strong>开启时由你确认过正文</strong>的占位回复（每人一次），其余攒着；回来时一张交接简报告诉你发生了什么。</li>
+  <li><strong>把打扰也记成数据</strong>：被直接忽略、被立刻关闭的推送，是在告诉你阈值设低了。</li>
+</ul></div>
+
+<h2>7 · 框架里的中断与恢复</h2>
+<p>审批意味着 agent 的执行会<strong>停下来等人</strong>，可能是几秒，也可能是几天。这对实现提出了两个要求：状态能持久化；恢复时不会把已经做过的副作用再做一遍。主流框架的做法：</p>
+
+<div class="tabs">
+<div class="tab-panel" data-label="OpenAI Agents SDK">
+<p>在工具上声明 <code>needsApproval</code>（布尔值或异步函数），运行到这个工具时不执行，而是出现在 <code>result.interruptions</code> 里；人做决定后调用 <code>state.approve()</code> / <code>state.reject()</code>，再把状态交回 <code>run</code> 继续。</p>
+<pre data-title="@openai/agents（TypeScript）"><code class="lang-ts">
+import { Agent, run, tool, RunState } from '@openai/agents';
+import { z } from 'zod';
+
+const sendEmail = tool({
+  name: 'send_email',
+  description: '给指定收件人发邮件',
+  parameters: z.object({ to: z.string(), body: z.string() }),
+  needsApproval: async (_ctx, { to }) =&gt; !to.endsWith('@example.com'), // 外部收件人才需审批
+  execute: async ({ to, body }) =&gt; mailer.send(to, body),
+});
+
+const agent = new Agent({ name: '办公助理', instructions: '…', tools: [sendEmail] });
+let result = await run(agent, '把月报发给客户');
+
+if (result.interruptions.length) {
+  // 等待可能很久：把状态序列化后存到服务端（快照本身不带鉴权，不能交给客户端）
+  await db.saveRun(runId, result.state.toString());
+}
+
+// ……用户在界面上点了批准之后：
+const state = await RunState.fromString(agent, await db.takeRun(runId)); // 原子地取出并删除，防止重放
+for (const item of state.getInterruptions()) state.approve(item);
+result = await run(agent, state);
+</code></pre>
+<p>官方文档特别提醒：序列化的快照<strong>没有鉴权</strong>，应保存在服务端，并且<strong>原子地消费</strong>，防止同一次批准被重放两次。审批人的身份要从你自己的登录会话里取，不能相信请求体里自报的身份。还要注意：原子消费只防止"同一个快照恢复两次"，<strong>并不保证工具的副作用恰好执行一次</strong>——发邮件这类工具自己仍要带幂等键（第 10 章）。</p>
+</div>
+<div class="tab-panel" data-label="LangGraph">
+<p>在节点里调用 <code>interrupt()</code> 暂停，需要配置 checkpointer 和 <code>thread_id</code>；恢复时传入 <code>new Command({ resume: 值 })</code>。</p>
+<pre data-title="LangGraph（TypeScript）"><code class="lang-ts">
+import { interrupt, Command } from '@langchain/langgraph';
+
+async function approveAndSend(state: State) {
+  // ⚠️ 恢复时整个节点会从头重跑：interrupt 之前的代码会再执行一遍
+  const decision = interrupt({ draft: state.draft, to: state.to }); // 第一次运行到这里暂停
+  if (decision.action !== 'approve') return { status: 'rejected' };
+  await mailer.send(state.to, decision.text ?? state.draft, { idempotencyKey: state.proposalId });
+  return { status: 'sent' };
+}
+
+// 恢复：
+await graph.invoke(new Command({ resume: { action: 'approve', text: null } }), {
+  configurable: { thread_id: threadId },
+});
+</code></pre>
+<p>三个必须知道的坑：</p>
+<ul>
+  <li><strong>恢复时整个节点从头重跑。</strong>所以 <code>interrupt()</code> 之前不要放副作用；非放不可的必须幂等，或者挪到单独的节点里。</li>
+  <li><strong>不要用 try/catch 包住 <code>interrupt()</code>。</strong>它靠抛出特殊异常实现暂停，被吞掉就不会暂停。</li>
+  <li><strong>同一节点多次 interrupt 的顺序必须稳定。</strong>恢复值是按调用顺序的下标匹配的，条件分支里时有时无的 interrupt 会导致答案对错位置。</li>
+</ul>
+</div>
+<div class="tab-panel" data-label="自己实现">
+<p>如果你的系统本身就是"提案落库 + 执行器轮询"的结构（第 2 节），审批天然就是异步的：agent 的那一轮在生成提案后就结束了，不需要"挂起的执行"。用户批准只是一次数据库状态更新，执行器下一拍拾取。</p>
+<p>这种结构最简单、最可靠——没有需要序列化的调用栈，也没有"恢复时重跑"的问题。代价是 agent 不能在<strong>同一次推理</strong>里等到审批结果再继续推理；需要"批准后继续做后续步骤"时，把后续步骤建模成由"提案完成"事件触发的新一轮。</p>
+<p>12-Factor Agents 里的两条原则说的正是这件事：<em>Contact humans with tool calls</em>（联系人类也是一次结构化输出）与 <em>Launch/Pause/Resume with simple APIs</em>。</p>
+</div>
+</div>
+
+<div class="quiz" data-answer="4">
+<p class="q">在 LangGraph 的一个节点里，你先调用了 <code>createTicket()</code> 建工单，再调用 <code>interrupt()</code> 等用户确认是否通知客户。用户确认后会发生什么？</p>
+<ol>
+  <li>从 interrupt 那一行继续，一切正常</li>
+  <li>图会报错，因为节点里不能有副作用</li>
+  <li>createTicket 被跳过，因为框架记得它执行过</li>
+  <li>整个节点从头重跑，createTicket 被再调用一次——如果它不幂等，就会多出一张重复工单</li>
+</ol>
+<div class="explain">恢复的语义是"重跑整个节点，在 interrupt 处返回恢复值"。解决办法：把建工单挪到前一个节点，或者给它一个幂等键（例如由线程 ID 派生），保证重跑时服务端识别为同一次请求。</div>
+</div>
+
+<h2>8 · 反模式清单</h2>
+<ul>
+  <li><strong>"自动模式"是另一条代码路径</strong>：审批路径和自动路径各写一套，迟早有一边漏了检查。应该只有一个执行器。</li>
+  <li><strong>让 agent 决定自己的权限</strong>：模型输出"这条可以自动发"并被直接采纳。放权建议只能生成待审批的设置卡。</li>
+  <li><strong>护栏写在提示词里</strong>："不要在深夜自动回复"应该是一行时间判断，而不是一句请求。</li>
+  <li><strong>把置信度当唯一依据</strong>：模型的自评置信度不可靠，只能和其他确定性护栏一起用。</li>
+  <li><strong>按会话一刀切</strong>：给整个会话开自动，等于把这个会话里所有动作的风险一起放出去了。</li>
+  <li><strong>撤回不影响权限</strong>：撤回是最强的负面信号，不降级就等于告诉系统"错了也没关系"。</li>
+  <li><strong>审批卡永不过期</strong>：情况已经变化（对方追问、你亲自回复了）的卡还能被批准，会造成重复或过时的回复。</li>
+</ul>
+
+<div class="callout case review-link"><b>真实项目复盘</b>
+<p>本章的知识点在两个真实项目里缺位时发生了什么，以及"有这块知识"时会怎么设计：</p>
+<ul><li><a href="review.html#f-N6">N6</a> · niuma 7 天推 238 张卡，真正点过的只有一成</li><li><a href="review.html#f-D7">D7</a> · devtask 的授权卡上看不到将要执行的指令</li><li><a href="review.html#f-D8">D8</a> · devtask 授权后，话题里任何人都能经模型驱动编码 agent</li></ul></div>
+
+<div class="takeaways"><b>本章要点</b>
+<ul>
+  <li>对外动作按风险分配控制权；自主度是设计选择，与模型能力无关。</li>
+  <li>一切对外动作皆提案：模型只产出提案，执行器只读 approved，自动执行是"被策略批准"，不是另一条路径。</li>
+  <li>审批卡要展示原文、依据与不确定点，支持多选与改写，防止 ASI09 式的过度信任；改写与拒绝是最好的学习信号。</li>
+  <li>信任矩阵按"动作 × 对象"分级（L0–L3），默认全 L1；升级由数据建议、人来批准，撤回立即降级。</li>
+  <li>护栏是确定性代码，任一不通过就降级为出卡；打扰用户要按期望成本决策。</li>
+  <li>框架中断恢复时要特别注意副作用的幂等与状态的安全保存。</li>
+</ul></div>
+
+<h2>参考资料</h2>
+<ul class="refs">
+  <li><a href="https://arxiv.org/abs/2506.12469" target="_blank" rel="noopener">Levels of Autonomy for AI Agents</a> <span class="src">Feng, McDonald, Zhang · v2 2025-07-28 · 五级用户角色与 L4 的开放问题</span></li>
+  <li><a href="https://genai.owasp.org/2025/12/09/owasp-top-10-for-agentic-applications-the-benchmark-for-agentic-security-in-the-age-of-autonomous-ai/" target="_blank" rel="noopener">OWASP Top 10 for Agentic Applications</a> <span class="src">OWASP · 2025-12-09 · ASI09 Human-Agent Trust Exploitation</span></li>
+  <li><a href="https://openai.github.io/openai-agents-js/guides/human-in-the-loop/" target="_blank" rel="noopener">Human-in-the-loop · OpenAI Agents SDK (JS)</a> <span class="src">OpenAI · needsApproval、interruptions、RunState</span></li>
+  <li><a href="https://docs.langchain.com/oss/javascript/langgraph/interrupts" target="_blank" rel="noopener">Interrupts · LangGraph</a> <span class="src">LangChain · interrupt / Command / checkpointer</span></li>
+  <li><a href="https://www.erichorvitz.com/chi99horvitz.pdf" target="_blank" rel="noopener">Principles of Mixed-Initiative User Interfaces</a> <span class="src">Eric Horvitz · CHI 1999</span></li>
+  <li><a href="https://www.microsoft.com/en-us/research/publication/guidelines-for-human-ai-interaction/" target="_blank" rel="noopener">Guidelines for Human-AI Interaction</a> <span class="src">Amershi et al. · CHI 2019 · 18 条人机交互准则</span></li>
+  <li><a href="https://arxiv.org/abs/2410.12361" target="_blank" rel="noopener">Proactive Agent: Shifting LLM Agents from Reactive Responses to Active Assistance</a> <span class="src">Lu et al. · ICLR 2025 · ProactiveBench</span></li>
+  <li><a href="https://arxiv.org/abs/2602.01532" target="_blank" rel="noopener">PRISM</a> <span class="src">2026-02-02 · 基于 p_need / p_accept 的打扰阈值</span></li>
+  <li><a href="https://openai.com/index/introducing-chatgpt-pulse/" target="_blank" rel="noopener">Introducing ChatGPT Pulse</a> <span class="src">OpenAI · 2025-09-25 · 异步主动推送的产品形态</span></li>
+  <li><a href="https://github.com/humanlayer/12-factor-agents" target="_blank" rel="noopener">12-Factor Agents</a> <span class="src">HumanLayer · Contact humans with tool calls 等原则</span></li>
+</ul>
+</article>
+
+<script>
+window.addEventListener('DOMContentLoaded', () => {
+  // ---------- 信任矩阵模拟器 ----------
+  const actions = [
+    ['ack', '简短应答（收到 / 好的）'],
+    ['reply', '实质性回复'],
+    ['task', '创建任务'],
+    ['event', '修改日程'],
+    ['external', '发外部邮件'],
+  ];
+  const objects = [
+    ['boss', '上级'],
+    ['peer', '同事'],
+    ['ext', '外部联系人'],
+    ['unknown', '陌生人'],
+  ];
+  const labels = ['L0 不碰', 'L1 出卡', 'L2 记账', 'L3 静默'];
+  const KEYWORDS = ['合同', '报价', '付款', '薪资', '密码'];
+  const events = [
+    { conv: 'c1', obj: 'peer', act: 'ack', group: false, mention: true, conf: 0.95, text: '同事私聊："周报模板我发你邮箱了"' },
+    { conv: 'c2', obj: 'peer', act: 'ack', group: true, mention: false, conf: 0.9, text: '同事在群里："大家周会改到周四"' },
+    { conv: 'c3', obj: 'boss', act: 'reply', group: false, mention: true, conf: 0.86, text: '上级："月报导出加部门筛选，今天能好吗？"' },
+    { conv: 'c4', obj: 'ext', act: 'reply', group: false, mention: true, conf: 0.92, text: '客户："上周说的报价单什么时候给？"' },
+    { conv: 'c1', obj: 'peer', act: 'task', group: false, mention: true, conf: 0.88, text: '同事："帮忙把会议纪要里的三条待办建成任务"' },
+    { conv: 'c1', obj: 'peer', act: 'ack', group: false, mention: true, conf: 0.97, text: '同事私聊："纪要发群里了"' },
+    { conv: 'c1', obj: 'peer', act: 'ack', group: false, mention: true, conf: 0.96, text: '同事私聊："附件也补上了"' },
+    { conv: 'c5', obj: 'unknown', act: 'reply', group: false, mention: true, conf: 0.9, text: '陌生人："您好，想约您聊聊合作"' },
+    { conv: 'c6', obj: 'peer', act: 'ack', group: false, mention: true, conf: 0.94, bot: true, text: '对方自动回复："我正在休假，回来后处理"' },
+    { conv: 'c3', obj: 'boss', act: 'event', group: false, mention: true, conf: 0.72, text: '上级："明早的会挪到下午三点"' },
+  ];
+  const root = document.getElementById('tm');
+  const grid = root.querySelector('[data-grid]');
+  const list = root.querySelector('[data-events]');
+  const conf = root.querySelector('[data-conf]');
+  const confVal = root.querySelector('[data-conf-val]');
+  const guards = {};
+  root.querySelectorAll('[data-g]').forEach((c) => (guards[c.dataset.g] = c));
+  let matrix = {};
+  const resetMatrix = () => {
+    matrix = {};
+    for (const [a] of actions) for (const [o] of objects) matrix[a + ':' + o] = 1;
+  };
+  const revoked = new Set();
+  resetMatrix();
+
+  const drawGrid = () => {
+    let html = '<tr><th></th>' + objects.map(([, n]) => `<th>${n}</th>`).join('') + '</tr>';
+    for (const [a, an] of actions) {
+      html += `<tr><th class="rowh">${an}</th>`;
+      for (const [o] of objects) {
+        const l = matrix[a + ':' + o];
+        html += `<td><button type="button" class="tm-cell" data-cell="${a}:${o}" data-l="${l}">${labels[l]}</button></td>`;
+      }
+      html += '</tr>';
+    }
+    grid.innerHTML = html;
+  };
+
+  const decideAll = () => {
+    const autoCount = {};
+    const t = Number(conf.value);
+    confVal.textContent = t.toFixed(2);
+    list.innerHTML = '<div style="font-size:13px;color:var(--muted);margin-top:4px">事件流（按时间顺序处理）</div>';
+    events.forEach((e, idx) => {
+      const level = matrix[e.act + ':' + e.obj];
+      let tag;
+      let why = '';
+      if (level === 0) {
+        tag = '<span class="pill">不处理</span>';
+        why = '这一格是 L0：连提案都不生成。';
+      } else if (level === 1) {
+        tag = '<span class="pill accent">出卡待审批</span>';
+        why = '这一格是 L1：生成提案，等你决定。';
+      } else {
+        const failed = [];
+        if (guards.quiet.checked) failed.push('静默时段');
+        if (guards.mention.checked && e.group && !e.mention) failed.push('群聊未点名');
+        if (e.conf < t) failed.push(`置信度 ${e.conf} < ${t.toFixed(2)}`);
+        if (guards.keywords.checked && KEYWORDS.some((k) => e.text.includes(k))) failed.push('命中敏感词');
+        if (guards.rate.checked && (autoCount[e.conv] || 0) >= 2) failed.push('超过每小时上限');
+        if (e.bot) failed.push('疑似机器人对话');
+        if (failed.length) {
+          tag = '<span class="pill accent">降级为出卡</span>';
+          why = `这一格是 L${level}，但护栏未通过：${failed.join('、')}。`;
+        } else {
+          autoCount[e.conv] = (autoCount[e.conv] || 0) + 1;
+          tag = level === 2 ? '<span class="pill warn">自动执行 · 记账</span>' : '<span class="pill ok">静默执行</span>';
+          why = level === 2 ? '自动执行，进日报"替你做了"，可撤回。' : '自动执行，日报里只计数。';
+          if (!revoked.has(idx)) why += ` <button class="btn small" type="button" data-revoke="${idx}">撤回</button>`;
+        }
+      }
+      const obj = objects.find(([k]) => k === e.obj)[1];
+      const act = actions.find(([k]) => k === e.act)[1];
+      list.insertAdjacentHTML('beforeend', `<div class="ev"><span>${e.text}<br><span class="src">动作：${act} · 对象：${obj}${e.group ? ' · 群聊' : ''} · 置信度 ${e.conf}</span></span>${tag}<div class="why">${why}</div></div>`);
+    });
+  };
+  const render = () => (drawGrid(), decideAll());
+
+  grid.addEventListener('click', (ev) => {
+    const b = ev.target.closest('[data-cell]');
+    if (!b) return;
+    matrix[b.dataset.cell] = (matrix[b.dataset.cell] + 1) % 4;
+    render();
+  });
+  list.addEventListener('click', (ev) => {
+    const b = ev.target.closest('[data-revoke]');
+    if (!b) return;
+    const e = events[Number(b.dataset.revoke)];
+    const key = e.act + ':' + e.obj;
+    matrix[key] = Math.max(1, matrix[key] - 1);
+    revoked.add(Number(b.dataset.revoke));
+    render();
+    list.insertAdjacentHTML('afterbegin', `<div class="callout warn" style="margin:6px 0"><b>已撤回</b>"${e.text}" 对应的格子立即降一级（现在是 L${matrix[key]}），不需要询问——收权可以单方面做，放权必须经你同意。</div>`);
+  });
+  root.querySelectorAll('[data-g]').forEach((c) => c.addEventListener('change', render));
+  conf.addEventListener('input', render);
+  root.querySelector('[data-preset]').addEventListener('click', () => {
+    matrix['ack:peer'] = 3;
+    render();
+  });
+  root.querySelector('[data-reset]').addEventListener('click', () => {
+    resetMatrix();
+    revoked.clear();
+    render();
+  });
+  render();
+
+  // ---------- 打扰决策计算器 ----------
+  const pr = document.getElementById('prism');
+  const val = (k) => Number(pr.querySelector(`[data-k="${k}"]`).value);
+  const calc = () => {
+    for (const k of ['need', 'accept', 'fa', 'fn']) pr.querySelector(`[data-v="${k}"]`).textContent = val(k);
+    const tau = val('fa') / (val('fa') + val('need') * val('fn'));
+    const go = val('accept') >= tau;
+    pr.querySelector('[data-out]').innerHTML =
+      `τ = ${val('fa')} / (${val('fa')} + ${val('need')} × ${val('fn')}) = <b>${tau.toFixed(3)}</b><br>` +
+      `p<sub>accept</sub> = ${val('accept')} ${go ? '≥' : '<'} τ → ` +
+      (go ? '<span class="pill ok">值得打扰：立即推送</span>' : '<span class="pill">先不打扰：攒进简报</span>') +
+      `<div class="bar" style="margin-top:10px"><i style="width:${Math.min(100, tau * 100)}%;background:var(--warn)"></i></div>` +
+      '<small style="color:var(--muted)">黄色条长度 = 门槛 τ；p<sub>accept</sub> 越过它才推送。</small>';
+  };
+  pr.querySelectorAll('input').forEach((i) => i.addEventListener('input', calc));
+  calc();
+});
+</script>
+</body>
+</html>

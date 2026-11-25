@@ -1,0 +1,903 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P7 编码驾驭器 · AI Agent 工程</title>
+<meta name="description" content="跟练项目 P7：用 Bun 写一个编码 agent 驾驭器——人确认后启动、git worktree 隔离、headless 运行、读 git 与 gh 判断客观进度、Stop hook、功能清单与独立复核。">
+<link rel="stylesheet" href="assets/css/course.css">
+<script src="assets/js/manifest.js"></script>
+<script defer src="assets/js/course.js"></script>
+<style>
+  .hx-console { background: var(--code-bg); color: var(--code-text); border-radius: 8px; padding: 10px 14px; font: 12.5px/1.65 var(--mono); height: 260px; overflow-y: auto; white-space: pre-wrap; word-break: break-word; }
+  .hx-console .w { color: #f0c674; }
+  .hx-console .e { color: #ef7676; }
+  .hx-console .g { color: #8fd18f; }
+  .hx-console .m { color: #8a93a6; }
+  .hx-side { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; margin-top: 10px; }
+  .hx-side .w-out { margin-top: 0; }
+  .hx-btns { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
+  @media (max-width: 600px) { .hx-side { grid-template-columns: minmax(0, 1fr); } }
+</style>
+</head>
+<body data-page="p7">
+<article id="content">
+<div class="eyebrow">跟练项目 · P7</div>
+<h1>P7 · 编码 Agent 驾驭器</h1>
+<p class="lead">编码 agent 已经很能干，但把它放进真实仓库跑几个小时，问题就变成了工程问题：在哪儿跑、能动什么、做到哪了、什么时候算完、跑偏了谁来拉回来。这个项目写一个小型"驾驭器"（harness）来回答这些问题。</p>
+<div class="meta"><span>约 150 分钟</span><span>前置：第 10 章、第 12 章</span><span>含 1 个分步动画、1 个控制台模拟、1 道小测</span></div>
+
+<div class="goals"><b>做完你能</b>
+<ul>
+  <li>用 git worktree 给每个任务一个隔离的目录与分支，并安全地收尾清理</li>
+  <li>以 headless 方式驱动编码 agent，解析它的事件流，记录进度与成本</li>
+  <li>用 git 与 gh 的客观状态（提交、PR、CI）判断进度，而不是相信 agent 的自述</li>
+  <li>用功能清单、进度文件、Stop hook 和独立复核，对付"上下文耗尽"和"过早宣布完成"两类典型失败</li>
+</ul></div>
+
+<div class="callout warn"><b>关于命令行参数</b>
+<p>本页用 Claude Code 的 print 模式（<code>claude -p</code>）作为主示例，并给出 OpenAI Codex（<code>codex exec</code>）的替代写法。两者的参数、事件字段和权限规则语法都在快速演进，<strong>以各自官方文档为准</strong>，本页核对于 2026-11。驾驭器把与具体 agent 相关的部分集中在 <code>harness/agent.ts</code> 一个文件里，换 agent 只改这里。</p></div>
+
+<h2>1 · 成品是什么</h2>
+<p>一条命令：<code>bun harness/main.ts tasks/export-filter.json</code>。任务文件由人写：标题、仓库、验收点、复核命令、轮数与预算上限。驾驭器负责其余的一切：</p>
+
+<figure class="anim" data-dim>
+<div class="diagram">
+<svg viewBox="0 0 760 380" width="760" role="img" aria-label="驾驭器的任务生命周期">
+  <g data-k="task"><rect class="box m" x="20" y="20" width="140" height="56" rx="10"/><text class="tb" x="90" y="44" text-anchor="middle">任务文件</text><text class="ts" x="90" y="63" text-anchor="middle">验收点 · 预算</text></g>
+  <g data-k="ok"><rect class="box w" x="200" y="20" width="140" height="56" rx="10"/><text class="tb" x="270" y="44" text-anchor="middle">人确认启动</text><text class="ts" x="270" y="63" text-anchor="middle">输入任务 id</text></g>
+  <g data-k="wt"><rect class="box g" x="380" y="20" width="160" height="56" rx="10"/><text class="tb" x="460" y="44" text-anchor="middle">git worktree</text><text class="ts" x="460" y="63" text-anchor="middle">隔离目录 + 新分支</text></g>
+  <g data-k="files"><rect class="box v" x="580" y="20" width="160" height="56" rx="10"/><text class="tb" x="660" y="44" text-anchor="middle">驾驭文件</text><text class="ts" x="660" y="63" text-anchor="middle">功能清单 · 进度文件</text></g>
+  <g data-k="agent"><rect class="box a" x="200" y="140" width="200" height="70" rx="12"/><text class="tb" x="300" y="168" text-anchor="middle">一轮：全新上下文</text><text class="ts" x="300" y="190" text-anchor="middle">claude -p … stream-json</text></g>
+  <g data-k="hook"><rect class="box r" x="20" y="148" width="140" height="56" rx="10"/><text class="tb" x="90" y="172" text-anchor="middle">Stop hook</text><text class="ts" x="90" y="191" text-anchor="middle">未提交 → exit 2</text></g>
+  <g data-k="check"><rect class="box b" x="460" y="140" width="280" height="70" rx="12"/><text class="tb" x="600" y="166" text-anchor="middle">轮后核对</text><text class="ts" x="600" y="186" text-anchor="middle">清单只改 passes？git / gh 快照</text><text class="ts" x="600" y="202" text-anchor="middle">预算、停滞刹车</text></g>
+  <g data-k="verify"><rect class="box g" x="200" y="280" width="200" height="70" rx="12"/><text class="tb" x="300" y="308" text-anchor="middle">独立复核</text><text class="ts" x="300" y="328" text-anchor="middle">复核命令 + 清单 + CI</text></g>
+  <g data-k="clean"><rect class="box w" x="460" y="280" width="280" height="70" rx="12"/><text class="tb" x="600" y="308" text-anchor="middle">收尾（需确认）</text><text class="ts" x="600" y="328" text-anchor="middle">有未保存的工作就拒绝 · 归档记录</text></g>
+  <g data-k="e1"><path class="line" d="M160 48 H200" marker-end="url(#arr)"/><path class="line" d="M340 48 H380" marker-end="url(#arr)"/><path class="line" d="M540 48 H580" marker-end="url(#arr)"/></g>
+  <g data-k="e2"><path class="line a" d="M660 76 C660 110 300 105 300 140" marker-end="url(#arr-a)"/></g>
+  <g data-k="e3"><path class="line r" d="M200 168 H160" marker-end="url(#arr-r)"/><path class="line r dash" d="M160 186 H200" marker-end="url(#arr-r)"/></g>
+  <g data-k="e4"><path class="line b" d="M400 175 H460" marker-end="url(#arr-b)"/></g>
+  <g data-k="e5"><path class="line b dash" d="M600 210 C600 252 370 252 370 212" marker-end="url(#arr-b)"/><text class="ts" x="485" y="266" text-anchor="middle">还有未通过的功能 → 下一轮</text></g>
+  <g data-k="e6"><path class="line g" d="M260 210 V280" marker-end="url(#arr-g)"/><text class="ts" x="252" y="250" text-anchor="end">全部通过</text></g>
+  <g data-k="e7"><path class="line" d="M400 315 H460" marker-end="url(#arr)"/></g>
+</svg>
+</div>
+<ol class="anim-steps">
+  <li data-show="task ok wt files e1" data-hl="task">任务由人写成文件：验收点每条一句可验证的话，外加独立复核用的命令、最多几轮、预算多少。驾驭器不替人改需求。</li>
+  <li data-hl="ok">启动前把计划完整打印出来，要求输入任务 id 才放行。"会花钱、会改代码"的动作，默认需要人点头。</li>
+  <li data-hl="wt">用 <code>git worktree</code> 从 <code>origin/main</code> 开一个独立目录和新分支。多个任务可以并行，互不踩脚，也不碰你正在用的工作区。</li>
+  <li data-hl="files">把验收点展开成 <code>features.json</code>（全部 <code>passes: false</code>），再建一个进度文件。它们放在 <code>.harness/</code> 下，写进 <code>info/exclude</code>，不进版本库。</li>
+  <li data-show="agent e2" data-hl="agent e2">每一轮都启动一个<strong>全新上下文</strong>的 agent：先读进度文件和 git log，再挑一条没通过的功能，只做这一条。状态全靠文件和提交传递，而不是靠越来越长的对话。</li>
+  <li data-show="hook e3" data-hl="hook e3">agent 想停下时，Stop hook 检查有没有未提交的改动：有就以退出码 2 阻止停止，把提醒交回给它；已经续跑过一次就放行，避免死循环。</li>
+  <li data-show="check e4" data-hl="check e4">每轮结束，驾驭器自己核对：功能清单除了 <code>passes</code> 有没有被改；读 git（未提交、新提交、未推送）与 gh（PR、CI）。超预算或连续两轮没有新提交就刹车。</li>
+  <li data-show="e5" data-hl="e5 agent">还有没通过的功能，就开下一轮。每轮做一个功能、提交一次、追加一段进度记录。</li>
+  <li data-show="verify e6" data-hl="verify e6">全部标为通过后，驾驭器<strong>自己</strong>运行复核命令、检查 CI，不采信 agent"我做完了"的说法。过早宣布完成是长任务最常见的失败。</li>
+  <li data-show="clean e7" data-hl="clean">最后询问是否清理工作目录：有未提交或未推送的工作就拒绝；删除前把 <code>.harness/</code> 归档，分支和 PR 保留给人评审。</li>
+</ol>
+<figcaption>图 P7-1 驾驭器的任务生命周期。</figcaption>
+</figure>
+
+<h2>2 · 练到的能力</h2>
+<table>
+<tr><th>能力</th><th>对应章节</th></tr>
+<tr><td>长任务的两类失败；initializer、功能清单、进度文件；每轮一个功能</td><td><a href="ch12-long-running.html">第 12 章 长任务与编码 Agent 的驾驭</a></td></tr>
+<tr><td>崩溃后能接着跑、幂等的启动步骤、确认后才做的不可逆操作</td><td><a href="ch10-durable-execution.html">第 10 章 可靠执行</a></td></tr>
+<tr><td>按动作风险分配自主度：启动与清理需确认，编码过程自主</td><td><a href="ch08-hitl-autonomy.html">第 8 章 人在回路与自主度</a></td></tr>
+<tr><td>事件流记录、成本累计、预算刹车</td><td><a href="ch14-observability.html">第 14 章 可观测性、成本与运维</a></td></tr>
+</table>
+
+<h2>3 · 前置</h2>
+<ul>
+  <li>本机装好并登录 <code>git</code>、<code>gh</code>，以及至少一个编码 agent 的命令行（Claude Code 或 Codex）。</li>
+  <li>准备一个<strong>练习用的仓库</strong>（有测试命令、能推到远端），不要第一次就拿重要仓库试。</li>
+  <li>驾驭器不依赖 P1–P6 的代码，可以独立完成；进阶挑战里会把它接回 P3 的审批流和 P6 的评测。</li>
+</ul>
+
+<h2>4 · 先玩一下：驾驭器控制台模拟</h2>
+<p>这是一个纯前端的模拟，没有真的启动任何 agent。按顺序点按钮，再试试两个"故障注入"，看驾驭器怎么应对：</p>
+<div class="widget" id="hx">
+<div class="w-title">驾驭器控制台（模拟）</div>
+<div class="hx-btns">
+  <button class="btn primary" type="button" data-a="start">输入 id 确认启动</button>
+  <button class="btn" type="button" data-a="round" disabled>推进一轮</button>
+  <button class="btn" type="button" data-a="stop" disabled>注入：带着未提交改动想停下</button>
+  <button class="btn" type="button" data-a="tamper" disabled>注入：改写功能描述</button>
+  <button class="btn" type="button" data-a="reset">重来</button>
+</div>
+<div class="hx-console" data-log aria-live="polite"></div>
+<div class="hx-side">
+  <div class="w-out" data-feat></div>
+  <div class="w-out" data-snap></div>
+</div>
+</div>
+
+<h2>5 · 目录与文件</h2>
+<div class="callout tip"><b>参考实现</b>
+<p>本项目的完整代码在课程仓库的 <code>agent-lab/</code> 目录：<code>harness/</code>、<code>tasks/</code> 与 <code>tests/harness.test.ts</code>。所有项目共用一个仓库、一套测试，说明见 <a href="agent-lab/README.md">agent-lab/README.md</a>。建议先自己写，卡住了再对照。</p></div>
+<pre data-title="P7 新增的文件"><code>
+agent-lab/
+├── harness/
+│   ├── task.ts            # 任务文件 schema 与分支命名
+│   ├── sh.ts              # 运行外部命令、需输入确认词的确认
+│   ├── worktree.ts        # 建 worktree、清理前核对、归档后删除
+│   ├── features.ts        # 功能清单：初始化、完整性核对、修复
+│   ├── progress.ts        # git 与 gh 的客观进度快照、CI 状态归类
+│   ├── agent.ts           # 启动编码 agent、解析事件流（换 agent 只改这里）
+│   ├── stop-hook.ts       # Claude Code 的 Stop hook
+│   ├── prompts.ts         # 每轮的提示词、进度文件模板
+│   └── main.ts            # 生命周期编排
+├── tasks/export-filter.json
+└── tests/harness.test.ts
+</code></pre>
+
+<h2>6 · 分步实现</h2>
+
+<h3>6.1 任务文件</h3>
+<p>验收点写成"可验证的一句话"，复核命令由人指定。<code>id</code> 会拼进分支名和目录名，所以只允许安全字符。</p>
+<pre data-title="tasks/export-filter.json"><code class="lang-json">
+{
+  "id": "export-filter",
+  "title": "月报导出支持按部门筛选",
+  "repo": "/Users/you/code/report-service",
+  "base": "main",
+  "agent": "claude",
+  "acceptance": [
+    "导出接口接受 department 参数，只导出该部门的数据",
+    "不传 department 时导出全部部门，与现在的行为一致",
+    "导出文件名包含筛选的部门名"
+  ],
+  "verify": ["bun", "test"],
+  "maxSessions": 6,
+  "maxCostUsd": 5
+}
+</code></pre>
+<pre data-title="harness/task.ts"><code class="lang-ts">
+import { z } from 'zod';
+
+// 一个开发任务：由人写好，驾驭器只负责执行与核对，不替人改需求。
+export const CodingTaskSchema = z.object({
+  id: z.string().regex(/^[a-z0-9-]{3,40}$/, '只用小写字母、数字和连字符，3–40 位'),
+  title: z.string().min(1),
+  repo: z.string().min(1).describe('仓库主目录的绝对路径'),
+  base: z.string().default('main'),
+  agent: z.enum(['claude', 'codex']).default('claude'),
+  acceptance: z.array(z.string().min(1)).min(1).describe('验收点，每条一句可验证的话'),
+  verify: z.array(z.string()).min(1).describe('独立复核用的命令，如 ["bun", "test"]'),
+  maxSessions: z.number().int().min(1).max(30).default(8),
+  maxCostUsd: z.number().positive().default(5),
+});
+export type CodingTask = z.infer&lt;typeof CodingTaskSchema&gt;;
+
+export async function loadTask(path: string): Promise&lt;CodingTask&gt; {
+  const parsed = CodingTaskSchema.safeParse(await Bun.file(path).json());
+  if (!parsed.success) throw new Error(`任务文件 ${path} 不合法：\n${z.prettifyError(parsed.error)}`);
+  return parsed.data;
+}
+
+export function branchName(task: CodingTask): string {
+  return `agent/${task.id}`;
+}
+</code></pre>
+
+<h3>6.2 命令执行与确认</h3>
+<p>需要人确认的步骤要求输入一个特定的词（任务 id、<code>remove</code>），而不是回车即过——习惯性回车是"走过场的审批"最常见的形态。</p>
+<pre data-title="harness/sh.ts"><code class="lang-ts">
+// 运行外部命令。所有 git / gh / agent 调用都经这里，统一拿到退出码与输出。
+export type ShResult = { code: number; stdout: string; stderr: string };
+
+export async function sh(cmd: string[], cwd: string, opts: { timeoutMs?: number } = {}): Promise&lt;ShResult&gt; {
+  const proc = Bun.spawn(cmd, { cwd, stdout: 'pipe', stderr: 'pipe', timeout: opts.timeoutMs ?? 120_000 });
+  const [stdout, stderr, code] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+  return { code, stdout: stdout.trim(), stderr: stderr.trim() };
+}
+
+export async function shOk(cmd: string[], cwd: string): Promise&lt;string&gt; {
+  const r = await sh(cmd, cwd);
+  if (r.code !== 0) throw new Error(`命令失败（${r.code}）：${cmd.join(' ')}\n${r.stderr || r.stdout}`);
+  return r.stdout;
+}
+
+// 需要人确认的步骤：要求输入指定的词，避免手滑回车就放行。
+export function confirmByTyping(question: string, expected: string): boolean {
+  const answer = prompt(`${question}\n确认请输入 ${expected}：`);
+  return answer?.trim() === expected;
+}
+</code></pre>
+
+<h3>6.3 worktree：隔离与安全清理</h3>
+<p>两个细节值得注意：驾驭器的文件写进 <code>info/exclude</code>，这样它们不会出现在 <code>git status</code> 里、不会被 agent 误提交；而 <code>git worktree remove</code> 仍会因为这些被忽略的文件拒绝删除，所以先由我们自己核对"有没有真正的未保存工作"，归档后再强制删除。</p>
+<pre data-title="harness/worktree.ts"><code class="lang-ts">
+import { appendFile, cp, mkdir } from 'node:fs/promises';
+import { homedir } from 'node:os';
+import { basename, join, resolve } from 'node:path';
+import { sh, shOk } from './sh';
+import { branchName, type CodingTask } from './task';
+
+// worktree 放在仓库外，避免出现在仓库自己的 git status 里。
+export function worktreePath(task: CodingTask): string {
+  return join(homedir(), '.agent-lab', 'worktrees', basename(task.repo), task.id);
+}
+
+export async function createWorktree(task: CodingTask): Promise&lt;string&gt; {
+  const path = worktreePath(task);
+  if (await Bun.file(join(path, '.git')).exists()) return path; // 重跑时接着用
+  await mkdir(join(path, '..'), { recursive: true });
+  await shOk(['git', 'fetch', 'origin', task.base], task.repo);
+  await shOk(['git', 'worktree', 'add', '-b', branchName(task), path, `origin/${task.base}`], task.repo);
+  // 驾驭器自己的文件不进版本库：写进所有 worktree 共用的 info/exclude
+  const common = resolve(path, await shOk(['git', 'rev-parse', '--git-common-dir'], path));
+  await appendFile(join(common, 'info', 'exclude'), '\n/.harness/\n/.claude/settings.local.json\n');
+  return path;
+}
+
+export type CleanupCheck = { ok: boolean; reasons: string[] };
+
+// 删除前核对：有未提交改动或未推送的提交就不删，免得丢工作。
+export async function checkRemovable(path: string): Promise&lt;CleanupCheck&gt; {
+  const reasons: string[] = [];
+  const status = await shOk(['git', 'status', '--porcelain'], path);
+  if (status) reasons.push(`有未提交的改动：\n${status}`);
+  // 不和 @{u} 比：从 origin/main 建出的分支会默认跟踪 origin/main，推送时没加 -u 就会误报。
+  // 只看"有没有本地提交不在任何远端分支上"，推到哪个远端分支都算已推送。
+  const unpushed = await shOk(['git', 'rev-list', '--count', 'HEAD', '--not', '--remotes'], path);
+  if (Number(unpushed) &gt; 0) reasons.push(`有 ${unpushed} 个提交没推送到任何远端分支`);
+  return { ok: reasons.length === 0, reasons };
+}
+
+// 调用前必须先过 checkRemovable。剩下的只有驾驭器自己的被忽略文件（.harness/ 等），
+// git 仍会因它们拒绝删除，所以先把 .harness/ 归档到运行记录目录，再强制删除。分支保留，PR 不受影响。
+export async function removeWorktree(task: CodingTask): Promise&lt;string&gt; {
+  const path = worktreePath(task);
+  const archive = join(homedir(), '.agent-lab', 'runs', `${task.id}-${Date.now()}`);
+  await mkdir(archive, { recursive: true });
+  await cp(join(path, '.harness'), archive, { recursive: true });
+  await shOk(['git', 'worktree', 'remove', '--force', path], task.repo);
+  return archive;
+}
+</code></pre>
+
+<h3>6.4 功能清单：只许改 passes</h3>
+<p>Anthropic 在长任务驾驭的实践里发现：用 JSON 而不是 Markdown 记功能清单，模型更不容易随手改写；并且要明确规定 agent 只能改 <code>passes</code> 字段。驾驭器在每轮后核对，越权的改动恢复、合法的保留。</p>
+<pre data-title="harness/features.ts"><code class="lang-ts">
+// 功能清单：把验收点展开成 JSON，agent 只允许改 passes 字段。
+// 用 JSON 而不是 Markdown：模型更不容易随手改写 JSON 的结构和措辞。
+export type Feature = { id: string; description: string; passes: boolean };
+
+export function initFeatures(acceptance: string[]): Feature[] {
+  return acceptance.map((description, i) =&gt; ({ id: `F${i + 1}`, description, passes: false }));
+}
+
+// 对比一轮前后的清单：除了 passes，任何改动（删条目、改描述、加条目）都算违规。
+export function checkIntegrity(before: Feature[], after: unknown): string[] {
+  if (!Array.isArray(after)) return ['features.json 不再是数组'];
+  const violations: string[] = [];
+  if (after.length !== before.length) violations.push(`条目数从 ${before.length} 变成了 ${after.length}`);
+  before.forEach((b, i) =&gt; {
+    const a = after[i] as Partial&lt;Feature&gt; | undefined;
+    if (!a) return;
+    if (a.id !== b.id) violations.push(`第 ${i + 1} 条的 id 被改成了 ${String(a.id)}`);
+    if (a.description !== b.description) violations.push(`${b.id} 的描述被改动`);
+    if (typeof a.passes !== 'boolean') violations.push(`${b.id} 的 passes 不是布尔值`);
+    const extra = Object.keys(a).filter((k) =&gt; !['id', 'description', 'passes'].includes(k));
+    if (extra.length) violations.push(`${b.id} 多了字段：${extra.join('、')}`);
+  });
+  return violations;
+}
+
+// 合法的那部分改动（passes）保留，其余恢复原样。
+export function repair(before: Feature[], after: unknown): Feature[] {
+  const list = Array.isArray(after) ? (after as Array&lt;Partial&lt;Feature&gt;&gt;) : [];
+  return before.map((b) =&gt; {
+    const a = list.find((x) =&gt; x?.id === b.id);
+    return { ...b, passes: typeof a?.passes === 'boolean' ? a.passes : b.passes };
+  });
+}
+
+export function allPass(features: Feature[]): boolean {
+  return features.every((f) =&gt; f.passes);
+}
+</code></pre>
+
+<h3>6.5 客观进度：读 git 与 gh</h3>
+<p>agent 说"我已经提交并开了 PR"不等于真的做了。驾驭器每轮结束自己看：</p>
+<pre data-title="harness/progress.ts"><code class="lang-ts">
+import { sh } from './sh';
+
+// 客观进度：不听 agent 自己说做到哪了，直接读 git 和 gh。
+export type CiState = 'none' | 'pending' | 'success' | 'failure';
+export type Snapshot = {
+  dirty: string[];
+  commits: string[];
+  unpushed: number; // 不在任何远端分支上的本地提交数
+  pr: { url: string; state: string } | null;
+  ci: CiState;
+};
+
+type Check = { __typename?: string; status?: string; conclusion?: string | null; state?: string };
+
+// gh 的 statusCheckRollup 里混着两种记录：CheckRun（status + conclusion）与 StatusContext（state）。
+export function classifyChecks(checks: Check[]): CiState {
+  if (checks.length === 0) return 'none';
+  const BAD = ['FAILURE', 'ERROR', 'CANCELLED', 'TIMED_OUT', 'ACTION_REQUIRED', 'STARTUP_FAILURE'];
+  const results = checks.map((c) =&gt; {
+    if (c.__typename === 'StatusContext' || (c.state &amp;&amp; !c.status)) {
+      const s = (c.state ?? '').toUpperCase();
+      return BAD.includes(s) ? 'failure' : s === 'SUCCESS' ? 'success' : 'pending';
+    }
+    if ((c.status ?? '').toUpperCase() !== 'COMPLETED') return 'pending';
+    const conclusion = (c.conclusion ?? '').toUpperCase();
+    return BAD.includes(conclusion) ? 'failure' : 'success'; // SUCCESS、NEUTRAL、SKIPPED 都不挡路
+  });
+  if (results.includes('failure')) return 'failure';
+  if (results.includes('pending')) return 'pending';
+  return 'success';
+}
+
+export async function snapshot(path: string, base: string): Promise&lt;Snapshot&gt; {
+  const status = await sh(['git', 'status', '--porcelain'], path);
+  const log = await sh(['git', 'log', '--oneline', `origin/${base}..HEAD`], path);
+  // 不和 @{u} 比：从 origin/main 建出的分支默认跟踪 origin/main，推送时没加 -u 会把已推送的提交也算进来
+  const ahead = await sh(['git', 'rev-list', '--count', 'HEAD', '--not', '--remotes'], path);
+  const pr = await sh(['gh', 'pr', 'view', '--json', 'url,state,statusCheckRollup'], path);
+  let prInfo: Snapshot['pr'] = null;
+  let ci: CiState = 'none';
+  if (pr.code === 0) {
+    const data = JSON.parse(pr.stdout) as { url: string; state: string; statusCheckRollup: Check[] | null };
+    prInfo = { url: data.url, state: data.state };
+    ci = classifyChecks(data.statusCheckRollup ?? []);
+  }
+  return {
+    dirty: status.stdout ? status.stdout.split('\n') : [],
+    commits: log.stdout ? log.stdout.split('\n') : [],
+    unpushed: ahead.code === 0 ? Number(ahead.stdout) : 0,
+    pr: prInfo,
+    ci,
+  };
+}
+
+export function describe(s: Snapshot): string {
+  return [
+    `未提交 ${s.dirty.length} 个文件`,
+    `新提交 ${s.commits.length} 个`,
+    `待推送 ${s.unpushed}`,
+    s.pr ? `PR ${s.pr.state} ${s.pr.url}` : '无 PR',
+    `CI ${s.ci}`,
+  ].join(' · ');
+}
+</code></pre>
+
+<h3>6.6 启动 agent 与解析事件流</h3>
+<p>print 模式下用 <code>--output-format stream-json</code> 拿到逐行 JSON 事件：初始化事件带会话 id，助手消息里有工具调用，最后的结果事件带 <code>total_cost_usd</code>。驾驭器用它显示进度、累计成本、触发预算刹车。权限上只放行列出的命令，文件编辑用 <code>acceptEdits</code> 自动接受。</p>
+<pre data-title="harness/agent.ts"><code class="lang-ts">
+// 以 headless 方式启动编码 agent，并把它的事件流变成驾驭器能用的信息。
+// 命令行参数与事件字段以各自的官方文档为准；解析器对不认识的事件只记录、不报错。
+export type AgentKind = 'claude' | 'codex';
+
+export function buildCommand(kind: AgentKind, prompt: string): string[] {
+  if (kind === 'claude') {
+    return [
+      'claude', '-p', prompt,
+      '--output-format', 'stream-json', '--verbose', // 逐行 JSON 事件；print 模式下流式输出需要 --verbose
+      '--permission-mode', 'acceptEdits',            // 允许改文件；其余命令按下面的白名单放行
+      '--allowedTools', 'Bash(bun test:*)', 'Bash(bun run:*)', 'Bash(git status:*)', 'Bash(git diff:*)',
+      'Bash(git add:*)', 'Bash(git commit:*)', 'Bash(git push:*)', 'Bash(gh pr create:*)', 'Bash(gh pr view:*)',
+    ];
+  }
+  // Codex：默认只读沙箱，workspace-write 允许写工作区；--json 输出 JSONL 事件
+  return ['codex', 'exec', '--json', '--sandbox', 'workspace-write', prompt];
+}
+
+export type AgentEvent = {
+  kind: 'init' | 'text' | 'tool' | 'result' | 'other';
+  sessionId?: string;
+  text?: string;
+  tool?: string;
+  costUsd?: number;
+  isError?: boolean;
+  raw: unknown;
+};
+
+type ContentBlock = { type?: string; text?: string; name?: string };
+
+export function parseEventLine(line: string): AgentEvent | null {
+  if (!line.trim()) return null;
+  let e: Record&lt;string, unknown&gt;;
+  try {
+    e = JSON.parse(line) as Record&lt;string, unknown&gt;;
+  } catch {
+    return { kind: 'other', text: line, raw: line }; // 非 JSON 行（例如警告）原样记下
+  }
+  const sessionId = typeof e.session_id === 'string' ? e.session_id : undefined;
+  if (e.type === 'system' &amp;&amp; e.subtype === 'init') return { kind: 'init', sessionId, raw: e };
+  if (e.type === 'assistant') {
+    const blocks = ((e.message as { content?: ContentBlock[] } | undefined)?.content ?? []) as ContentBlock[];
+    const tool = blocks.find((b) =&gt; b.type === 'tool_use');
+    if (tool) return { kind: 'tool', tool: tool.name, sessionId, raw: e };
+    const text = blocks.filter((b) =&gt; b.type === 'text').map((b) =&gt; b.text ?? '').join('');
+    return { kind: 'text', text, sessionId, raw: e };
+  }
+  if (e.type === 'result') {
+    return {
+      kind: 'result',
+      sessionId,
+      text: typeof e.result === 'string' ? e.result : undefined,
+      costUsd: typeof e.total_cost_usd === 'number' ? e.total_cost_usd : undefined,
+      isError: e.is_error === true || (typeof e.subtype === 'string' &amp;&amp; e.subtype !== 'success'),
+      raw: e,
+    };
+  }
+  return { kind: 'other', raw: e };
+}
+
+export type SessionOutcome = { exitCode: number; sessionId: string | null; costUsd: number; finalText: string; tools: number };
+
+export async function runSession(
+  kind: AgentKind,
+  cwd: string,
+  prompt: string,
+  onEvent: (e: AgentEvent) =&gt; void,
+  timeoutMs = 45 * 60_000,
+): Promise&lt;SessionOutcome&gt; {
+  const proc = Bun.spawn(buildCommand(kind, prompt), { cwd, stdout: 'pipe', stderr: 'inherit', timeout: timeoutMs });
+  const out: SessionOutcome = { exitCode: -1, sessionId: null, costUsd: 0, finalText: '', tools: 0 };
+  const decoder = new TextDecoder();
+  let buf = '';
+  for await (const chunk of proc.stdout) {
+    buf += decoder.decode(chunk, { stream: true });
+    let nl = buf.indexOf('\n');
+    while (nl &gt;= 0) {
+      const e = parseEventLine(buf.slice(0, nl));
+      buf = buf.slice(nl + 1);
+      nl = buf.indexOf('\n');
+      if (!e) continue;
+      if (e.sessionId) out.sessionId = e.sessionId;
+      if (e.kind === 'tool') out.tools++;
+      if (e.kind === 'result') {
+        out.costUsd = e.costUsd ?? 0;
+        out.finalText = e.text ?? '';
+      }
+      onEvent(e);
+    }
+  }
+  out.exitCode = await proc.exited;
+  return out;
+}
+</code></pre>
+<div class="callout note"><b>换成 Codex</b>
+<p><code>codex exec</code> 默认在只读沙箱里运行，<code>--sandbox workspace-write</code> 允许写工作区；<code>--json</code> 输出 JSONL 事件，<code>--output-schema</code> 可以约束最终输出，<code>codex exec resume</code> 用来续跑。它的事件字段与 Claude Code 不同，本页的解析器会把不认识的事件归为 <code>other</code> 并照常记录；成本需要按事件里的 token 用量自己估算。Codex 没有 Claude Code 的 Stop hook，"停下前检查未提交改动"要改由驾驭器在轮后核对时追加一轮来完成。</p></div>
+
+<h3>6.7 Stop hook：别带着未保存的改动停下</h3>
+<p>Claude Code 的 Stop hook 在 agent 准备停下时运行。<strong>退出码 2</strong> 才会阻止停止（退出码 1 不会，这是常见陷阱），stderr 的内容交回给 agent。输入里的 <code>stop_hook_active</code> 表示"已经因为 Stop hook 续跑过"，此时必须放行，否则可能无限循环（系统另有连续续跑次数的上限）。</p>
+<pre data-title="harness/stop-hook.ts"><code class="lang-ts">
+// Claude Code 的 Stop hook：agent 想停下时运行。
+// 有未提交改动 → 退出码 2，stderr 的内容会交回给 agent，它会继续干活；只提醒一次。
+// 注意：退出码 1 不会阻止停止，只有 2 才会。
+export type HookInput = { stop_hook_active?: boolean; cwd?: string };
+
+export function decide(input: HookInput, dirtyFiles: string[]): { code: 0 | 2; message: string } {
+  // 已经因为 Stop hook 继续过一次了：放行，避免无限循环
+  if (input.stop_hook_active) return { code: 0, message: '' };
+  if (dirtyFiles.length === 0) return { code: 0, message: '' };
+  return {
+    code: 2,
+    message: [
+      `停下之前还有 ${dirtyFiles.length} 个文件的改动没有提交：`,
+      ...dirtyFiles.slice(0, 20),
+      '请确认这些改动是否属于本次功能：属于就运行测试后提交，并更新 .harness/progress.md；不属于就还原。',
+    ].join('\n'),
+  };
+}
+
+if (import.meta.main) {
+  const input = JSON.parse(await Bun.stdin.text()) as HookInput;
+  const proc = Bun.spawnSync(['git', 'status', '--porcelain'], { cwd: input.cwd ?? process.cwd() });
+  const dirty = proc.stdout.toString().split('\n').filter((l) =&gt; l.trim() &amp;&amp; !l.includes('.harness/'));
+  const { code, message } = decide(input, dirty);
+  if (message) console.error(message);
+  process.exit(code);
+}
+</code></pre>
+<p>驾驭器在 worktree 里写一份 <code>.claude/settings.local.json</code> 注册它（见 6.9 的 <code>main.ts</code>），格式以官方 hooks 文档为准：</p>
+<pre data-title=".claude/settings.local.json（由驾驭器生成）"><code class="lang-json">
+{
+  "hooks": {
+    "Stop": [{ "hooks": [{ "type": "command", "command": "bun /abs/path/agent-lab/harness/stop-hook.ts" }] }]
+  }
+}
+</code></pre>
+
+<h3>6.8 每轮的提示词</h3>
+<p>提示词的核心是一套固定的"开工流程"：先确认自己在哪、读进度和历史、挑一个功能、做完验证、只改 passes、提交、写进度。遇到需要人决定的事就写下来停下，而不是猜。</p>
+<pre data-title="harness/prompts.ts"><code class="lang-ts">
+import type { CodingTask } from './task';
+
+// 每一轮都是全新的上下文，状态全靠仓库里的文件传递：功能清单、进度文件、git 历史。
+export function sessionPrompt(task: CodingTask, session: number): string {
+  return `你在为任务「${task.title}」工作，这是第 ${session} 轮。你的上下文是全新的，先按顺序做：
+1. 运行 pwd，阅读 .harness/progress.md 和 git log --oneline -20，了解之前做到哪。
+2. 阅读 .harness/features.json，选出一条 passes 为 false 的功能，这一轮只做这一条。
+3. 实现它，并运行 ${task.verify.join(' ')} 验证；需要端到端检查的，按功能描述实际操作一遍，不要只看单元测试。
+4. 确认通过后，把这一条的 passes 改为 true。features.json 里除 passes 外的任何内容都不许改、不许删条目。
+5. 提交改动（一个功能一个提交），推送分支；还没有 PR 时用 gh pr create 开一个草稿 PR。
+6. 在 .harness/progress.md 末尾追加：本轮做了什么、怎么验证的、下一轮该注意什么。
+如果遇到无法独立决定的问题（需求有歧义、需要密钥、需要改与任务无关的代码），把问题写进 progress.md 的"待人决定"一节后停下，不要猜。`;
+}
+
+export function initialProgress(task: CodingTask): string {
+  return `# ${task.title}\n\n任务 ID：${task.id}\n基线分支：${task.base}\n\n## 验收点\n${task.acceptance.map((a, i) =&gt; `- F${i + 1}：${a}`).join('\n')}\n\n## 待人决定\n\n（无）\n\n## 进度记录\n`;
+}
+</code></pre>
+
+<h3>6.9 生命周期编排</h3>
+<pre data-title="harness/main.ts"><code class="lang-ts">
+// 用法：bun harness/main.ts tasks/export-filter.json
+import { appendFile, mkdir } from 'node:fs/promises';
+import { join, resolve } from 'node:path';
+import { runSession } from './agent';
+import { allPass, checkIntegrity, type Feature, initFeatures, repair } from './features';
+import { describe, snapshot } from './progress';
+import { initialProgress, sessionPrompt } from './prompts';
+import { confirmByTyping, sh } from './sh';
+import { branchName, loadTask } from './task';
+import { checkRemovable, createWorktree, removeWorktree, worktreePath } from './worktree';
+
+const taskFile = process.argv[2];
+if (!taskFile) throw new Error('用法：bun harness/main.ts &lt;任务文件.json&gt;');
+const task = await loadTask(taskFile);
+
+// ---- 1. 人确认后才启动 ----
+console.log(`任务：${task.title}\n仓库：${task.repo}（基于 ${task.base}，新分支 ${branchName(task)}）`);
+console.log(`工作目录：${worktreePath(task)}\n执行方：${task.agent}，最多 ${task.maxSessions} 轮，预算 $${task.maxCostUsd}`);
+console.log(`验收点：\n${task.acceptance.map((a, i) =&gt; `  F${i + 1}. ${a}`).join('\n')}`);
+if (!confirmByTyping('确认启动？', task.id)) process.exit(0);
+
+// ---- 2. 隔离的工作目录与驾驭文件 ----
+const wt = await createWorktree(task);
+const dir = join(wt, '.harness');
+await mkdir(dir, { recursive: true });
+const featuresFile = Bun.file(join(dir, 'features.json'));
+if (!(await featuresFile.exists())) {
+  await Bun.write(featuresFile, `${JSON.stringify(initFeatures(task.acceptance), null, 2)}\n`);
+  await Bun.write(join(dir, 'progress.md'), initialProgress(task));
+}
+if (task.agent === 'claude') {
+  const hook = `bun ${resolve(import.meta.dir, 'stop-hook.ts')}`;
+  await mkdir(join(wt, '.claude'), { recursive: true });
+  await Bun.write(join(wt, '.claude', 'settings.local.json'), JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: 'command', command: hook }] }] } }, null, 2));
+}
+const events = join(dir, 'events.jsonl');
+const record = (type: string, data: Record&lt;string, unknown&gt;) =&gt;
+  appendFile(events, `${JSON.stringify({ ts: new Date().toISOString(), type, ...data })}\n`);
+
+// ---- 3. 逐轮推进：每轮一个全新上下文，只做一个功能 ----
+let spent = 0;
+let stalled = 0;
+for (let session = 1; session &lt;= task.maxSessions; session++) {
+  const before = (await featuresFile.json()) as Feature[];
+  if (allPass(before)) break;
+  const commitsBefore = (await snapshot(wt, task.base)).commits.length;
+  console.log(`\n== 第 ${session} 轮 ==`);
+  const outcome = await runSession(task.agent, wt, sessionPrompt(task, session), (e) =&gt; {
+    if (e.kind === 'tool') console.log(`  · ${e.tool}`);
+    void record('agent', { session, kind: e.kind, tool: e.tool, text: e.text?.slice(0, 500) });
+  });
+  spent += outcome.costUsd;
+
+  // 功能清单只许改 passes：越权的改动恢复，合法的保留
+  const after: unknown = await featuresFile.json().catch(() =&gt; null);
+  const violations = checkIntegrity(before, after);
+  if (violations.length) {
+    await Bun.write(featuresFile, `${JSON.stringify(repair(before, after), null, 2)}\n`);
+    await record('violation', { session, violations });
+    console.warn(`  ! 功能清单被越权修改，已恢复：${violations.join('；')}`);
+  }
+  const snap = await snapshot(wt, task.base);
+  const features = (await featuresFile.json()) as Feature[];
+  await record('session', { session, exitCode: outcome.exitCode, costUsd: outcome.costUsd, sessionId: outcome.sessionId, snapshot: snap });
+  console.log(`  ${describe(snap)} · 功能 ${features.filter((f) =&gt; f.passes).length}/${features.length} · 累计 $${spent.toFixed(2)}`);
+
+  // 刹车：超预算、连续两轮没有任何新提交
+  if (spent &gt;= task.maxCostUsd) {
+    console.warn('已达预算上限，停止。');
+    break;
+  }
+  stalled = snap.commits.length &gt; commitsBefore ? 0 : stalled + 1;
+  if (stalled &gt;= 2) {
+    console.warn('连续两轮没有新提交，停下等人看 .harness/progress.md 的"待人决定"。');
+    break;
+  }
+}
+
+// ---- 4. 独立复核：不采信 agent 的自述 ----
+const features = (await featuresFile.json()) as Feature[];
+const verify = await sh(task.verify, wt, { timeoutMs: 15 * 60_000 });
+const snap = await snapshot(wt, task.base);
+console.log('\n== 复核 ==');
+for (const f of features) console.log(`  ${f.passes ? '✓' : '✗'} ${f.id} ${f.description}`);
+console.log(`  复核命令 ${task.verify.join(' ')}：${verify.code === 0 ? '通过' : `失败（${verify.code}）`}`);
+console.log(`  ${describe(snap)}`);
+const done = allPass(features) &amp;&amp; verify.code === 0 &amp;&amp; snap.dirty.length === 0 &amp;&amp; snap.ci !== 'failure';
+await record('verify', { done, verifyCode: verify.code, snapshot: snap, spent });
+console.log(done ? '\n结论：可以交给人评审 PR。' : '\n结论：还不能交付，见上面未通过的项。');
+
+// ---- 5. 收尾清理（需确认，且有未保存的工作时拒绝） ----
+if (done &amp;&amp; confirmByTyping('删除工作目录？分支与 PR 保留。', 'remove')) {
+  const check = await checkRemovable(wt);
+  if (!check.ok) console.warn(`不删除：\n${check.reasons.join('\n')}`);
+  else {
+    const archive = await removeWorktree(task);
+    console.log(`已删除工作目录；功能清单、进度与事件记录归档在 ${archive}`);
+  }
+}
+</code></pre>
+
+<h2>7 · 测试</h2>
+<p>驾驭器里能纯函数化的都抽出来测；Stop hook 额外在临时 git 仓库里作为真实脚本跑一遍，确认退出码与 stdin 读取都对。真正启动 agent 的部分不进单元测试，用练习仓库实跑验收。</p>
+<pre data-title="tests/harness.test.ts"><code class="lang-ts">
+import { describe, expect, test } from 'bun:test';
+import { mkdtemp } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { buildCommand, parseEventLine } from '../harness/agent';
+import { checkIntegrity, initFeatures, repair } from '../harness/features';
+import { classifyChecks } from '../harness/progress';
+import { decide } from '../harness/stop-hook';
+import { CodingTaskSchema } from '../harness/task';
+
+describe('功能清单', () =&gt; {
+  const before = initFeatures(['导出支持按部门筛选', '筛选条件写进文件名']);
+  // 拦：只改 passes 的合法更新被误判为越权
+  test('只改 passes 不算违规', () =&gt; {
+    const after = before.map((f) =&gt; ({ ...f, passes: f.id === 'F1' }));
+    expect(checkIntegrity(before, after)).toEqual([]);
+  });
+  // 拦：agent 改写验收描述、删掉做不出来的条目来"完成"任务
+  test('改描述、删条目都算违规，修复时只保留 passes', () =&gt; {
+    const after = [{ id: 'F1', description: '导出支持筛选（部门筛选另行处理）', passes: true }];
+    expect(checkIntegrity(before, after).length).toBeGreaterThanOrEqual(2);
+    expect(repair(before, after)).toEqual([
+      { id: 'F1', description: '导出支持按部门筛选', passes: true },
+      { id: 'F2', description: '筛选条件写进文件名', passes: false },
+    ]);
+  });
+});
+
+describe('Stop hook', () =&gt; {
+  // 拦：有未提交改动时放行，agent 宣布完成但改动没保存
+  test('有未提交改动时阻止停止', () =&gt; {
+    expect(decide({ stop_hook_active: false }, [' M src/export.ts']).code).toBe(2);
+  });
+  // 拦：每次都阻止，agent 永远停不下来
+  test('已经续跑过一次就放行', () =&gt; {
+    expect(decide({ stop_hook_active: true }, [' M src/export.ts']).code).toBe(0);
+  });
+
+  // 拦：脚本本身的 IO 写错（读不到 stdin、退出码不对）
+  test('作为真实脚本运行时的退出码', async () =&gt; {
+    const repo = await mkdtemp(join(tmpdir(), 'hook-'));
+    Bun.spawnSync(['git', 'init', '-q'], { cwd: repo });
+    const run = (input: object) =&gt;
+      Bun.spawnSync(['bun', join(import.meta.dir, '..', 'harness', 'stop-hook.ts')], { stdin: Buffer.from(JSON.stringify(input)) });
+    expect(run({ cwd: repo, stop_hook_active: false }).exitCode).toBe(0);
+    await Bun.write(join(repo, 'a.txt'), 'x');
+    const blocked = run({ cwd: repo, stop_hook_active: false });
+    expect(blocked.exitCode).toBe(2);
+    expect(blocked.stderr.toString()).toContain('a.txt');
+    expect(run({ cwd: repo, stop_hook_active: true }).exitCode).toBe(0);
+  });
+});
+
+describe('CI 状态', () =&gt; {
+  // 拦：有一个检查失败却报"通过"，或还在跑就报"通过"
+  test('失败优先于进行中，进行中优先于成功', () =&gt; {
+    expect(classifyChecks([])).toBe('none');
+    expect(classifyChecks([{ __typename: 'CheckRun', status: 'COMPLETED', conclusion: 'SUCCESS' }, { __typename: 'CheckRun', status: 'IN_PROGRESS', conclusion: null }])).toBe('pending');
+    expect(classifyChecks([{ __typename: 'CheckRun', status: 'IN_PROGRESS', conclusion: null }, { __typename: 'StatusContext', state: 'FAILURE' }])).toBe('failure');
+    expect(classifyChecks([{ __typename: 'CheckRun', status: 'COMPLETED', conclusion: 'SKIPPED' }, { __typename: 'StatusContext', state: 'SUCCESS' }])).toBe('success');
+  });
+});
+
+describe('事件流解析', () =&gt; {
+  // 拦：成本、会话 id 取不到，预算刹车形同虚设
+  test('从结果事件里取出成本与会话', () =&gt; {
+    const e = parseEventLine(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: '完成 F1', session_id: 's1', total_cost_usd: 0.42 }));
+    expect(e).toMatchObject({ kind: 'result', costUsd: 0.42, sessionId: 's1', isError: false });
+  });
+  // 拦：遇到不认识的事件或非 JSON 行就崩溃
+  test('未知事件与非 JSON 行不报错', () =&gt; {
+    expect(parseEventLine('{"type":"stream_event"}')?.kind).toBe('other');
+    expect(parseEventLine('warning: something')?.kind).toBe('other');
+    expect(parseEventLine('')).toBeNull();
+  });
+  test('识别工具调用', () =&gt; {
+    const e = parseEventLine(JSON.stringify({ type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Edit', input: {} }] } }));
+    expect(e).toMatchObject({ kind: 'tool', tool: 'Edit' });
+  });
+  // 拦：提示词被拆成多个参数，或忘了要求逐行 JSON 输出
+  test('提示词作为单个参数传入', () =&gt; {
+    const cmd = buildCommand('claude', '做 F1；不要改 features 的描述');
+    expect(cmd[cmd.indexOf('-p') + 1]).toBe('做 F1；不要改 features 的描述');
+    expect(cmd).toContain('stream-json');
+  });
+});
+
+describe('任务文件', () =&gt; {
+  // 拦：任务 id 带空格或斜杠，拼进分支名和目录后出问题
+  test('id 只允许安全字符，缺省值生效', () =&gt; {
+    expect(CodingTaskSchema.safeParse({ id: 'Export Filter', title: 't', repo: '/r', acceptance: ['a'], verify: ['bun', 'test'] }).success).toBe(false);
+    const ok = CodingTaskSchema.parse({ id: 'export-filter', title: 't', repo: '/r', acceptance: ['a'], verify: ['bun', 'test'] });
+    expect(ok).toMatchObject({ base: 'main', agent: 'claude', maxSessions: 8 });
+  });
+});
+</code></pre>
+
+<div class="quiz" data-answer="4">
+<p class="q">agent 在第 3 轮结束时说"所有功能都已完成并通过测试"，<code>features.json</code> 也全部是 <code>passes: true</code>。驾驭器接下来应该？</p>
+<ol>
+  <li>相信它，直接通知人合并</li>
+  <li>再开一轮，让 agent 自己检查一遍</li>
+  <li>看 agent 输出里有没有"测试通过"字样</li>
+  <li>由驾驭器自己运行复核命令、检查工作区是否干净与 CI 状态，全部满足才交给人评审</li>
+</ol>
+<div class="explain">"过早宣布完成"是长任务的头号失败。<code>passes</code> 是 agent 自己改的，"测试通过"是 agent 自己说的。驾驭器要用自己能验证的事实（复核命令的退出码、git 状态、CI）做结论；最终的合并决定仍然留给人。</div>
+</div>
+
+<h2>8 · 验收标准</h2>
+<ul class="checklist" data-key="p7-accept">
+  <li><code>bun test</code> 全部通过，包括在临时仓库里实跑 Stop hook 的测试</li>
+  <li>在练习仓库上用一个 2–3 条验收点的任务跑通全流程：开出 PR、CI 通过、复核结论为可交付</li>
+  <li>手动在 worktree 里留一个未提交文件后让 agent 停下，观察到 Stop hook 阻止了一次、第二次放行</li>
+  <li>手动改坏 <code>features.json</code> 的描述，下一轮结束后被检测并恢复，事件记录里有违规条目</li>
+  <li>把预算设得很低，确认驾驭器在超预算后停下</li>
+  <li>收尾时故意留一个未推送的提交，清理被拒绝；推送后清理成功，<code>.harness/</code> 已归档</li>
+  <li>同时开两个任务并行运行，两个 worktree 互不影响</li>
+</ul>
+
+<h2>9 · 进阶挑战</h2>
+<ol>
+  <li><strong>接回审批流</strong>：把"确认启动"和"确认清理"改成 <a href="p3-approval.html">P3</a> 的提案，可以在别处审批；驾驭器崩溃重启后从事件记录恢复到正确的阶段。</li>
+  <li><strong>独立评审者</strong>：所有功能通过后，用一个全新上下文、只读权限的 agent 按验收点逐条审查 diff，结论写回进度文件（评估者与生成者分离，参见第 12 章）。</li>
+  <li><strong>跟进 CI 与评审意见</strong>：PR 的 CI 失败或出现新的评审意见时，自动开一轮，把失败日志或评审意见作为本轮输入。</li>
+  <li><strong>可替换的执行方</strong>：把 <code>agent.ts</code> 抽象成接口，实现 Claude 与 Codex 两个适配器，用 <a href="p6-evals.html">P6</a> 的方法在同一批小任务上比较两者的通过率与成本。</li>
+  <li><strong>中途交接</strong>：实现"换 agent 接手"：新 agent 的首轮提示里带上原始需求、分支、最近的进度与事件，要求先核对 <code>git status</code> 再继续。</li>
+</ol>
+
+<h2>10 · 常见坑</h2>
+<ul>
+  <li><strong>一次做完整个需求</strong>：上下文中途耗尽，留下半成品。坚持每轮一个功能、每个功能一个提交。</li>
+  <li><strong>相信 agent 的自述</strong>：进度看 git 与 gh，完成看独立复核。</li>
+  <li><strong>Stop hook 用退出码 1</strong>：不会阻止停止。要阻止用 2；并处理 <code>stop_hook_active</code> 防死循环。</li>
+  <li><strong>驾驭文件进了版本库</strong>：<code>.harness/</code> 与 <code>settings.local.json</code> 写进 <code>info/exclude</code>。</li>
+  <li><strong>清理时丢工作</strong>：先核对未提交与未推送，再归档，最后删除；分支永远保留。</li>
+  <li><strong>权限给太宽</strong>：无人值守时只放行任务需要的命令；不要为了省事跳过所有权限检查。</li>
+  <li><strong>没有刹车</strong>：轮数、预算、停滞三道刹车缺一不可，否则一个卡住的任务能整晚空转。</li>
+</ul>
+
+<div class="takeaways"><b>本项目要点</b>
+<ul>
+  <li>驾驭器负责"在哪跑、能动什么、做到哪、何时算完"，agent 只负责写代码。</li>
+  <li>每轮全新上下文、只做一个功能，状态靠功能清单、进度文件和 git 历史传递。</li>
+  <li>功能清单用 JSON，只许改 passes；每轮后核对，越权改动恢复。</li>
+  <li>进度读 git 与 gh；完成由驾驭器独立复核；Stop hook 用退出码 2 并防死循环。</li>
+  <li>启动与清理是需要人确认的动作；清理前核对、归档，分支与 PR 留给人评审。</li>
+</ul></div>
+
+<h2>参考资料</h2>
+<ul class="refs">
+  <li><a href="https://www.anthropic.com/engineering/effective-harnesses-for-long-running-agents" target="_blank" rel="noopener">Effective harnesses for long-running agents</a> <span class="src">Anthropic · 2025-11-26 · 功能清单用 JSON、只改 passes、进度文件、每轮一个功能、端到端验证</span></li>
+  <li><a href="https://code.claude.com/docs/en/headless" target="_blank" rel="noopener">Claude Code：headless / print 模式</a> <span class="src">-p、--output-format stream-json、total_cost_usd、--resume、权限参数</span></li>
+  <li><a href="https://code.claude.com/docs/en/hooks" target="_blank" rel="noopener">Claude Code：Hooks</a> <span class="src">Stop hook、退出码 2、stop_hook_active</span></li>
+  <li><a href="https://code.claude.com/docs/en/worktrees" target="_blank" rel="noopener">Claude Code：worktrees</a> <span class="src">用 git worktree 并行运行多个会话</span></li>
+  <li><a href="https://learn.chatgpt.com/docs/non-interactive-mode" target="_blank" rel="noopener">Codex：非交互模式</a> <span class="src">codex exec、--json、--sandbox、--output-schema、resume</span></li>
+  <li><a href="https://cli.github.com/manual/gh_pr_view" target="_blank" rel="noopener">gh pr view</a> <span class="src">--json url,state,statusCheckRollup</span></li>
+</ul>
+</article>
+<script>
+window.addEventListener('DOMContentLoaded', () => {
+  const box = document.getElementById('hx');
+  const log = box.querySelector('[data-log]');
+  const featBox = box.querySelector('[data-feat]');
+  const snapBox = box.querySelector('[data-snap]');
+  const btn = (a) => box.querySelector(`[data-a="${a}"]`);
+  const DESCS = ['导出接口接受 department 参数', '不传时导出全部部门', '文件名包含部门名'];
+  let s;
+  const reset = () => {
+    s = { started: false, round: 0, feats: DESCS.map((d, i) => ({ id: 'F' + (i + 1), d, p: false })), commits: 0, dirty: 0, pr: false, ci: 'none', cost: 0, done: false };
+    log.innerHTML = '';
+    line('m', '$ bun harness/main.ts tasks/export-filter.json');
+    line('', '任务：月报导出支持按部门筛选（3 个验收点，最多 6 轮，预算 $5）');
+    ['round', 'stop', 'tamper'].forEach((a) => (btn(a).disabled = true));
+    btn('start').disabled = false;
+    paint();
+  };
+  const line = (cls, text) => {
+    const d = document.createElement('div');
+    if (cls) d.className = cls;
+    d.textContent = text;
+    log.append(d);
+    log.scrollTop = log.scrollHeight;
+  };
+  const paint = () => {
+    featBox.innerHTML = '<b>features.json</b><br>' + s.feats.map((f) => `${f.p ? '✓' : '·'} ${f.id} ${Course.escape(f.d)}`).join('<br>');
+    snapBox.innerHTML = `<b>客观进度</b><br>未提交 ${s.dirty} · 提交 ${s.commits}<br>PR ${s.pr ? '草稿已开' : '无'} · CI ${s.ci}<br>累计成本 $${s.cost.toFixed(2)}`;
+  };
+  const next = () => s.feats.find((f) => !f.p);
+  const checkDone = () => {
+    if (!next()) {
+      s.ci = 'success';
+      line('', '\n== 复核 ==');
+      s.feats.forEach((x) => line('', `  ✓ ${x.id} ${x.d}`));
+      line('', '  复核命令 bun test：通过 · CI success · 工作区干净');
+      line('g', '结论：可以交给人评审 PR。');
+      ['round', 'stop', 'tamper'].forEach((a) => (btn(a).disabled = true));
+    }
+    paint();
+  };
+  btn('start').addEventListener('click', () => {
+    line('w', '确认启动？确认请输入 export-filter：export-filter');
+    line('g', '✓ 已创建 worktree ~/.agent-lab/worktrees/report-service/export-filter（分支 agent/export-filter）');
+    line('g', '✓ 已写入 .harness/features.json、progress.md，注册 Stop hook');
+    s.started = true;
+    btn('start').disabled = true;
+    ['round', 'stop', 'tamper'].forEach((a) => (btn(a).disabled = false));
+    paint();
+  });
+  btn('round').addEventListener('click', () => {
+    const f = next();
+    if (!f) return;
+    s.round++;
+    line('', `\n== 第 ${s.round} 轮 ==`);
+    line('m', '  · Bash pwd  · Read .harness/progress.md  · Bash git log');
+    line('m', `  · Edit src/export.ts  · Bash bun test  · Edit .harness/features.json`);
+    f.p = true;
+    s.commits++;
+    s.cost += 0.6 + s.round * 0.1;
+    if (!s.pr) { s.pr = true; line('m', '  · Bash gh pr create --draft'); }
+    s.ci = 'pending';
+    line('', `  未提交 0 · 新提交 ${s.commits} · 待推送 0 · PR DRAFT · CI pending · 功能 ${s.feats.filter((x) => x.p).length}/3 · 累计 $${s.cost.toFixed(2)}`);
+    checkDone();
+  });
+  btn('stop').addEventListener('click', () => {
+    const f = next();
+    if (!f) return;
+    s.round++;
+    line('', `\n== 第 ${s.round} 轮 ==`);
+    line('m', '  · Edit src/export.ts  · Edit src/filename.ts');
+    s.dirty = 2;
+    paint();
+    line('w', '  [Stop hook] 停下之前还有 2 个文件的改动没有提交：src/export.ts、src/filename.ts → exit 2');
+    line('m', '  agent 收到提醒，继续：· Bash bun test  · Bash git add  · Bash git commit');
+    s.dirty = 0;
+    s.commits++;
+    f.p = true;
+    s.cost += 0.9;
+    line('m', '  [Stop hook] stop_hook_active=true → 放行');
+    line('', `  未提交 0 · 新提交 ${s.commits} · 功能 ${s.feats.filter((x) => x.p).length}/3 · 累计 $${s.cost.toFixed(2)}`);
+    checkDone();
+  });
+  btn('tamper').addEventListener('click', () => {
+    const f = next();
+    if (!f) return;
+    s.round++;
+    const orig = f.d;
+    line('', `\n== 第 ${s.round} 轮 ==`);
+    f.d = orig + '（暂不处理，留到下期）';
+    f.p = true;
+    paint();
+    line('m', '  · Edit .harness/features.json');
+    line('e', `  ! 功能清单被越权修改，已恢复：${f.id} 的描述被改动`);
+    f.d = orig;
+    line('w', `  ${f.id} 的 passes=true 保留，但复核时仍会运行 bun test 独立验证`);
+    s.cost += 0.4;
+    checkDone();
+  });
+  btn('reset').addEventListener('click', reset);
+  reset();
+});
+</script>
+</body>
+</html>

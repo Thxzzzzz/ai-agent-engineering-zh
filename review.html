@@ -1,0 +1,477 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>真实项目复盘 · AI Agent 工程</title>
+<meta name="description" content="对照全课程的知识点，逐条复盘 niuma-agent 与 devtask 因缺少哪些 agent 工程知识而没做好，并对比有这块知识时会怎么设计。">
+<link rel="stylesheet" href="assets/css/course.css">
+<script src="assets/js/manifest.js"></script>
+<script defer src="assets/js/course.js"></script>
+<style>
+  .heat { display: grid; grid-template-columns: minmax(120px, 1.4fr) repeat(2, minmax(90px, 1fr)); gap: 4px; font-size: 13.5px; }
+  .heat > div { padding: 7px 10px; border-radius: 6px; }
+  .heat .hd { font-weight: 650; color: var(--muted); }
+  .heat .dom { background: var(--surface-2); }
+  .heat .cell { cursor: pointer; text-align: center; border: 1px solid var(--border); background: var(--surface); }
+  .heat .cell:hover { border-color: var(--accent); }
+  .heat .cell.s0 { color: var(--muted); }
+  .heat .cell.s1 { background: var(--warn-soft); }
+  .heat .cell.s2 { background: color-mix(in srgb, var(--danger) 18%, var(--surface)); }
+  .heat .cell.s3 { background: color-mix(in srgb, var(--danger) 34%, var(--surface)); font-weight: 650; }
+  .heat .cell.on { outline: 2px solid var(--accent); }
+  .filters { display: flex; flex-wrap: wrap; gap: 8px; margin: 14px 0; align-items: center; }
+  .filters select { width: auto; }
+  .finding { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px 18px; margin: 14px 0; box-shadow: var(--shadow); scroll-margin-top: 70px; }
+  .finding.flash { border-color: var(--accent); }
+  .finding h4 { margin: 0 0 6px; font-size: 16.5px; }
+  .finding .tags { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+  .finding .ev { font-size: 14px; color: var(--muted); margin: 6px 0 10px; }
+  .finding .ev b { color: var(--text); }
+  .cmp { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .cmp > div { border-radius: 8px; padding: 10px 12px; font-size: 14.5px; }
+  .cmp .without { background: var(--danger-soft); }
+  .cmp .with { background: var(--ok-soft); }
+  .cmp b { display: block; font-size: 13px; margin-bottom: 2px; }
+  .finding .gap { font-size: 14px; margin-top: 8px; }
+  .finding.mode-without .cmp .with, .finding.mode-with .cmp .without { display: none; }
+  .finding.mode-without .cmp, .finding.mode-with .cmp { grid-template-columns: 1fr; }
+  .seg { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  .seg button { appearance: none; border: 0; background: var(--surface); color: var(--muted); font: inherit; font-size: 13px; padding: 4px 10px; cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+  @media (max-width: 640px) { .cmp { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body data-page="review">
+<article id="content">
+<div class="eyebrow">第五部分 · 综合 · 复盘</div>
+<h1>复盘：两个真实项目里的知识短板</h1>
+<p class="lead">前面 16 章讲的都是"应该怎么做"。这一章反过来：拿两个真实项目，逐条找出因为缺了哪块知识而走的弯路，再对比"有这块知识时会怎么设计"。这是整门课最值得反复看的一章，因为每一条都真实发生过。</p>
+<div class="meta"><span>约 50 分钟</span><span>前置：读完第 1–15 章</span><span>31 条发现 · 10 条做对的事</span></div>
+
+<div class="goals"><b>学完你能</b>
+<ul>
+  <li>把课程里的每个知识点和一次真实的返工、事故或隐患对上号</li>
+  <li>识别两个项目共有的 6 类根因，在下一个项目里提前避开</li>
+  <li>拿到一份按优先级排好的整改清单，知道先修哪几处</li>
+</ul></div>
+
+<h2>1 · 这份复盘是怎么来的</h2>
+<p>审计对象有两个：</p>
+<ul>
+  <li><strong>niuma-agent</strong>：TypeScript/Bun 写的个人工作消息助理。它读 IM 消息，做分析、出提案，经用户审批后代发、建任务、派发给外部 agent，还有记忆、信任矩阵、知识库编译和对话助手。审计范围是 2026-10-02 至 11-24 的 378 个提交，src 约 8.3 万行，44 份提示词，31 份 ADR。</li>
+  <li><strong>devtask</strong>：Python 写的 agent 插件。用户在聊天里提开发需求，插件发授权卡，批准后用 git worktree 启动 Claude Code 等编码 agent，读 git/gh 跟进进度并回写卡片，最后收尾。审计范围是两个月的 146 个提交（其中 64 个是 fix），非测试代码 55 个文件、1.33 万行。</li>
+</ul>
+<p>方法：2026-11-25 对照本课程 15 章的知识域只读审计，每条发现都要有证据，即代码位置、提交哈希或文档里记下的事故与日期；只有推测的会注明。几条高严重度的发现我又亲手复核过，比如 devtask 的完成判定，在 Python 里实际运行了 <code>is_completed('未完成')</code>，返回 <code>True</code>。</p>
+
+<div class="callout note"><b>先说清楚：这不是在否定这两个项目</b>
+<p>两个项目都已经自己摸索出了不少业界最佳实践，第 7 节逐条列出。复盘的意义在于<strong>算清"缺这块知识"的代价</strong>：同一个结论，有知识储备时是第一天的设计决定；没有时，要付出一次事故、几天返工，或者一个至今没被发现的隐患才能学到。</p></div>
+
+<h2>2 · 问题分布：知识域 × 项目</h2>
+<p>颜色越深，表示这个知识域里最严重的发现越重。点任意格子，下方的发现列表会只显示那一格。再点一次取消筛选。</p>
+<div class="widget">
+  <div class="w-title">问题热力图</div>
+  <div class="heat" id="heat"></div>
+  <p style="font-size:13px;color:var(--muted);margin:10px 0 0">格子里的数字是发现条数。颜色：浅黄＝最高为低/中，红＝中高，深红＝高。</p>
+</div>
+
+<h2>3 · 两条时间线：缺知识 vs 有知识</h2>
+<p>把两个项目两个月的提交历史压缩成一条时间线，再和"同一个人具备本课程知识时"的假设路径对照。点"下一步"逐段看两条路在哪里分开。</p>
+
+<figure class="anim" data-dim>
+<div class="diagram">
+<svg viewBox="0 0 760 330" width="760" role="img" aria-label="实际路径与有知识时的路径对比">
+  <text class="tb" x="20" y="40">实际</text>
+  <text class="tb" x="20" y="230">有知识时</text>
+  <path class="line" d="M90 35 H740" /><path class="line" d="M90 225 H740" />
+  <g data-k="a1"><rect class="box r" x="95" y="55" width="140" height="62" rx="8"/><text class="t" x="165" y="80" text-anchor="middle">第 1 天：M1–M5</text><text class="ts" x="165" y="100" text-anchor="middle">含 auto 全标"完成"</text></g>
+  <g data-k="a2"><rect class="box r" x="250" y="55" width="150" height="62" rx="8"/><text class="t" x="325" y="80" text-anchor="middle">功能先行</text><text class="ts" x="325" y="100" text-anchor="middle">108 个里程碑 / 53 天</text></g>
+  <g data-k="a3"><rect class="box r" x="415" y="55" width="150" height="62" rx="8"/><text class="t" x="490" y="80" text-anchor="middle">事故驱动补丁</text><text class="ts" x="490" y="100" text-anchor="middle">缓存、超时、熔断后补</text></g>
+  <g data-k="a4"><rect class="box r" x="580" y="55" width="160" height="62" rx="8"/><text class="t" x="660" y="80" text-anchor="middle">审批疲劳</text><text class="ts" x="660" y="100" text-anchor="middle">238 张卡只点了一成</text></g>
+  <g data-k="a5"><rect class="box w" x="250" y="135" width="490" height="44" rx="8"/><text class="t" x="495" y="162" text-anchor="middle">提示词越改越长：规则堆积、判例写进提示词、同一规则来回翻</text></g>
+  <g data-k="b1"><rect class="box g" x="95" y="245" width="140" height="62" rx="8"/><text class="t" x="165" y="270" text-anchor="middle">窄链路</text><text class="ts" x="165" y="290" text-anchor="middle">私聊 → 草稿 → 审批</text></g>
+  <g data-k="b2"><rect class="box g" x="250" y="245" width="150" height="62" rx="8"/><text class="t" x="325" y="270" text-anchor="middle">先建评测</text><text class="ts" x="325" y="290" text-anchor="middle">每节点 30–50 条标注</text></g>
+  <g data-k="b3"><rect class="box g" x="415" y="245" width="150" height="62" rx="8"/><text class="t" x="490" y="270" text-anchor="middle">默认就有</text><text class="ts" x="490" y="290" text-anchor="middle">缓存布局、超时、熔断</text></g>
+  <g data-k="b4"><rect class="box g" x="580" y="245" width="160" height="62" rx="8"/><text class="t" x="660" y="270" text-anchor="middle">按指标扩面</text><text class="ts" x="660" y="290" text-anchor="middle">采纳率达标再加卡型</text></g>
+</svg>
+</div>
+<ol class="anim-steps">
+  <li data-show="a1 b1" data-hl="a1 b1">起点就分开了。实际：第一天把包括 auto 模式在内的 5 个里程碑都标成"完成"。有知识时（第 1 章"复杂度阶梯"）：只做一条最窄的链路，"私聊或 @我 → 回复草稿 → 审批"，其他一概不做。</li>
+  <li data-show="a2 b2" data-hl="a2 b2">实际：53 天 108 个里程碑、45 个助手工具，VERIFY.md 里 112 项未勾。有知识时（第 13 章）：在扩功能之前，先给每个 LLM 节点建 30–50 条人工标注，改提示词前后各跑 k=3 次。</li>
+  <li data-show="a3 b3" data-hl="a3 b3">实际：一天 407 万输入 token 只命中 3072 个缓存，知识库编译因为没有超时卡死一个多小时，发送被拒后一天重试三千多次，都是出了事才补。有知识时（第 2、10、14 章）：这些都是第一天的默认配置。</li>
+  <li data-show="a4 b4" data-hl="a4 b4">实际：7 天推了 238 张卡，真正点过的只有一成，108 个里程碑里 33 个都在给卡降噪。有知识时（第 8 章"审批预算"）：从第一天就记录采纳率，精度不够的卡型降级成简报里的一行，达标后再升级成卡片。</li>
+  <li data-show="a5" data-hl="a5">贯穿始终：分析提示词从 1291 字涨到 6058 字，改了 25 次。devtask 里"新需求要不要并入旧任务"的规则一个月翻了三次。这些判例本应进评测集（第 5、13 章）。</li>
+</ol>
+<figcaption>上半是两个项目的实际路径，下半是假设的有知识路径。数字都来自提交记录和项目文档。</figcaption>
+</figure>
+
+<h2>4 · 31 条发现</h2>
+<p>每条发现都分成两半对比：<span class="pill danger">缺这块知识时</span> 是实际发生的，<span class="pill ok">有这块知识时</span> 是课程里对应知识点会给出的设计。右上角的开关可以切成只看一边。</p>
+<div class="filters">
+  <label>项目 <select id="fProject"><option value="">全部</option><option value="niuma">niuma-agent</option><option value="devtask">devtask</option></select></label>
+  <label>严重度 <select id="fSev"><option value="">全部</option><option value="3">高</option><option value="2">中高</option><option value="1">中及以下</option></select></label>
+  <label>现状 <select id="fStatus"><option value="">全部</option><option>仍存在</option><option>部分修复</option><option>已修复</option></select></label>
+  <span class="seg" id="mode"><button type="button" data-m="both" class="on">对比</button><button type="button" data-m="without">只看缺知识时</button><button type="button" data-m="with">只看有知识时</button></span>
+  <span class="pill" id="count"></span>
+</div>
+<div id="findings"></div>
+
+<h2>5 · 六类共性根因</h2>
+<p>31 条发现归并下来，其实只有 6 类根因。每一类都对应课程里的一两章。</p>
+<table>
+<tr><th>根因</th><th>在两个项目里的表现</th><th>对应章节</th></tr>
+<tr><td><strong>① 让模型做了该由代码做的事</strong></td><td>devtask：让模型自报"用户已同意"、宣布完成、搬运 ID、充当调度中枢。niuma：一次调用同时出十几个判断。</td><td><a href="ch01-what-is-agent.html">第 1 章</a> · <a href="ch03-structured-tools.html">第 3 章</a></td></tr>
+<tr><td><strong>② 先扩功能，后建评测</strong></td><td>niuma：87 个改提示词的提交里，只有 17 个附了回放数据；结清判断没达标就上线。devtask：482 个单测没有一条测 agent 行为。</td><td><a href="ch13-evals.html">第 13 章</a></td></tr>
+<tr><td><strong>③ 用提示词打补丁</strong></td><td>niuma：分析提示词里有 53 处"不要/一律/除非"，还写进了具体事故里的业务名词。devtask：SKILL.md 里 59 处同类措辞，升级说明累计 24 条。</td><td><a href="ch05-context-engineering.html">第 5 章</a></td></tr>
+<tr><td><strong>④ 没有威胁模型</strong></td><td>两个项目都同时具备"不可信输入 + 私有数据 + 对外动作"（lethal trifecta）。devtask 授权后谁都能经模型驱动编码 agent，权限确认还交给另一个 LLM 代按。</td><td><a href="ch09-security.html">第 9 章</a> · <a href="ch08-hitl-autonomy.html">第 8 章</a></td></tr>
+<tr><td><strong>⑤ 耦合实现而非协议</strong></td><td>devtask 读终端画面、会话文件和进程环境来判断编码 agent 的状态，contracts.py 的存在本身就说明了这一点；Claude、Orca 相关的修复有 22 个。</td><td><a href="ch11-protocols.html">第 11 章</a> · <a href="ch12-long-running.html">第 12 章</a></td></tr>
+<tr><td><strong>⑥ 可靠性靠事故驱动</strong></td><td>缓存、超时、熔断、token 预算、端到端 trace，都是出了事才补，或者至今没有。</td><td><a href="ch10-durable-execution.html">第 10 章</a> · <a href="ch14-observability.html">第 14 章</a></td></tr>
+</table>
+
+<div class="quiz" data-answer="3">
+<p class="q">devtask 用"状态文本里含不含'完成'"来判断任务是否结束。下面哪种改法最符合本课程的思路？</p>
+<ol>
+  <li>把匹配词改成"已完成"，避免误判"未完成"</li>
+  <li>在 SKILL.md 里加一条规则："不要写'未完成'"</li>
+  <li>状态改成枚举；终态只能由插件根据 PR 合并、CI 通过等可核实条件写入，模型最多提议"请人工 review"</li>
+  <li>让另一个模型复核状态文本</li>
+</ol>
+<div class="explain">选项 1 和 2 都是在补丁上再打补丁，下一个"完成了一半"照样误判。选项 4 用一个不可靠的判断去复核另一个不可靠的判断。根因是"完成"这种有后果的状态<strong>由模型的自由文本决定</strong>：第 3 章说状态要用枚举，第 12 章说完成要由可验证的条件门控。</div>
+</div>
+
+<div class="quiz" data-answer="2">
+<p class="q">niuma 的分析提示词里写进了一串具体的业务名词（来自某次事故涉及的几个业务模块），用来纠正一次值班误判。这种做法最大的问题是什么？</p>
+<ol>
+  <li>提示词变长，费用增加</li>
+  <li>判例写进提示词，只能覆盖见过的情形，规则越积越多还互相牵制；它应该进评测集，确定性的归属判断交给代码</li>
+  <li>模型看不懂中文业务名词</li>
+  <li>违反了提示缓存的前缀规则</li>
+</ol>
+<div class="explain">这正是 Anthropic 说的"if-else 式提示词"，见第 5 章"合适的高度"。判例的正确去处是标注集（第 13 章）；"归不归我们组"这类能确定性判断的事，交给代码去比对职责清单。项目后来确实改成了"摘出职责原文、由代码核对"，方向是对的。</div>
+</div>
+
+<h2>6 · 如果重来：按优先级的整改清单</h2>
+<p>按"风险 × 修复成本"排序。前 5 条是安全和正确性问题，建议先处理。勾选状态会保存在你的浏览器里。</p>
+<ul class="checklist" data-key="fix">
+  <li><strong>devtask：授权卡显示将要执行的完整指令</strong>（或摘要加哈希），执行时校验；指令改了就重新授权。见 <a href="#f-D7">D7</a>。</li>
+  <li><strong>devtask：去掉模型自报确认</strong>。<code>user_confirmed</code> 这类参数一律改成引用插件记录的消息 ID 或按钮回调。见 <a href="#f-D3">D3</a>。</li>
+  <li><strong>devtask：完成判定改成枚举，并由可核实条件门控</strong>；先把"未完成会被判成完成"这个现存 bug 修掉。见 <a href="#f-D5">D5</a>。</li>
+  <li><strong>devtask：编码 agent 用受限的权限模式</strong>；权限请求不交给话题 agent 代按；非创建人的消息只当建议。见 <a href="#f-D8">D8</a>、<a href="#f-D9">D9</a>。</li>
+  <li><strong>niuma：写一份威胁模型</strong>；外发草稿只用本会话上下文；自动派发强制沙箱、出网白名单和最小上下文包。见 <a href="#f-N7">N7</a>、<a href="#f-N8">N8</a>。</li>
+  <li><strong>niuma：交付证据改为回查 PR 状态与 CI 结果</strong>，任意 URL 不再算证据。见 <a href="#f-N10">N10</a>。</li>
+  <li><strong>两个项目：每个 LLM 节点建标注集</strong>，30–50 条人工金标；改提示词前后各跑 k=3 次，看 pass^k。见 <a href="#f-N4">N4</a>、<a href="#f-D13">D13</a>。</li>
+  <li><strong>niuma：瘦身分析提示词</strong>，只留 5–7 条原则，判例迁进评测集，把单次分析拆成链。见 <a href="#f-N2">N2</a>、<a href="#f-N3">N3</a>。</li>
+  <li><strong>niuma：上下文按 token 预算组装</strong>，把档案移到静态规则之后，并记录每一节的占比。见 <a href="#f-N11">N11</a>、<a href="#f-N12">N12</a>。</li>
+  <li><strong>devtask：用 headless/ACP 持有编码 agent 会话</strong>，用结构化事件代替读终端和内部文件；定义 <code>CodingAgent</code> 接口。见 <a href="#f-D6">D6</a>、<a href="#f-D14">D14</a>。</li>
+  <li><strong>两个项目：通知和发送走 outbox，区分可重试与不可重试</strong>，配熔断和死信；启动时做对账。见 <a href="#f-N15">N15</a>、<a href="#f-D12">D12</a>。</li>
+  <li><strong>niuma：trace 带批次和卡片的关联 id</strong>；助手工具按意图分组、按需下发。见 <a href="#f-N16">N16</a>、<a href="#f-N17">N17</a>。</li>
+</ul>
+
+<h2>7 · 已经做对的事</h2>
+<p>这些是两个项目自己摸索出、与业界最佳实践一致的做法。它们也说明，缺的往往不是工程能力，而是<strong>提前知道该往哪里用力</strong>。</p>
+<div class="tabs">
+<div class="tab-panel" data-label="niuma-agent">
+<ul>
+  <li><strong>模型不填长 ID</strong>：上下文里用 M/U/R 短编号，由代码映射回真实 ID；回答里的【m3】引用由系统换成跳转链接。这是第 3 章的防呆设计（poka-yoke）。</li>
+  <li><strong>可靠执行</strong>：提案状态机配幂等键，键里含正文（actions.ts:484）；派发前先记"派发中"；重启后把执行中的卡退回待审批，不自动重发（repo/proposals.ts:470）。这是第 10 章的教科书做法。</li>
+  <li><strong>确定性护栏</strong>：read_local_file 只读用户亲手给出的路径；safe-fetch 防止 DNS 解析后换成内网地址；MCP 的只读标注只当提示，另配白名单；执行过写操作的工具循环出错后不换模型重来（tool-loop.ts:48）。</li>
+  <li><strong>评测基础设施</strong>：提示词带版本号；回放按提案时刻截断上下文，防止后来的信息泄进来；新草稿和本人写的话做盲测；有影子提示词。</li>
+  <li><strong>多 agent 刹车与分级</strong>：答复执行方最多两轮、有并发上限、可叫停、回查 60 秒超时；按任务分配模型；主体是 workflow，只有对话助手是 agent loop；ADR 写了推翻条件。</li>
+</ul>
+</div>
+<div class="tab-panel" data-label="devtask">
+<ul>
+  <li><strong>创建人 ID 由插件记录、覆盖模型填的值</strong>（plugin.py:77、672，有测试）。这是在一次编造 ID 的事故之后改的，方向完全正确。</li>
+  <li><strong>审批按钮不进模型，在锁内幂等</strong>：第一条有效决定获胜，重开后旧决定作废（service/intake.py:148-187）；确认方案时核对创建人原话，单次有效。</li>
+  <li><strong>客观读取进度</strong>：从 git 和 gh 读提交、PR、CI；自动状态只往前推（progress.py:388-417）；发布到环境分支由插件确定性执行，不经过模型。</li>
+  <li><strong>Stop hook 写得规范</strong>：<code>stop_hook_active</code> 时放行，每轮只提醒一次；用 <code>python3 -I</code> 运行，跑 git 时关掉仓库 hook 和 fsmonitor；用真实 Claude Code 验证过。</li>
+  <li><strong>把隐性依赖显性化</strong>：contracts.py 在版本变化时自动核对，doctor 也会检查；缺的能力整理成文档提给上游。另有每个任务的事件日志、看板和 gh_health 记账。</li>
+</ul>
+</div>
+</div>
+
+<div class="takeaways"><b>本章要点</b>
+<ul>
+  <li>两个项目的 31 条发现可以归成 6 类根因：模型越权、评测后置、提示词打补丁、没有威胁模型、耦合实现、可靠性靠事故驱动。</li>
+  <li>最危险的几条都在授权与执行的边界上：模型自报确认、授权看不到指令、权限请求由另一个模型代按、完成判定用子串匹配。</li>
+  <li>缺知识的代价，是把"第一天的设计决定"变成了"一次事故之后的补丁"。缓存、超时、熔断、评测，本都该是默认配置。</li>
+  <li>两个项目已经摸索出不少正确做法：短编号、幂等状态机、客观进度、规范的 Stop hook。缺的主要是提前知道往哪里用力。</li>
+</ul></div>
+
+<h2>参考资料</h2>
+<ul class="refs">
+  <li><a href="ch01-what-is-agent.html">第 1 章 · 复杂度阶梯</a> <span class="src">workflow 与 agent 的分界</span></li>
+  <li><a href="ch05-context-engineering.html">第 5 章 · 合适的高度</a> <span class="src">为什么规则堆积会适得其反</span></li>
+  <li><a href="ch09-security.html">第 9 章 · lethal trifecta 与 Rule of Two</a> <span class="src">两个项目共同缺的威胁模型</span></li>
+  <li><a href="ch13-evals.html">第 13 章 · 评测</a> <span class="src">把事故变成回归用例</span></li>
+  <li><a href="https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents" target="_blank" rel="noopener">Effective context engineering for AI agents</a> <span class="src">Anthropic · 2025-09-29 · "if-else 式提示词"与合适的高度</span></li>
+  <li><a href="https://simonwillison.net/2025/Jun/16/the-lethal-trifecta/" target="_blank" rel="noopener">The lethal trifecta for AI agents</a> <span class="src">Simon Willison · 2025-06-16</span></li>
+</ul>
+</article>
+
+<script>
+window.addEventListener('DOMContentLoaded', () => {
+  // 严重度：3 高 · 2 中高 · 1 中 · 0 低
+  const DOMAINS = [
+    ['ch01', '复杂度与 workflow', 'ch01-what-is-agent.html'],
+    ['ch02', '模型工程与缓存', 'ch02-llm-fundamentals.html'],
+    ['ch03', '结构化输出与工具', 'ch03-structured-tools.html'],
+    ['ch04', 'Agent Loop', 'ch04-agent-loop.html'],
+    ['ch05', '上下文工程', 'ch05-context-engineering.html'],
+    ['ch06', '记忆', 'ch06-memory.html'],
+    ['ch07', '检索与知识库', 'ch07-retrieval.html'],
+    ['ch08', '人在回路与自主度', 'ch08-hitl-autonomy.html'],
+    ['ch09', '安全', 'ch09-security.html'],
+    ['ch10', '可靠执行', 'ch10-durable-execution.html'],
+    ['ch11', '多 Agent 与协议', 'ch11-protocols.html'],
+    ['ch12', '长任务与编码 Agent', 'ch12-long-running.html'],
+    ['ch13', '评测', 'ch13-evals.html'],
+    ['ch14', '可观测与成本', 'ch14-observability.html'],
+    ['ch15', '架构', 'ch15-reference-architecture.html'],
+  ];
+  const F = [
+    { id: 'N1', p: 'niuma', d: ['ch01', 'ch15'], sev: 3, st: '仍存在', t: '功能扩张跑在验证前面',
+      ev: '53 天 108 个里程碑、8.3 万行、45 个助手工具、74 个配置默认项、约 47 万字文档；M1–M5（含 auto 模式）在第一天都标了"完成"；VERIFY.md 已勾 46 项、未勾 112 项。',
+      gap: '复杂度阶梯；先把一条链做窄做深，再按指标扩面。',
+      without: '能想到的场景都做成里程碑：群聊、值班、知识库、离开模式、Web 控制台……每个都"能用"，但大多数没验证过效果，返工分散在几十个点上。',
+      with: '只做"私聊或 @我 → 草稿 → 审批"一条链，采纳率和误报率达标后再扩群聊、知识库、值班。预期：功能更少，但每个功能都有数字支撑，返工集中而且可控。' },
+    { id: 'N2', p: 'niuma', d: ['ch05', 'ch13'], sev: 3, st: '部分修复', t: '提示词成了 if-else',
+      ev: 'analyze.md 从 1291 字（ed7ca23）涨到 6058 字（a13e337），改了 25 次，有 53 处"不要/不算/一律/除非/哪怕"；triage.md 从 533 字涨到 2698 字；规则里写进了具体事故的业务名词（analyze.md:41、triage.md 值班一节），违反项目自己定的"行业中性"。',
+      gap: '上下文工程里"合适的高度"；判例应进标注集，确定性判断交给代码。',
+      without: '每次误判就往提示词里加一条规则或一个例子。规则越来越多、互相牵制，修好一处又引出另一处，模型对每条规则的注意力也被稀释。',
+      with: '提示词只留 5–7 条原则加少量多样的示例；误判样本进评测集作为回归用例；"归不归我们组"这类能确定的事由代码按会话档案判。预期：提示词长度稳定，改动能用评测数字验证。' },
+    { id: 'N3', p: 'niuma', d: ['ch03', 'ch01'], sev: 2, st: '部分修复', t: '一次分析调用干太多事',
+      ev: 'AnalysisSchema 一次输出摘要、要不要回、要不要关注、任务、需求（TaskSpec）、草稿、追问、候选答案、机器人检测、紧急度、置信度；规则互相牵制（analyze.md:21），带来连锁修补（01f2167、3c9743d）。',
+      gap: '提示链（prompt chaining）：每次调用只管一件事。',
+      without: '一个大 schema 包办所有判断。字段之间的规则互相影响，改一个字段的提示会让另一个字段变差，也没法单独评测某一项判断。',
+      with: '拆成"相关性 → 要不要回 → 抽需求 → 起草"四步，每步各有 schema 和评测，前一步不通过就不走后一步。预期：每一步都能单独测和调，便宜的判断还能用小模型做。项目后来拆出分诊和角色判断，方向正确。' },
+    { id: 'N4', p: 'niuma', d: ['ch13'], sev: 3, st: '部分修复', t: '先改提示词、后补评测，没有 pass^k',
+      ev: '87 个改提示词的提交里只有 17 个附了回放数据；`niuma eval`（fdb7194）只覆盖回复卡，所以到 10-31 才发现"102 张追问卡一张没被用上"；10-25 一天内 4 次修角色判断（affd8c5→e38f1d1→f67543b→b6722a4），最后靠"三次判两次一致"补救；"同一个人几次判得不一样"的处理是加大思考强度，而不是量出方差。',
+      gap: '评测驱动开发；pass@k 与 pass^k；方差要量化。',
+      without: '改完提示词看几个例子觉得好了就提交。同一天来回修四次，因为没有固定的测试集，每次都在为最近看到的那个例子调。',
+      with: '每个 LLM 节点先有 30–50 条标注，改前改后各跑 k=3 次，看 pass^k 和失败分类的变化。追问卡这类产出从第一天就纳入评测。预期：一次改对的概率大幅提高，"一张卡都没被用上"会在第一周暴露。' },
+    { id: 'N5', p: 'niuma', d: ['ch13'], sev: 2, st: '仍存在', t: '评测标签不独立，没达标就上线',
+      ev: '结清的标注集"由助手读上下文代标"，一致率 80%，没达到 95% 的门槛（roadmap:1260）；但守护进程已经在用模型判断结清（pipeline.ts:371、cli/run.ts:749）。',
+      gap: '人工金标；judge 必须先和人工标注对齐；没过门槛不自动执行。',
+      without: '让模型给模型的判断打标签，再用这些标签说明模型判得对。门槛没过也照样上线自动作废。',
+      with: '人工标 50 条作为金标；门槛没过之前只"建议作废"、交给人点。预期：自动作废的误伤可以量化，过了门槛才放权。' },
+    { id: 'N6', p: 'niuma', d: ['ch08'], sev: 3, st: '部分修复', t: '审批疲劳是上线后才发现的',
+      ev: '7 天推了 238 张卡，"真正在卡上点过的只有一成左右"（roadmap:1194）；11-06 挂着 258 张待处理卡（roadmap:1248）；108 个里程碑里有 33 个在给卡降噪、少打字、自动作废、放权。',
+      gap: '审批预算；精度先于推送；OWASP ASI09 人对 agent 的过度信任与走过场审批。',
+      without: '凡是可能需要处理的都出一张卡，指望用户自己筛。结果用户不再看卡，审批形同虚设，之后再花三分之一的里程碑往回收。',
+      with: '从第一天就记录每种卡的采纳率；精度不够的卡型只进简报里的一行，达标才升级成卡片；给每天的推送量设上限。预期：卡少但每张都值得点，审批真正起作用。' },
+    { id: 'N7', p: 'niuma', d: ['ch09'], sev: 3, st: '仍存在', t: '主管线没有提示注入威胁模型',
+      ev: '文档里的"注入"都是指上下文注入；analyze.md 没有"消息是数据不是指令"，反而要求链接文档内容"以它为准"（:35）；分析上下文里有跨会话的全文检索结果（memory/search.ts:32 不限会话）加个人档案；auto 会话的防线只有敏感词子串、模型自报的 confidence 和 LLM 底线检查（policy.ts:78-125）。',
+      gap: 'lethal trifecta；Rule of Two；确定性的信息流隔离。',
+      without: '同一次调用里既有同事发来的不可信消息，又有别的会话的私有内容，还能（在 auto 模式下）直接对外发。防线是"模型自己判断要不要发"。一条精心构造的消息可能把别的会话的内容带进回复。',
+      with: '写一份威胁模型；外发草稿只用本会话的上下文；跨会话的检索结果只用于分析、不进可外发的草稿；用引用编号确定性地检查草稿里每一句的来源。预期：即使模型被注入，也拿不到能泄露的数据。' },
+    { id: 'N8', p: 'niuma', d: ['ch09', 'ch12'], sev: 3, st: '仍存在', t: '编码 agent 一侧三要素同时成立',
+      ev: '需求来自同事消息（不可信）；执行方经 `niuma mcp serve` 能检索全部消息（docs/07:112）；它还能建 PR、能联网；ADR-0028 允许 code 类需求自动派发，沙箱是可选的（docs/07:269）。能否被利用属于推测，未实测。',
+      gap: '最小权限；按任务授权；Managed Agents 式的凭据与沙箱分离。',
+      without: '派发给编码 agent 时给了它"查全部消息"的能力，又允许自动派发。一段写在需求里的指令，理论上能让编码 agent 把消息内容带进 PR 或发到外网。',
+      with: '自动派发强制沙箱和出网白名单；MCP 只暴露这个需求的上下文包，不给全库检索；凭据经代理注入、不进沙箱。预期：三要素最多同时满足两个。' },
+    { id: 'N9', p: 'niuma', d: ['ch08'], sev: 2, st: '仍存在', t: '自称"不可妥协"的边界，三周放开三次',
+      ev: 'ADR-0028、0029、0031 依次放开了自动派发、自动应答、个人账号建文档；answer-executor.md:4 仍写"用户批准后才会发出"，和 L2 自动转回矛盾。',
+      gap: '放权要可度量、可回滚；放权时同步更新模型看到的前提。',
+      without: '边界写成"不可妥协"，需要时再逐条破例。提示词里还留着旧前提，模型以为有人审批，实际已经自动发出。',
+      with: '一开始就把边界写成分级（第 8 章的信任矩阵），每次放权附回滚指标；改策略的同一个提交里同步更新所有相关提示词。预期：边界随信任演进，而不是被一次次破例。' },
+    { id: 'N10', p: 'niuma', d: ['ch12'], sev: 2, st: '仍存在', t: '交付的"客观证据"判得太松',
+      ev: 'auto-approve.ts:46-49：交付通知的正文里只要有任意 `https://` 链接或附件，就算有客观证据；ADR-0028 写的是"以 PR、文档链接这类客观证据为准"。',
+      gap: 'verifier 应检查能核实的东西；不信 agent 的自述。',
+      without: '执行方回一句带链接的"做完了"，就满足了自动发交付通知的条件，哪怕链接与任务无关、PR 还没合并。',
+      with: '回查 PR 的合并状态和 CI 结果，文档链接要能打开且属于这次任务；任意 URL 不算证据。预期：自动交付通知不会建立在未核实的自述上。' },
+    { id: 'N11', p: 'niuma', d: ['ch02', 'ch14'], sev: 1, st: '部分修复', t: '缓存和超时都是出了事才补',
+      ev: '"之前一天 407 万输入只命中 3072"，10-25 才补上缓存键（5b87bbb）；"一次知识库编译曾因此卡死一个多小时"，10-27 才加超时（59dad68）；初始化整理曾要上万次调用（VERIFY.md:500）；残留问题：档案放在静态规则之前（analyze.md:8），档案一改就破坏前缀缓存。',
+      gap: '缓存友好的上下文布局（静态在前、易变在后）；所有调用默认带超时。',
+      without: '先把功能跑通，账单和卡死出现后再查原因。查到之后修了，但提示词里的布局问题还在。',
+      with: '第一天就把"稳定内容在前、会变的在后"和"每次调用都有超时与总时长上限"写成调用层的默认值。预期：省下前三周的大部分输入费用，也不会卡死一小时。' },
+    { id: 'N12', p: 'niuma', d: ['ch05'], sev: 1, st: '仍存在', t: '上下文只按条数截断，没有 token 预算',
+      ev: '05-pipeline.md:110 写"token 预算内截断"，代码只按 40 条取（analyzer.ts:212-216），整个 src 里没有 token 估算；上下文有 13 个来源，各管各的条数上限。',
+      gap: '统一的上下文预算；记录每节占比；context rot。',
+      without: '每个来源各自定一个"最多几条"，总长度没人管。长消息多的时候上下文膨胀，短消息多的时候又浪费了预算；文档和代码说的也不一样。',
+      with: '组装器按 token 预算分配各节份额，超了按优先级裁剪，并把每节实际占比写进 trace。预期：上下文长度可预测，出问题时能直接看到是哪一节挤占了空间。' },
+    { id: 'N13', p: 'niuma', d: ['ch06'], sev: 1, st: '部分修复', t: '记忆自我强化，写入不审核',
+      ev: 'e38f1d1 "judge roles from own words, not past guesses"：旧的猜测被回灌成证据；提取结果"不做审核队列"（11-memory-persona.md:241）；自动生成的档案在审阅前就被使用（:203）；会话档案里的 not_mine 能让分诊直接判 none（triage.md 第 6 条）。',
+      gap: '记忆污染（OWASP ASI06）；防反馈回路；会影响路由的记忆需要多源佐证。',
+      without: '模型的猜测写进记忆，下次又被当成事实读回来，错误越滚越稳；一条错误的"这不是我的事"能让整类消息被静默跳过。',
+      with: '记忆区分"来自原话的事实"和"模型的推断"，推断不作为证据回灌；会改变路由的记忆需要多源佐证或人工确认后才生效。项目后来加了变更日志、撤销和手改保护，方向正确。' },
+    { id: 'N14', p: 'niuma', d: ['ch07', 'ch13'], sev: 2, st: '部分修复', t: '知识库没有基线就连升格式',
+      ev: '11-07 人工抽读才发现"事故页是杂物筐""类型判错"；lint 228 页里孤立页 195 个、标题是群名的 36 个（roadmap:1327）；11-08 到 11-09 格式从 1 连升到 5；src/wiki 的 39 个提交里有 14 个是 fix；固定问题集基线 V94-2 至今未勾；中文仍按空白和标点切词（wiki/retrieve.ts:41）。',
+      gap: '检索评测先行；中文分词；知识编译的质量指标。',
+      without: '先把编译管线做出来，再靠人工抽读发现质量问题，然后一天内连改几版格式。',
+      with: '先定一组固定问题集，量出检索命中率和答案正确率作为基线，每次改格式都对比基线；中文用 n-gram 或分词器。预期：格式升级有数字依据，不会两天升四版。' },
+    { id: 'N15', p: 'niuma', d: ['ch10'], sev: 1, st: '部分修复', t: '不可重试的错误没有熔断',
+      ev: '"飞书拒收，一天里重试了三千多次"（roadmap:1046，9b6b2f5）；这次的触发原因已修，有没有通用熔断未核实（推测没有）。',
+      gap: '区分可重试与不可重试的错误；熔断；死信队列。',
+      without: '所有失败都按同一种方式重试。遇到对方明确拒收，就无限重试下去，直到有人看到日志。',
+      with: '4xx 类业务拒绝直接进死信并通知；同一目标连续失败触发熔断。预期：三千次重试变成一条告警。' },
+    { id: 'N16', p: 'niuma', d: ['ch14'], sev: 1, st: '仍存在', t: 'trace 不能端到端关联',
+      ev: 'trace.ts:21-41 没有批次或卡片的关联 id；提示词版本靠文本"认出"（trace.ts:55）；预算只有全局的日上限和月上限。',
+      gap: 'trace/span 建模；关联 id；按任务归集成本。',
+      without: '每次模型调用各记一行。要回答"这张卡为什么这么写、花了多少钱"，只能靠时间戳去拼。',
+      with: '一批消息一个 trace，分诊、分析、起草、工具调用都挂在它下面，卡片记录 trace id；提示词版本显式传入。预期：判错时一跳就能看到完整链路和成本。' },
+    { id: 'N17', p: 'niuma', d: ['ch03', 'ch05'], sev: 1, st: '仍存在', t: '助手工具面太宽',
+      ev: '45 个工具每轮全量下发（chat.ts:175-190）；assistant.md 的 18 条规则多半是"用户说 X → 用 Y"的路由表。',
+      gap: '工具少而精、按需披露（Skills 的渐进披露、Code execution with MCP）。',
+      without: '每轮都把 45 个工具的定义塞进上下文，再用规则教模型什么时候用哪个。工具越多，选错的概率越高，规则也越长。',
+      with: '合并成少量意图级工具，低频工具按意图分组按需加载；路由规则改由工具描述本身承担。预期：每轮上下文更小，选错工具更少。' },
+
+    { id: 'D1', p: 'devtask', d: ['ch01'], sev: 3, st: '部分修复', t: '本该是 workflow，却让 LLM 当调度中枢',
+      ev: 'PR 出现前，Claude 每停一轮插件都起一轮话题 agent 回合（README:149）；2e1de31（10-19）记录一个话题一天调用模型 311 次、输入 token 中位数 127k；之后 71f68cd、4b2c9a7、a84b8fe 接连"砍 agent 回合"，改成插件直接转发 Claude 的回复。',
+      gap: 'workflow 与 agent 的分界：控制流已知时由代码驱动。',
+      without: '每个事件都交给 LLM 决定下一步，于是"转发一条消息"也要一轮完整的 agent 回合。',
+      with: '状态迁移由代码驱动；只在需要判断的节点调 LLM，比如解释 CI 失败、向人转述方案。预期：调用量按数量级下降，而且行为可预测。' },
+    { id: 'D2', p: 'devtask', d: ['ch15', 'ch01'], sev: 2, st: '仍存在', t: '复杂度失控，文档跟实现对不上',
+      ev: 'README 72KB，第 149 行一条就有 7598 字；README:12 写"7 个工具"，实际有 20 个（plugin.py:357-613）；README:18 写"不做 watcher 轮询"，但 watcher.py:33 每 5 秒轮询一次。',
+      gap: '复杂度预算；核心与扩展分离；文档与接口同源。',
+      without: '每个新需求都直接加进核心流程，文档跟着追加，最后文档自己互相矛盾，也和代码对不上。',
+      with: '核心只留"授权 → 启动 → 跟进 → 收尾"状态机；多仓库、换 agent、手动接管、发布做成可选扩展；工具清单从代码生成。预期：核心能被一个人完整理解。' },
+    { id: 'D3', p: 'devtask', d: ['ch03', 'ch08'], sev: 3, st: '仍存在', t: '让模型自报"用户已同意"',
+      ev: '`user_confirmed`、`new_task_in_topic`、`discard_resolution`、`confirm_worktree_removal` 都由模型填，约束只有一句描述"不能凭自己判断就填"（plugin.py:531-533）；同一个项目里 `devtask_approve_plan` 的做法是对的：核对创建人 10 分钟内的原话，用一次就作废（README:121）。',
+      gap: '"确认"必须是可验证的证据，不能是模型填的布尔参数。',
+      without: '模型只要把参数填成 true，就绕过了确认步骤：删 worktree、丢弃改动、把消息发给别的任务的 Claude。约束全靠模型自觉。',
+      with: '所有确认一律引用插件记录的消息 ID 或按钮回调，由代码核对发送人和时间窗。预期：模型再怎么出错，也越不过确认这道门。' },
+    { id: 'D4', p: 'devtask', d: ['ch03'], sev: 1, st: '已修复', t: '让模型搬运 ID，导致编造和漏填',
+      ev: '模型编过不存在的 open_id，飞书建卡报 100290（README:93）；685c1cf（11-18）："话题 agent 漏传 task_id，每天几十次 KeyError"，每次重试都重发整段上下文。仓库路径、提交 SHA 仍由模型填。',
+      gap: '工具参数从上下文推导；防呆设计；不让模型填标识符。',
+      without: '工具 schema 里要求模型填 open_id、task_id，模型就会编、会漏。',
+      with: '从一开始就把 requester、task_id 绑定到会话，不出现在 schema 里。预期：这一类错误从源头消失，而不是逐个补默认值。' },
+    { id: 'D5', p: 'devtask', d: ['ch04', 'ch12', 'ch03'], sev: 3, st: '部分修复', t: '"完成"由模型用自由文本宣布',
+      ev: 'SKILL.md:61、73 让 agent 读完 Claude 的回复后，用 `devtask_update` 把状态改成"已完成"；状态值原样写入（service/base.py:308）；完成判定按子串匹配"完成"（core/status.py:58）。<b>已实测：<code>is_completed("未完成")</code> 返回 True。</b>只有"CI 中"有拦截（base.py:301），是事后补的。',
+      gap: '完成必须由可验证条件门控（长任务的"过早宣布完成"）；状态用枚举。',
+      without: '模型读一段 Claude 的自述就宣布完成；状态是自由文本，"未完成"也会被当成完成。',
+      with: '状态改成枚举；终态由插件按 PR 合并、CI 通过等条件判定，模型最多只能提议"需要人工 review"。预期：不会再出现"卡片说完成了，其实没做完"。' },
+    { id: 'D6', p: 'devtask', d: ['ch11', 'ch12', 'ch04'], sev: 3, st: '部分修复', t: '驾驭交互式终端，没用程序化协议',
+      ev: '轮次是否结束，靠 Orca 状态加会话 jsonl 里的 turn_duration 兜底（watcher.py:39-41）；d3542e0（09-30）Claude 一升级启动检测全部失败，cbb6c4c（10-23）改成读屏幕判断空闲，5bb2d90（11-02）又改成读进程环境变量；一次实测 11 个孤儿 Claude（README:156）；contracts.py:1-6 自己写明，依赖的都"不是公开承诺的接口，变了通常不报错"；Claude、Orca 相关的 fix 有 22 个。',
+      gap: 'headless 与 ACP 这类程序化协议；防腐层；"一次性 runner"与"程序化会话"的区别。',
+      without: '为了让人能在终端里看到和接管，选择驱动交互式终端，于是轮次结束、启动成功、权限请求都只能从屏幕和内部文件里猜。上游每升级一次就坏一次。',
+      with: '插件用 ACP 或 Agent SDK 持有编码 agent 会话，轮次结束、权限请求、会话恢复都是协议里的结构化事件；终端只作为可选的观看和接管界面。预期：上游升级不再导致检测全面失效，孤儿进程问题自然消失。' },
+    { id: 'D7', p: 'devtask', d: ['ch08', 'ch09'], sev: 3, st: '仍存在', t: '授权卡上看不到要执行的指令',
+      ev: '卡片只渲染 summary 和 services（channels/feishu/card.py:289、325），channels/ 里没有任何地方渲染 `runner_prompt`；Claude 实际执行的是模型写的 runner_prompt 加 DEV_RULES（service/develop.py:54-67）。',
+      gap: '批准的必须就是将被执行的内容（所见即所批）。',
+      without: '用户批准的是一段摘要，执行的是另一段模型写的完整指令。两者不一致时，用户无从发现。',
+      with: '卡上展示指令全文，或摘要加内容哈希；执行时校验哈希一致，指令改了就重新授权。预期：授权真正约束执行内容。' },
+    { id: 'D8', p: 'devtask', d: ['ch08', 'ch09'], sev: 3, st: '仍存在', t: '授权只拦一次，之后任何人都能经模型驱动编码 agent',
+      ev: '授权只认创建人（core/authorization.py:203），但任务话题里任何人的消息都会带着任务上下文进模型（plugin.py:1082）；测试明确断言陌生人的"再改一下"会收到 devtask_say 提示（tests/test_plugin.py:251-258）；Claude 弹出的权限确认，由话题 agent 按"安全且在授权范围内"替它按键（SKILL.md:57）。',
+      gap: '持续授权与最小权限；权限请求不能交给另一个 LLM 代批。',
+      without: '授权之后，话题就成了任何人都能指挥编码 agent 的入口；编码 agent 申请越界权限时，批准它的是另一个同样可能被注入的模型。',
+      with: '非创建人的消息标明身份、只作为建议；权限确认按工具白名单由策略自动决定，越界的必须创建人点按钮。预期：授权范围在整个任务期间都成立。' },
+    { id: 'D9', p: 'devtask', d: ['ch09'], sev: 3, st: '仍存在', t: '不可信输入、私有数据、外发通道集中在同一个 agent',
+      ev: 'lark-read 用固定的登录态（skills/lark-read/scripts/lark-read:10-11），文档却写"以创建人的账号"，实际上谁建任务谁就借用了机主的账号；这个工具经 DEV_RULES 交给编码 agent（develop.py:42），而编码 agent 同时能 git push、能用 psql 查库；插件没有设置编码 agent 的权限模式（全仓库搜不到 permission-mode），等于继承用户的全局配置。',
+      gap: 'lethal trifecta 与 Rule of Two；凭据按实际请求人绑定；最小权限。',
+      without: '为了方便，让编码 agent 一个进程里同时拥有读私有文档、读数据库和推代码的能力，还用着机主的身份。一份被投毒的文档就可能让它把数据推到别处。',
+      with: '读外部文档放在隔离的只读步骤里，产出摘要交人确认后再给编码 agent；编码 agent 用受限的权限配置和出网白名单；凭据按实际请求人绑定。预期：三要素拆开，一次注入的影响被限制在单个步骤里。' },
+    { id: 'D10', p: 'devtask', d: ['ch05'], sev: 1, st: '部分修复', t: '规则堆积，靠改提示词打补丁',
+      ev: '约 2000 字的 PROMPT_SECTION 注册成 profile 级系统提示（plugin.py:136、345）；SKILL.md 10216 字，"不要/一律/只在"出现 59 次，10-19 刚瘦身到 6363 字（2e1de31）又涨回来；AGENT_CHANGES 24 条作为升级说明注入老会话（followup.py:175）；"新需求要不要并入已有任务"一个月翻了三次：2a130c0（10-14）不准默默并入 → a190623（10-30）先问用户 → 0664db4（11-24）一律新建、不问。',
+      gap: '能写成代码的约束不放进提示词；判例进评测集。',
+      without: '行为不对就加一条规则；规则之间冲突了就再加一条解释；同一条规则来回翻，没有评测告诉你哪个版本更好。',
+      with: '能拦截的都代码化（"话题里禁建任务"已经是代码拦截，做对了）；提示词只留意图和示例；规则翻转前先用评测集比较。预期：提示词稳定，行为变化有数据依据。' },
+    { id: 'D11', p: 'devtask', d: ['ch06', 'ch12'], sev: 1, st: '部分修复', t: '任务记忆来得晚，而且依赖模型自觉',
+      ev: '上线两个月后的 3e46165（11-24）才加 devtask_remember，写入全靠 agent 记得调用（memory.py:3-5）；实现本身不错：分区、4000 字上限、只在历史里找不到时才注入。',
+      gap: '任务状态外置成一等公民（长任务的进度文件、功能清单）。',
+      without: '决定和验收口径散落在对话里，上下文一压缩或开新会话就丢，靠模型"记得"调用记忆工具。',
+      with: '在授权、方案确认、用户回复这几个时刻，由插件自动抽取需求、决定和验收口径，请人确认后写成结构化的任务文件。预期：换会话、换 agent 都不丢上下文。' },
+    { id: 'D12', p: 'devtask', d: ['ch10'], sev: 1, st: '部分修复', t: '轮询、内存状态、通知至多送达一次',
+      ev: '每 5 秒轮询 Orca，CI 每 2 分钟、PR 每 10 分钟复查（watcher.py:33-37）；话题"忙碌"只存在内存里，丢了结束信号时最长 1 小时才失效（plugin.py:94、270）；inject_message 返回 True 后仍可能被拒，通知就丢了（README:193）；推测：启动前崩溃的任务没有对账，会一直停在"执行中"。做得好的：flock 加原子写（store.py:80-100），授权在锁内幂等。',
+      gap: '事件驱动；带回执的 outbox；启动对账。',
+      without: '用轮询感知变化，用内存记状态，发通知不确认送达。进程一重启或一个信号丢失，状态就卡住。',
+      with: '让 worktree 里已有的 Stop hook 直接推送"轮次结束"事件；通知走 outbox 直到确认送达；启动时对账"已授权但未确认启动"的任务。预期：状态不会无声地卡住。' },
+    { id: 'D13', p: 'devtask', d: ['ch13', 'ch14'], sev: 3, st: '仍存在', t: '没有针对 agent 行为的评测，可观测性不闭环',
+      ev: '482 个单测全部用替身测插件逻辑，没有一条测路由（建任务、交给 Claude、先出方案）、完成判定或权限代按；问题都在线上发现（e151ba8、0e882c4 的提交说明都写着"线上看到"）；成本是手工统计的（2e1de31）；事件日志不记录 LLM 为什么这样做。',
+      gap: '把事故变成可回放的评测用例；按任务关联的 trace。',
+      without: '代码逻辑测得很全，但 agent 的决策完全没测。每次改 SKILL.md，只能上线后看会不会出事。',
+      with: '从真实话题里抽 50–100 条输入，标注期望的工具调用，每次改提示词就跑一遍。上面那三次路由翻转都会被拦住。事件里记录模型回合、token 和触发原因。' },
+    { id: 'D14', p: 'devtask', d: ['ch11', 'ch15'], sev: 1, st: '仍存在', t: '编码 agent 没有抽象，渠道抽象有泄漏',
+      ev: '状态键和工具名都以 Claude 命名（repo_claudes、devtask_wake_claude）；e208858（11-17）才加入 Codex 和 Antigravity，接回会话、Stop hook、会话记录兜底只对 Claude 有效（README:109），当天又补了两个 fix（a2d01e6、ec324d7）；飞书卡片的 14 天更新期限和多维表格同步写在 service/base.py:485、491。',
+      gap: '按协议抽象 agent；接口与实现分离。',
+      without: '一开始只想着一种编码 agent，名字和逻辑都写死。加第二种时到处打补丁，能力还不对等。',
+      with: '先定义 CodingAgent 接口（start / resume / prompt / turn_end / permission），各家通过 ACP 或 SDK 适配；渠道特有的期限和同步放在渠道实现里。预期：加一种 agent 只需加一个适配器。' },
+  ];
+
+  const sevName = ['低', '中', '中高', '高'];
+  const sevPill = ['pill', 'pill warn', 'pill danger', 'pill danger'];
+  const stPill = { 已修复: 'pill ok', 部分修复: 'pill warn', 仍存在: 'pill danger' };
+  const projName = { niuma: 'niuma-agent', devtask: 'devtask' };
+  const domName = Object.fromEntries(DOMAINS.map(([k, n, f]) => [k, [n, f]]));
+
+  // 热力图
+  const heat = document.getElementById('heat');
+  heat.append(Course.el('div', { class: 'hd', text: '知识域' }), Course.el('div', { class: 'hd', text: 'niuma-agent' }), Course.el('div', { class: 'hd', text: 'devtask' }));
+  let cellFilter = null;
+  for (const [k, name, file] of DOMAINS) {
+    heat.append(Course.el('div', { class: 'dom', html: `<a href="${file}">${name}</a>` }));
+    for (const p of ['niuma', 'devtask']) {
+      const list = F.filter((f) => f.p === p && f.d.includes(k));
+      const max = list.length ? Math.max(...list.map((f) => f.sev)) : -1;
+      const cls = list.length === 0 ? 's0' : max >= 3 ? 's3' : max === 2 ? 's2' : 's1';
+      const cell = Course.el('div', { class: `cell ${cls}`, text: list.length ? String(list.length) : '—', title: list.map((f) => f.id + ' ' + f.t).join('\n') });
+      cell.addEventListener('click', () => {
+        const same = cellFilter && cellFilter.k === k && cellFilter.p === p;
+        heat.querySelectorAll('.cell').forEach((c) => c.classList.remove('on'));
+        cellFilter = same || !list.length ? null : { k, p };
+        if (cellFilter) cell.classList.add('on');
+        render();
+        if (cellFilter) document.getElementById('findings').scrollIntoView({ behavior: 'smooth', block: 'start' });
+      });
+      heat.append(cell);
+    }
+  }
+
+  // 发现列表
+  const box = document.getElementById('findings');
+  const fP = document.getElementById('fProject');
+  const fS = document.getElementById('fSev');
+  const fT = document.getElementById('fStatus');
+  let mode = 'both';
+  const card = (f) => {
+    const doms = f.d.map((k) => `<a class="pill accent" href="${domName[k][1]}">${domName[k][0]}</a>`).join('');
+    return `<div class="finding mode-${mode}" id="f-${f.id}">
+      <div class="tags"><span class="pill">${f.id}</span><span class="pill">${projName[f.p]}</span><span class="${sevPill[f.sev]}">严重度：${sevName[f.sev]}</span><span class="${stPill[f.st]}">${f.st}</span>${doms}</div>
+      <h4>${f.t}</h4>
+      <div class="ev"><b>证据：</b>${f.ev.replace(/`([^`]+)`/g, '<code>$1</code>')}</div>
+      <div class="cmp"><div class="without"><b>缺这块知识时（实际发生）</b>${f.without}</div><div class="with"><b>有这块知识时（预期设计）</b>${f.with}</div></div>
+      <div class="gap"><b>缺的知识：</b>${f.gap}</div></div>`;
+  };
+  function render() {
+    const list = F.filter((f) => {
+      if (cellFilter && !(f.p === cellFilter.p && f.d.includes(cellFilter.k))) return false;
+      if (fP.value && f.p !== fP.value) return false;
+      if (fS.value === '3' && f.sev !== 3) return false;
+      if (fS.value === '2' && f.sev !== 2) return false;
+      if (fS.value === '1' && f.sev > 1) return false;
+      if (fT.value && f.st !== fT.value) return false;
+      return true;
+    });
+    box.innerHTML = list.map(card).join('') || '<p>没有符合条件的发现。</p>';
+    document.getElementById('count').textContent = `显示 ${list.length} / ${F.length} 条${cellFilter ? '（热力图筛选中）' : ''}`;
+  }
+  [fP, fS, fT].forEach((s) => s.addEventListener('change', render));
+  document.querySelectorAll('#mode button').forEach((b) =>
+    b.addEventListener('click', () => {
+      mode = b.dataset.m;
+      document.querySelectorAll('#mode button').forEach((x) => x.classList.toggle('on', x === b));
+      render();
+    }),
+  );
+  render();
+
+  // 从其他章节跳来（#f-N7）时，确保那一条可见并高亮
+  const focus = () => {
+    const m = location.hash.match(/^#f-(\w+)$/);
+    if (!m) return;
+    cellFilter = null;
+    fP.value = fS.value = fT.value = '';
+    render();
+    const el = document.getElementById('f-' + m[1]);
+    if (el) {
+      el.classList.add('flash');
+      // 等骨架和列表排版完成再跳；用 instant 绕开全站的平滑滚动
+      requestAnimationFrame(() => el.scrollIntoView({ block: 'start', behavior: 'instant' }));
+    }
+  };
+  addEventListener('hashchange', focus);
+  focus();
+});
+</script>
+</body>
+</html>

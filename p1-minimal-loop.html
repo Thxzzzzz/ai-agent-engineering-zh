@@ -1,0 +1,723 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P1 最小 Agent · AI Agent 工程</title>
+<meta name="description" content="不用任何框架，用约 100 行 TypeScript 写出一个能调用工具、能从错误中恢复、可以叫停的 agent，并配上离线测试和真实模型适配器。">
+<link rel="stylesheet" href="assets/css/course.css">
+<script src="assets/js/manifest.js"></script>
+<script defer src="assets/js/course.js"></script>
+<style>
+  .term { background: var(--code-bg); color: var(--code-text); border-radius: 8px; padding: 14px 16px; font: 13px/1.7 var(--mono); min-height: 300px; white-space: pre-wrap; word-break: break-word; }
+  .term .dim { color: #7f8aa3; }
+  .term .call { color: #89ddff; }
+  .term .ok { color: #c3e88d; }
+  .term .err { color: #ff8a80; }
+  .term .ans { color: #ffffff; }
+  .term .line { display: block; animation: termIn .25s ease-out; }
+  @keyframes termIn { from { opacity: 0; transform: translateY(3px); } }
+  .term-note { font-size: 13.5px; color: var(--muted); min-height: 2.6em; margin-top: 8px; }
+</style>
+</head>
+<body data-page="p1">
+<article id="content">
+<div class="eyebrow">跟练项目 · P1</div>
+<h1>P1 · 100 行写一个 Agent</h1>
+<p class="lead">不用框架，从零写出一个真正的 agent：模型在循环里调用工具，工具出错时它能自己改正，超过步数会停，按 Ctrl+C 能叫停。核心循环不到 100 行，但它就是后面所有项目的地基。</p>
+<div class="meta"><span>约 90 分钟</span><span>前置：第 1、3、4 章</span><span>产出：src/ 下 6 个文件 + 8 个测试</span></div>
+
+<div class="goals"><b>做完你能</b>
+<ul>
+  <li>说清 agent loop 里每一行代码在防什么：步数上限、错误回灌、tool_call 与 tool 结果一一对应、叫停</li>
+  <li>用 zod 定义工具：同一份 schema 既给模型看（JSON Schema），又在执行前校验参数</li>
+  <li>用假模型为 agent 写确定性的单元测试</li>
+  <li>写一个 OpenAI 兼容接口的适配器，把厂商差异挡在一个文件里</li>
+</ul></div>
+
+<h2>1 · 成品是什么</h2>
+<p>一个命令行 agent，有三个工具：查当前时间、四则运算、读本地 <code>notes/</code> 目录里的笔记。下面是它跑起来的样子（预录的一次真实运行，token 数为示意）。注意第 3 行：模型把文件名写错了，工具报错后它自己改对了——这就是"错误回灌"。</p>
+
+<div class="widget" id="replay">
+<div class="w-title">终端回放</div>
+<div class="term" aria-live="polite"></div>
+<div class="term-note"></div>
+<div class="anim-bar"><button class="btn small primary" type="button" data-act="play">▶ 播放</button><button class="btn small" type="button" data-act="step">下一行</button><button class="btn small" type="button" data-act="reset">↺ 重来</button></div>
+</div>
+
+<h2>2 · 练到的能力</h2>
+<table>
+<tr><th>能力</th><th>落在哪个文件</th><th>理论在哪</th></tr>
+<tr><td>Agent loop 与停止条件</td><td><code>src/loop.ts</code></td><td><a href="ch01-what-is-agent.html">第 1 章</a>、<a href="ch04-agent-loop.html">第 4 章</a></td></tr>
+<tr><td>工具定义、JSON Schema、参数校验</td><td><code>src/tools.ts</code></td><td><a href="ch03-structured-tools.html">第 3 章</a></td></tr>
+<tr><td>错误回灌与自我修正</td><td><code>src/loop.ts</code> 的 <code>executeTool</code></td><td><a href="ch04-agent-loop.html">第 4 章</a></td></tr>
+<tr><td>工具的安全边界（路径穿越、不用 eval）</td><td><code>src/tools.ts</code></td><td><a href="ch09-security.html">第 9 章</a></td></tr>
+<tr><td>厂商适配与用量统计</td><td><code>src/models/openai-compatible.ts</code></td><td><a href="ch02-llm-fundamentals.html">第 2 章</a></td></tr>
+</table>
+
+<h2>3 · 前置</h2>
+<ul>
+  <li>按<a href="projects.html">项目总览</a>的"环境准备"建好 <code>agent-lab</code> 仓库（Bun、zod、tsconfig）。</li>
+  <li>读过第 4 章，知道消息列表里 <code>assistant</code> 的 tool_call 和 <code>tool</code> 结果是怎么配对的。</li>
+</ul>
+
+<h2>4 · 文件一览</h2>
+<div class="callout tip"><b>参考实现</b>
+<p>本项目的完整代码在课程仓库的 <code>agent-lab/</code> 目录：<code>src/model.ts</code>、<code>src/fake-model.ts</code>、<code>src/tools.ts</code>、<code>src/loop.ts</code>、<code>src/models/openai-compatible.ts</code>、<code>src/main.ts</code> 与 <code>tests/loop.test.ts</code>。所有项目共用一个仓库、一套测试，说明见 <a href="agent-lab/README.md">agent-lab/README.md</a>。建议先自己写，卡住了再对照。</p></div>
+<figure>
+<div class="diagram">
+<svg viewBox="0 0 720 230" width="720" role="img" aria-label="P1 文件依赖关系">
+  <rect class="box g" x="20" y="20" width="150" height="56" rx="10"/><text class="tb" x="95" y="45" text-anchor="middle">main.ts</text><text class="ts" x="95" y="64" text-anchor="middle">命令行入口</text>
+  <rect class="box a" x="285" y="20" width="150" height="56" rx="10"/><text class="tb" x="360" y="45" text-anchor="middle">loop.ts</text><text class="ts" x="360" y="64" text-anchor="middle">runAgent</text>
+  <rect class="box b" x="550" y="20" width="150" height="56" rx="10"/><text class="tb" x="625" y="45" text-anchor="middle">tools.ts</text><text class="ts" x="625" y="64" text-anchor="middle">3 个工具 + toSpec</text>
+  <rect class="box m" x="285" y="150" width="150" height="56" rx="10"/><text class="tb" x="360" y="175" text-anchor="middle">model.ts</text><text class="ts" x="360" y="194" text-anchor="middle">类型与 Model 接口</text>
+  <rect class="box w" x="20" y="150" width="190" height="56" rx="10"/><text class="tb" x="115" y="175" text-anchor="middle">openai-compatible.ts</text><text class="ts" x="115" y="194" text-anchor="middle">真实模型（生产）</text>
+  <rect class="box v" x="510" y="150" width="190" height="56" rx="10"/><text class="tb" x="605" y="175" text-anchor="middle">fake-model.ts</text><text class="ts" x="605" y="194" text-anchor="middle">假模型（测试）</text>
+  <path class="line" d="M170 48 H285" marker-end="url(#arr)"/>
+  <path class="line" d="M435 48 H550" marker-end="url(#arr)"/>
+  <path class="line" d="M360 76 V150" marker-end="url(#arr)"/>
+  <path class="line" d="M95 76 V150" marker-end="url(#arr)"/>
+  <path class="line dash" d="M210 178 H285" marker-end="url(#arr)"/>
+  <path class="line dash" d="M510 178 H435" marker-end="url(#arr)"/>
+  <text class="ts" x="248" y="170" text-anchor="middle">实现</text>
+  <text class="ts" x="472" y="170" text-anchor="middle">实现</text>
+</svg>
+</div>
+<figcaption>loop.ts 只依赖 Model 接口，不知道对面是真模型还是假模型。这条依赖方向是"能离线测试"的前提。</figcaption>
+</figure>
+
+<h2>5 · 分步实现</h2>
+
+<h3>第 1 步：模型契约 <code>src/model.ts</code></h3>
+<p>先定义整个 agent-lab 唯一依赖的模型接口。它刻意做得很小：一次 <code>generate</code> 收消息列表和工具定义，回文本、工具调用、用量和停止原因。各家 API 的差异都留在适配器里，后面所有项目只认这几个类型。</p>
+<pre data-title="src/model.ts"><code class="lang-ts">
+// 模型层的最小契约：整个 agent-lab 只依赖这几个类型，换厂商只换适配器。
+export type ToolCall = { id: string; name: string; args: unknown };
+
+export type Message =
+  | { role: 'system' | 'user'; content: string }
+  | { role: 'assistant'; content: string; toolCalls: ToolCall[] }
+  | { role: 'tool'; toolCallId: string; content: string; isError?: boolean };
+
+export type ToolSpec = { name: string; description: string; inputSchema: Record&lt;string, unknown&gt; };
+
+export type Usage = { inputTokens: number; outputTokens: number; cachedInputTokens: number };
+
+export type StopReason = 'end' | 'tool_use' | 'max_tokens' | 'refusal';
+
+export type GenerateRequest = { messages: Message[]; tools: ToolSpec[]; signal?: AbortSignal };
+
+export type GenerateResult = { content: string; toolCalls: ToolCall[]; usage: Usage; stopReason: StopReason };
+
+export interface Model {
+  generate(req: GenerateRequest): Promise&lt;GenerateResult&gt;;
+}
+
+export const emptyUsage = (): Usage =&gt; ({ inputTokens: 0, outputTokens: 0, cachedInputTokens: 0 });
+
+export const addUsage = (a: Usage, b: Usage): Usage =&gt; ({
+  inputTokens: a.inputTokens + b.inputTokens,
+  outputTokens: a.outputTokens + b.outputTokens,
+  cachedInputTokens: a.cachedInputTokens + b.cachedInputTokens,
+});
+</code></pre>
+<div class="callout note"><b>为什么 <code>stopReason</code> 要单列出来</b><p>"模型没调用工具"有四种完全不同的含义：正常答完（<code>end</code>）、话说到一半被截断（<code>max_tokens</code>）、拒绝回答（<code>refusal</code>），以及还要继续调工具（<code>tool_use</code>）。把截断和拒答当成正常答案返回，是新手 agent 最常见的静默错误。</p></div>
+
+<h3>第 2 步：假模型 <code>src/fake-model.ts</code></h3>
+<p>剧本里每一步可以是固定回复，也可以是函数——函数能读到这一轮的请求，用来模拟"看到某个工具结果后再决定怎么回"。剧本用完了还被调用就报错：多调一次模型本身就是 bug。</p>
+<pre data-title="src/fake-model.ts"><code class="lang-ts">
+import type { GenerateRequest, GenerateResult, Model, ToolCall } from './model';
+
+// 一步脚本：固定回复，或根据收到的请求现算回复（用来断言"模型这一轮看到了什么"）。
+export type ScriptStep = Partial&lt;GenerateResult&gt; | ((req: GenerateRequest) =&gt; Partial&lt;GenerateResult&gt;);
+
+// 离线测试用的假模型：按脚本依次返回回复，并记下每次收到的请求。
+export class FakeModel implements Model {
+  readonly requests: GenerateRequest[] = [];
+  private cursor = 0;
+
+  constructor(private readonly script: ScriptStep[]) {}
+
+  async generate(req: GenerateRequest): Promise&lt;GenerateResult&gt; {
+    req.signal?.throwIfAborted();
+    // 存快照：调用方之后还会往同一个数组里 push，不复制的话断言会看到"未来"的消息
+    this.requests.push({ messages: structuredClone(req.messages), tools: structuredClone(req.tools) });
+    const step = this.script[this.cursor++];
+    if (!step) throw new Error(`FakeModel 脚本用完了：第 ${this.cursor} 次调用没有预设回复`);
+    const r = typeof step === 'function' ? step(req) : step;
+    const toolCalls = r.toolCalls ?? [];
+    return {
+      content: r.content ?? '',
+      toolCalls,
+      usage: r.usage ?? { inputTokens: 100, outputTokens: 20, cachedInputTokens: 0 },
+      stopReason: r.stopReason ?? (toolCalls.length &gt; 0 ? 'tool_use' : 'end'),
+    };
+  }
+}
+
+let seq = 0;
+export const call = (name: string, args: unknown, id = `call_${++seq}`): ToolCall =&gt; ({ id, name, args });
+</code></pre>
+
+<h3>第 3 步：工具 <code>src/tools.ts</code></h3>
+<p>一个工具 = 名字 + 给模型看的说明 + 参数 schema + 执行函数。用 zod 写 schema 的好处是一份定义两种用途：<code>z.toJSONSchema</code> 转成 JSON Schema 发给模型，执行前再用同一份 schema 校验模型给的参数。</p>
+<pre data-title="src/tools.ts"><code class="lang-ts">
+import { resolve, sep } from 'node:path';
+import { z } from 'zod';
+import type { ToolSpec } from './model';
+
+// 一个工具 = 给模型看的名字和说明 + 参数 schema + 真正执行的代码。
+export type Tool&lt;S extends z.ZodType = z.ZodType&gt; = {
+  name: string;
+  description: string;
+  schema: S;
+  // 工具已经自带 JSON Schema（例如来自 MCP 服务）时直接交给模型；schema 仍负责本地校验
+  jsonSchema?: Record&lt;string, unknown&gt;;
+  run(args: z.infer&lt;S&gt;, ctx: { signal?: AbortSignal }): Promise&lt;string&gt;;
+};
+
+export const defineTool = &lt;S extends z.ZodType&gt;(tool: Tool&lt;S&gt;): Tool&lt;S&gt; =&gt; tool;
+
+// zod → JSON Schema。去掉 $schema 键：有的兼容端点不认识它。
+export function toJsonSchema(schema: z.ZodType): Record&lt;string, unknown&gt; {
+  const { $schema: _ignored, ...rest } = z.toJSONSchema(schema) as Record&lt;string, unknown&gt;;
+  return rest;
+}
+
+export const toSpec = (tool: Tool): ToolSpec =&gt; ({
+  name: tool.name,
+  description: tool.description,
+  inputSchema: tool.jsonSchema ?? toJsonSchema(tool.schema),
+});
+
+export const getTime = defineTool({
+  name: 'get_time',
+  description: '查询某个时区的当前日期和时间。需要知道"今天几号""现在几点"时调用。',
+  schema: z.strictObject({ timezone: z.string().describe('IANA 时区名，例如 Asia/Shanghai、Europe/London') }),
+  async run({ timezone }) {
+    // 时区写错时 Intl 会抛 RangeError，由循环当成工具错误回灌给模型
+    return new Intl.DateTimeFormat('zh-CN', { timeZone: timezone, dateStyle: 'full', timeStyle: 'long' }).format(new Date());
+  },
+});
+
+export const calculator = defineTool({
+  name: 'calculator',
+  description: '计算四则运算表达式，支持 + - * / 和括号。涉及任何算术都用它，不要心算。',
+  schema: z.strictObject({ expression: z.string().describe('例如 (1200 - 300) * 1.06 / 12') }),
+  async run({ expression }) {
+    return String(evaluate(expression));
+  },
+});
+
+// 递归下降求值：只认数字、运算符和括号。绝不用 eval —— 参数来自模型，等于来自不可信输入。
+export function evaluate(input: string): number {
+  const tokens = input.match(/\d+(?:\.\d+)?|[()+\-*/]|\S/g) ?? [];
+  let pos = 0;
+  const peek = () =&gt; tokens[pos];
+  const next = () =&gt; tokens[pos++];
+  const primary = (): number =&gt; {
+    const t = next();
+    if (t === '(') {
+      const v = expr();
+      if (next() !== ')') throw new Error('缺少右括号');
+      return v;
+    }
+    if (t === '-') return -primary();
+    if (t !== undefined &amp;&amp; /^\d/.test(t)) return Number(t);
+    throw new Error(`无法识别的符号：${t ?? '（表达式结尾）'}`);
+  };
+  const term = (): number =&gt; {
+    let v = primary();
+    while (peek() === '*' || peek() === '/') {
+      const op = next();
+      const r = primary();
+      if (op === '/' &amp;&amp; r === 0) throw new Error('除数为 0');
+      v = op === '*' ? v * r : v / r;
+    }
+    return v;
+  };
+  const expr = (): number =&gt; {
+    let v = term();
+    while (peek() === '+' || peek() === '-') v = next() === '+' ? v + term() : v - term();
+    return v;
+  };
+  const value = expr();
+  if (pos &lt; tokens.length) throw new Error(`多余的符号：${tokens[pos]}`);
+  return value;
+}
+
+// 只能读 dir 目录下的笔记：解析成绝对路径后必须仍在目录内，挡住 ../ 和绝对路径。
+export function createReadNote(dir: string) {
+  const root = resolve(dir);
+  return defineTool({
+    name: 'read_note',
+    description: '读取一篇本地笔记的全文。不知道文件名时，先传 "?" 列出所有笔记。',
+    schema: z.strictObject({ name: z.string().describe('笔记文件名，例如 weekly.md；传 "?" 列出全部') }),
+    async run({ name }) {
+      const all = [...new Bun.Glob('*.md').scanSync(root)].sort();
+      if (name === '?') return all.length ? all.join('\n') : '（没有笔记）';
+      const path = resolve(root, name);
+      if (!path.startsWith(root + sep)) throw new Error('只能读取笔记目录里的文件');
+      const file = Bun.file(path);
+      if (!(await file.exists())) throw new Error(`没有 ${name}。现有笔记：${all.join('、') || '无'}`);
+      return file.text();
+    },
+  });
+}
+</code></pre>
+<div class="callout danger"><b>工具参数等于不可信输入</b>
+<p>模型给的参数可能被它读到的内容操纵（第 9 章的提示注入）。所以 <code>calculator</code> 自己写了一个只认数字和运算符的解析器，绝不用 <code>eval</code>；<code>read_note</code> 先把路径解析成绝对路径，再确认它仍在笔记目录里——只检查字符串里有没有 <code>..</code> 是不够的，绝对路径和符号拼接都能绕过。</p></div>
+
+<h3>第 4 步：循环 <code>src/loop.ts</code></h3>
+<p>这就是第 4 章那段伪代码的完整版。逐段对照着读：</p>
+<ul>
+  <li><strong>步数上限</strong>：模型可能在两个工具之间来回绕圈，没有上限就会一直烧钱。超限时抛出的错误带着完整消息记录，方便排查。</li>
+  <li><strong>每个 tool_call 都要有对应的 tool 消息</strong>：模型一次可能调用多个工具；漏掉任何一个的结果，下一次请求会被 API 直接拒绝。</li>
+  <li><strong>三类错误都回灌、不抛出</strong>：工具不存在、参数不合法、执行出错——都变成 <code>isError</code> 的结果交还给模型，让它自己修正。</li>
+  <li><strong>叫停不是工具错误</strong>：用户按了 Ctrl+C，工具里的 fetch 会抛 AbortError；这时要终止整个循环，而不是把它当成"工具失败"回灌。</li>
+  <li><strong>结果截断</strong>：一个工具返回了 50 万字的日志，会把上下文撑爆。截断并告诉模型"已截断，共多少字"。</li>
+</ul>
+<pre data-title="src/loop.ts"><code class="lang-ts">
+import { z } from 'zod';
+import { addUsage, emptyUsage, type Message, type Model, type ToolCall, type Usage } from './model';
+import { type Tool, toSpec } from './tools';
+
+export type AgentEvent =
+  | { type: 'model'; step: number; content: string; toolCalls: ToolCall[] }
+  | { type: 'tool'; name: string; args: unknown; content: string; isError: boolean };
+
+export type AgentOptions = {
+  model: Model;
+  tools: Tool[];
+  system: string;
+  maxSteps?: number;
+  maxResultChars?: number;
+  signal?: AbortSignal;
+  onEvent?: (event: AgentEvent) =&gt; void;
+};
+
+export type AgentResult = { text: string; messages: Message[]; steps: number; usage: Usage };
+
+// 带上完整消息记录抛出，调用方能看到 agent 在哪一步、因为什么停下。
+export class AgentError extends Error {
+  constructor(message: string, readonly messages: Message[]) {
+    super(message);
+  }
+}
+
+export async function runAgent(goal: string, opts: AgentOptions): Promise&lt;AgentResult&gt; {
+  const maxSteps = opts.maxSteps ?? 10;
+  const tools = new Map(opts.tools.map((t) =&gt; [t.name, t]));
+  const specs = opts.tools.map(toSpec);
+  const messages: Message[] = [
+    { role: 'system', content: opts.system },
+    { role: 'user', content: goal },
+  ];
+  let usage = emptyUsage();
+
+  for (let step = 1; step &lt;= maxSteps; step++) {
+    opts.signal?.throwIfAborted();
+    const reply = await opts.model.generate({ messages, tools: specs, signal: opts.signal });
+    usage = addUsage(usage, reply.usage);
+    messages.push({ role: 'assistant', content: reply.content, toolCalls: reply.toolCalls });
+    opts.onEvent?.({ type: 'model', step, content: reply.content, toolCalls: reply.toolCalls });
+
+    if (reply.stopReason === 'refusal') throw new AgentError('模型拒绝了这个请求', messages);
+    if (reply.toolCalls.length === 0) {
+      if (reply.stopReason === 'max_tokens') throw new AgentError('回答被截断（max_tokens）', messages);
+      return { text: reply.content, messages, steps: step, usage };
+    }
+    // 每个 tool_call 都必须有一条对应的 tool 消息，否则下一次请求会被 API 拒绝
+    for (const call of reply.toolCalls) {
+      const result = await executeTool(tools, call, opts);
+      messages.push({ role: 'tool', toolCallId: call.id, ...result });
+      opts.onEvent?.({ type: 'tool', name: call.name, args: call.args, ...result });
+    }
+  }
+  throw new AgentError(`超过最大步数 ${maxSteps} 仍未完成`, messages);
+}
+
+// 三类错误都不抛出，而是变成 isError 的结果回灌，让模型自己修正：工具不存在、参数不合法、执行失败。
+async function executeTool(tools: Map&lt;string, Tool&gt;, call: ToolCall, opts: AgentOptions) {
+  const tool = tools.get(call.name);
+  if (!tool) {
+    return { isError: true, content: `没有名为 ${call.name} 的工具。可用工具：${[...tools.keys()].join('、')}` };
+  }
+  const parsed = tool.schema.safeParse(call.args);
+  if (!parsed.success) {
+    return { isError: true, content: `参数不合法，请修正后重试：\n${z.prettifyError(parsed.error)}` };
+  }
+  try {
+    const out = await tool.run(parsed.data, { signal: opts.signal });
+    const max = opts.maxResultChars ?? 8000;
+    return { isError: false, content: out.length &gt; max ? `${out.slice(0, max)}\n…（已截断，共 ${out.length} 字）` : out };
+  } catch (err) {
+    if (opts.signal?.aborted) throw err; // 用户叫停不是工具错误，直接终止
+    return { isError: true, content: `工具执行出错：${err instanceof Error ? err.message : String(err)}` };
+  }
+}
+</code></pre>
+
+<h3>第 5 步：真实模型适配器 <code>src/models/openai-compatible.ts</code></h3>
+<p>把内部的消息格式翻译成 Chat Completions 的线上格式。值得注意的几个字段：工具定义在 <code>tools[].function.parameters</code>；模型的工具调用在 <code>message.tool_calls[]</code>，其中 <code>function.arguments</code> 是<strong>字符串</strong>，不保证是合法 JSON；工具结果用 <code>role: "tool"</code> 加 <code>tool_call_id</code> 回传；<code>finish_reason</code> 为 <code>tool_calls</code>、<code>length</code>、<code>content_filter</code> 时分别对应继续调工具、被截断、被过滤。</p>
+<pre data-title="src/models/openai-compatible.ts"><code class="lang-ts">
+import type { GenerateRequest, GenerateResult, Message, Model, StopReason, ToolCall } from '../model';
+
+// OpenAI Chat Completions 兼容接口的适配器：多数模型厂商与本地推理服务都提供这套接口。
+// 只用 fetch，不引 SDK，好让你看清线上传的到底是什么。
+export type OpenAICompatibleOptions = { baseURL: string; apiKey?: string; model: string; maxTokens?: number };
+
+type WireToolCall = { id: string; type: string; function?: { name: string; arguments: string } };
+type WireResponse = {
+  choices: { finish_reason: string | null; message: { content: string | null; refusal?: string | null; tool_calls?: WireToolCall[] } }[];
+  usage?: { prompt_tokens: number; completion_tokens: number; prompt_tokens_details?: { cached_tokens?: number } };
+};
+
+export class OpenAICompatibleModel implements Model {
+  constructor(private readonly opts: OpenAICompatibleOptions) {}
+
+  // Bun 会自动读取项目根目录的 .env
+  static fromEnv(): OpenAICompatibleModel {
+    const model = process.env.LLM_MODEL;
+    if (!model) throw new Error('请设置 LLM_MODEL（以及 LLM_BASE_URL、LLM_API_KEY），见 .env.example');
+    return new OpenAICompatibleModel({
+      baseURL: process.env.LLM_BASE_URL ?? 'https://api.openai.com/v1',
+      apiKey: process.env.LLM_API_KEY,
+      model,
+    });
+  }
+
+  async generate({ messages, tools, signal }: GenerateRequest): Promise&lt;GenerateResult&gt; {
+    const body = {
+      model: this.opts.model,
+      messages: messages.map(toWire),
+      ...(this.opts.maxTokens ? { max_tokens: this.opts.maxTokens } : {}),
+      ...(tools.length &gt; 0
+        ? { tools: tools.map((t) =&gt; ({ type: 'function', function: { name: t.name, description: t.description, parameters: t.inputSchema } })) }
+        : {}),
+    };
+    const res = await fetch(`${this.opts.baseURL.replace(/\/$/, '')}/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...(this.opts.apiKey ? { authorization: `Bearer ${this.opts.apiKey}` } : {}) },
+      body: JSON.stringify(body),
+      signal,
+    });
+    if (!res.ok) throw new Error(`模型接口返回 ${res.status}：${(await res.text()).slice(0, 500)}`);
+    const data = (await res.json()) as WireResponse;
+    const choice = data.choices[0];
+    if (!choice) throw new Error('模型接口没有返回 choices');
+
+    const toolCalls: ToolCall[] = (choice.message.tool_calls ?? [])
+      .filter((c) =&gt; c.type === 'function' &amp;&amp; c.function)
+      .map((c) =&gt; ({ id: c.id, name: c.function!.name, args: parseArgs(c.function!.arguments) }));
+    return {
+      content: choice.message.content ?? choice.message.refusal ?? '',
+      toolCalls,
+      usage: {
+        inputTokens: data.usage?.prompt_tokens ?? 0,
+        outputTokens: data.usage?.completion_tokens ?? 0,
+        cachedInputTokens: data.usage?.prompt_tokens_details?.cached_tokens ?? 0,
+      },
+      stopReason: stopReasonOf(choice.finish_reason, choice.message.refusal),
+    };
+  }
+}
+
+function toWire(m: Message) {
+  switch (m.role) {
+    case 'system':
+    case 'user':
+      return { role: m.role, content: m.content };
+    case 'assistant':
+      return {
+        role: 'assistant',
+        content: m.content || null,
+        ...(m.toolCalls.length &gt; 0
+          ? { tool_calls: m.toolCalls.map((c) =&gt; ({ id: c.id, type: 'function', function: { name: c.name, arguments: JSON.stringify(c.args) } })) }
+          : {}),
+      };
+    case 'tool':
+      return { role: 'tool', tool_call_id: m.toolCallId, content: m.isError ? `[错误] ${m.content}` : m.content };
+  }
+}
+
+// 模型生成的 arguments 是字符串，不保证是合法 JSON。解析失败就原样交出去，由参数校验报错回灌。
+function parseArgs(raw: string): unknown {
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return raw;
+  }
+}
+
+function stopReasonOf(finish: string | null, refusal?: string | null): StopReason {
+  if (refusal) return 'refusal';
+  if (finish === 'tool_calls') return 'tool_use';
+  if (finish === 'length') return 'max_tokens';
+  if (finish === 'content_filter') return 'refusal';
+  return 'end';
+}
+</code></pre>
+<div class="callout tip"><b>arguments 解析失败怎么办</b><p>不在适配器里抛错，而是把原始字符串交给循环，让 zod 校验失败、把错误回灌给模型。这样"JSON 写坏了"和"字段写错了"走同一条自我修正的路径，代码也只有一处。</p></div>
+
+<h3>第 6 步：命令行入口 <code>src/main.ts</code></h3>
+<p>系统提示里写清三件事：什么时候用工具、出错了怎么办、最多重试几次。打印每一轮的工具调用和结果，你才能看懂它在干什么。</p>
+<pre data-title="src/main.ts"><code class="lang-ts">
+import { type AgentEvent, runAgent } from './loop';
+import { OpenAICompatibleModel } from './models/openai-compatible';
+import { calculator, createReadNote, getTime } from './tools';
+
+const SYSTEM = `你是一个办公助理。可以查时间、做计算、读用户的本地笔记。
+- 需要事实时先用工具查，不要编造；算术一律用 calculator。
+- 工具报错时读错误信息，修正参数再试；同一个错误最多重试一次，仍失败就如实告诉用户。
+- 回答用简体中文，简洁直接。`;
+
+const goal = process.argv.slice(2).join(' ').trim();
+if (!goal) {
+  console.error('用法：bun run src/main.ts "你的问题"');
+  process.exit(1);
+}
+
+const controller = new AbortController();
+process.on('SIGINT', () =&gt; controller.abort());
+
+const print = (e: AgentEvent) =&gt; {
+  if (e.type === 'model') {
+    if (e.content) console.log(`\x1b[2m[第 ${e.step} 轮] ${e.content}\x1b[0m`);
+    for (const c of e.toolCalls) console.log(`\x1b[36m→ ${c.name}(${JSON.stringify(c.args)})\x1b[0m`);
+  } else {
+    const color = e.isError ? '\x1b[31m' : '\x1b[32m';
+    console.log(`${color}← ${e.content.slice(0, 200)}\x1b[0m`);
+  }
+};
+
+const result = await runAgent(goal, {
+  model: OpenAICompatibleModel.fromEnv(),
+  tools: [getTime, calculator, createReadNote('notes')],
+  system: SYSTEM,
+  signal: controller.signal,
+  onEvent: print,
+});
+console.log(`\n${result.text}`);
+const u = result.usage;
+console.log(`\x1b[2m（${result.steps} 轮；输入 ${u.inputTokens} tokens，其中缓存命中 ${u.cachedInputTokens}；输出 ${u.outputTokens}）\x1b[0m`);
+</code></pre>
+<p>再放一篇笔记，给 <code>read_note</code> 读：</p>
+<pre data-title="notes/weekly.md"><code>
+# 周报模板
+- 本周完成：
+- 下周计划：
+- 风险与需要的支持：
+截止：每周五 18:00 前发到项目群。
+</code></pre>
+
+<h2>6 · 测试</h2>
+<p>8 个测试，每个都写明了它拦的是哪种 bug。全部用假模型，毫秒级跑完：</p>
+<pre data-title="tests/loop.test.ts"><code class="lang-ts">
+import { describe, expect, test } from 'bun:test';
+import { mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { call, FakeModel } from '../src/fake-model';
+import { AgentError, runAgent } from '../src/loop';
+import { calculator, createReadNote, evaluate } from '../src/tools';
+
+const base = { system: '测试', tools: [calculator] };
+
+describe('runAgent', () =&gt; {
+  test('工具结果回灌给模型，模型不再调用工具时返回文本', async () =&gt; {
+    const model = new FakeModel([{ toolCalls: [call('calculator', { expression: '6*7' }, 'c1')] }, { content: '答案是 42' }]);
+    const r = await runAgent('6 乘 7 是多少', { ...base, model });
+    expect(r.text).toBe('答案是 42');
+    expect(r.steps).toBe(2);
+    // 拦：忘了把工具结果追加进上下文，模型第二轮看不到 42
+    expect(model.requests[1]!.messages.at(-1)).toEqual({ role: 'tool', toolCallId: 'c1', content: '42', isError: false });
+  });
+
+  test('调用不存在的工具：错误回灌、循环继续，而不是崩溃', async () =&gt; {
+    const model = new FakeModel([{ toolCalls: [call('web_search', { q: 'x' })] }, { content: '我没有搜索工具' }]);
+    const r = await runAgent('搜一下', { ...base, model });
+    const fed = model.requests[1]!.messages.at(-1);
+    expect(fed).toMatchObject({ role: 'tool', isError: true });
+    expect(r.text).toBe('我没有搜索工具');
+  });
+
+  test('参数不合法时不执行工具，把字段级错误回灌', async () =&gt; {
+    let ran = false;
+    const spy = { ...calculator, run: async () =&gt; ((ran = true), '0') };
+    const model = new FakeModel([{ toolCalls: [call('calculator', { expr: '1+1' })] }, { content: '好' }]);
+    await runAgent('算', { ...base, tools: [spy], model });
+    expect(ran).toBe(false);
+    const fed = model.requests[1]!.messages.at(-1) as { content: string; isError: boolean };
+    expect(fed.isError).toBe(true);
+    expect(fed.content).toContain('expression');
+  });
+
+  test('超过最大步数抛 AgentError，并带上完整消息记录', async () =&gt; {
+    const loopForever = () =&gt; ({ toolCalls: [call('calculator', { expression: '1+1' })] });
+    const model = new FakeModel([loopForever, loopForever, loopForever]);
+    const err = await runAgent('绕圈', { ...base, model, maxSteps: 3 }).catch((e) =&gt; e);
+    expect(err).toBeInstanceOf(AgentError);
+    expect((err as AgentError).messages.length).toBe(2 + 3 * 2);
+  });
+
+  test('叫停后不再请求模型', async () =&gt; {
+    const controller = new AbortController();
+    const model = new FakeModel([
+      () =&gt; (controller.abort(), { toolCalls: [call('calculator', { expression: '1+1' })] }),
+      { content: '不应该走到这里' },
+    ]);
+    await expect(runAgent('算', { ...base, model, signal: controller.signal })).rejects.toThrow();
+    expect(model.requests.length).toBe(1);
+  });
+
+  test('拒答直接抛错，不当作正常答案返回', async () =&gt; {
+    const model = new FakeModel([{ content: '抱歉，无法协助', stopReason: 'refusal' }]);
+    await expect(runAgent('x', { ...base, model })).rejects.toThrow('拒绝');
+  });
+});
+
+describe('工具', () =&gt; {
+  test('read_note 拒绝目录之外的路径', async () =&gt; {
+    const dir = mkdtempSync(join(tmpdir(), 'notes-'));
+    writeFileSync(join(dir, 'weekly.md'), '周报模板');
+    const readNote = createReadNote(dir);
+    expect(await readNote.run({ name: 'weekly.md' }, {})).toBe('周报模板');
+    await expect(readNote.run({ name: '../../etc/passwd' }, {})).rejects.toThrow('只能读取');
+    await expect(readNote.run({ name: '/etc/passwd' }, {})).rejects.toThrow('只能读取');
+  });
+
+  test('calculator 只做算术，不执行任何代码', () =&gt; {
+    expect(evaluate('(1200 - 300) * 2 / 3')).toBe(600);
+    expect(evaluate('-3 + 5')).toBe(2);
+    expect(() =&gt; evaluate('process.exit(1)')).toThrow();
+    expect(() =&gt; evaluate('1 / 0')).toThrow('除数为 0');
+  });
+});
+</code></pre>
+<table>
+<tr><th>测试</th><th>拦的是</th></tr>
+<tr><td>工具结果回灌</td><td>忘了把工具结果追加进上下文，模型第二轮"看不见"自己做过什么</td></tr>
+<tr><td>不存在的工具</td><td>模型幻觉出一个工具名，整个程序崩溃</td></tr>
+<tr><td>参数不合法</td><td>不校验就执行工具，用错误的参数改了外部数据</td></tr>
+<tr><td>超过最大步数</td><td>模型绕圈时循环永不停止</td></tr>
+<tr><td>叫停</td><td>用户已经叫停，循环还在继续请求模型</td></tr>
+<tr><td>拒答</td><td>把"抱歉，无法协助"当成正常答案返回给上层</td></tr>
+<tr><td>read_note 越界</td><td>路径穿越：读到笔记目录之外的文件</td></tr>
+<tr><td>calculator 不执行代码</td><td>有人把 calculator 改成 eval</td></tr>
+</table>
+<pre data-title="终端"><code class="lang-bash">
+bun test            # 应该看到 8 pass
+bun run typecheck   # 类型检查也要过
+</code></pre>
+
+<h2>7 · 接入真实模型</h2>
+<pre data-title="终端"><code class="lang-bash">
+cp .env.example .env    # 填好 LLM_BASE_URL、LLM_API_KEY、LLM_MODEL
+bun run agent "今天几号？周报模板里写的截止时间是什么？离截止还有多少小时？"
+</code></pre>
+<p>多试几个问题，专门找它的失败：问一个不存在的笔记、给一个错的时区、让它算 <code>1/0</code>、让它读 <code>../package.json</code>。每次失败时看打印出来的工具调用，判断是提示词、工具说明还是工具实现的问题。</p>
+
+<div class="quiz" data-answer="2">
+<p class="q">模型一次返回了两个 tool_call：一个查时间、一个读笔记。读笔记的工具抛了异常。正确的处理是？</p>
+<ol>
+  <li>立即抛出异常，终止循环</li>
+  <li>两个 tool_call 都追加对应的 tool 消息，读笔记那条标为错误，然后继续下一轮</li>
+  <li>只追加查时间的结果，跳过失败的那个</li>
+  <li>重新请求模型，丢弃这一轮的两个调用</li>
+</ol>
+<div class="explain">每个 tool_call 都必须有对应的 tool 消息，否则下一次请求会被 API 拒绝（选项 3）。工具失败是常态而不是异常，回灌给模型往往就能自己修正（选项 1 太脆弱）。丢弃这一轮（选项 4）会浪费已经成功的调用，还可能让模型重复做一遍有副作用的操作。</div>
+</div>
+
+<h2>8 · 验收标准</h2>
+<ul class="checklist">
+  <li><code>bun test</code> 8 个测试全部通过，<code>bun run typecheck</code> 无错误</li>
+  <li>真实模型能回答需要两个以上工具配合的问题</li>
+  <li>故意问一个不存在的笔记，能看到工具报错、模型改用 <code>"?"</code> 列出笔记后读对</li>
+  <li>运行中按 Ctrl+C 能立即停止，不再发出请求</li>
+  <li>能不看代码，口头讲清 loop.ts 里每个 <code>if</code> 在防什么</li>
+</ul>
+
+<h2>9 · 进阶挑战</h2>
+<ol>
+  <li><strong>并行执行工具</strong>：同一轮的多个 tool_call 互不依赖时用 <code>Promise.all</code> 并行跑，但消息顺序必须与调用顺序一致。为它补一个测试。</li>
+  <li><strong>流式输出</strong>：给适配器加 <code>stream: true</code>，边生成边打印文字；工具调用的参数是分片到达的，要自己拼接。</li>
+  <li><strong>预算上限</strong>：给 <code>runAgent</code> 加 <code>maxInputTokens</code>，累计用量超限就停，错误里说明花了多少。</li>
+  <li><strong>第二家适配器</strong>：照着 Model 接口，为另一家原生 API（比如 Anthropic Messages API）写一个适配器，<code>loop.ts</code> 一行都不改。</li>
+  <li><strong>工具说明的 A/B</strong>：把 <code>read_note</code> 的 description 去掉"不知道文件名时先传 ?"这句，跑十次同一个问题，统计它找对文件的次数。这就是 P6 评测的雏形。</li>
+</ol>
+
+<h2>10 · 常见坑</h2>
+<ul>
+  <li><strong>FakeModel 不复制请求</strong>：循环之后还会往同一个 <code>messages</code> 数组里 push，断言会看到"未来"的消息，测试结果莫名其妙。</li>
+  <li><strong>assistant 消息的 content 传了空字符串</strong>：有些兼容端点要求只有工具调用时 content 为 <code>null</code>，适配器里用 <code>m.content || null</code>。</li>
+  <li><strong>只看 <code>toolCalls.length === 0</code> 判断完成</strong>：截断和拒答也是零个工具调用，要先看 <code>stopReason</code>。</li>
+  <li><strong>JSON Schema 里多了 <code>$schema</code> 键</strong>：部分端点不认识它会报错，<code>toJsonSchema</code> 里把它去掉。</li>
+  <li><strong>小模型无视工具</strong>：一轮就"答完"了而且答案是编的——换一个支持工具调用的模型，而不是去加长提示词。</li>
+</ul>
+
+<div class="takeaways"><b>本项目要点</b>
+<ul>
+  <li>Agent 的骨架就是"请求模型 → 执行工具 → 结果回灌"的循环，加上步数上限与停止条件。</li>
+  <li>工具的三类错误都回灌给模型，让它自我修正；用户叫停则立即终止。</li>
+  <li>一份 zod schema 同时用于"告诉模型"和"校验模型"。</li>
+  <li>模型的参数是不可信输入：工具要自带边界检查。</li>
+  <li>循环只依赖 Model 接口，所以能用假模型写出确定性的测试。</li>
+</ul></div>
+
+<h2>参考资料</h2>
+<ul class="refs">
+  <li><a href="https://www.anthropic.com/engineering/building-effective-agents" target="_blank" rel="noopener">Building effective agents</a> <span class="src">Anthropic · 2024-12-19 · agent 的定义与"工具防呆设计"</span></li>
+  <li><a href="https://www.anthropic.com/engineering/writing-tools-for-agents" target="_blank" rel="noopener">Writing effective tools for agents — with agents</a> <span class="src">Anthropic · 2025-09-11 · 工具命名、返回量与可执行的错误信息</span></li>
+  <li><a href="https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create" target="_blank" rel="noopener">Chat Completions API 参考</a> <span class="src">OpenAI · tools、tool_calls、finish_reason 字段</span></li>
+  <li><a href="https://github.com/humanlayer/12-factor-agents" target="_blank" rel="noopener">12-Factor Agents</a> <span class="src">HumanLayer · "Own your control flow""Compact errors into context window"</span></li>
+  <li><a href="https://zod.dev/json-schema" target="_blank" rel="noopener">Zod：JSON Schema</a> <span class="src">z.toJSONSchema</span></li>
+</ul>
+</article>
+<script>
+window.addEventListener('DOMContentLoaded', () => {
+  const lines = [
+    ['dim', '$ bun run agent "今天几号？周报模板里写的截止时间是什么？离截止还有多少小时？"', '用户给出目标。系统提示 + 这句话构成第一轮的上下文。'],
+    ['call', '→ get_time({"timezone":"Asia/Shanghai"})', '第 1 轮：模型不知道今天几号，先调用工具查。注意它自己选了时区。'],
+    ['ok', '← 2026年11月25日星期三 中国标准时间 10:12:03', '工具在你的进程里执行，结果追加进上下文。'],
+    ['call', '→ read_note({"name":"weekly"})', '第 2 轮：模型去读周报模板，但文件名少写了 .md。'],
+    ['err', '← 工具执行出错：没有 weekly。现有笔记：weekly.md', '工具没有抛异常让程序崩溃，而是把错误和"现有笔记"一起回灌——可执行的错误信息。'],
+    ['call', '→ read_note({"name":"weekly.md"})', '第 3 轮：模型读懂了错误，自己改正了文件名。这就是错误回灌的价值。'],
+    ['ok', '← # 周报模板 … 截止：每周五 18:00 前发到项目群。', '拿到截止时间。'],
+    ['call', '→ calculator({"expression":"2*24 + 7.8"})', '第 4 轮：周三 10:12 到周五 18:00。系统提示要求"算术一律用 calculator"，它照做了。'],
+    ['ok', '← 55.8', ''],
+    ['ans', '今天是 11 月 25 日（周三）。周报要在每周五 18:00 前发到项目群，离这周五截止还有约 56 小时。', '第 5 轮：模型不再调用工具，输出最终答复，循环结束。'],
+    ['dim', '（5 轮；输入 4,180 tokens，其中缓存命中 2,816；输出 236）', '每轮都把整个上下文重发一遍，所以输入 token 随轮数累加；开头不变的部分能命中提示词缓存（第 2 章）。'],
+  ];
+  const box = document.getElementById('replay');
+  const term = box.querySelector('.term');
+  const note = box.querySelector('.term-note');
+  let i = 0;
+  let timer = null;
+  const playBtn = box.querySelector('[data-act="play"]');
+  const stop = () => { clearInterval(timer); timer = null; playBtn.textContent = '▶ 播放'; };
+  const step = () => {
+    if (i >= lines.length) return stop();
+    const [cls, text, explain] = lines[i++];
+    const span = document.createElement('span');
+    span.className = `line ${cls}`;
+    span.textContent = text;
+    term.append(span);
+    if (explain) note.textContent = explain;
+    if (i >= lines.length) stop();
+  };
+  const reset = () => { stop(); i = 0; term.textContent = ''; note.textContent = '点"播放"或"下一行"。'; };
+  playBtn.addEventListener('click', () => {
+    if (timer) return stop();
+    if (i >= lines.length) reset();
+    playBtn.textContent = '⏸ 暂停';
+    step();
+    timer = setInterval(step, 1600);
+  });
+  box.querySelector('[data-act="step"]').addEventListener('click', () => { stop(); step(); });
+  box.querySelector('[data-act="reset"]').addEventListener('click', reset);
+  reset();
+});
+</script>
+</body>
+</html>

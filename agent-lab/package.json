@@ -1,0 +1,26 @@
+{
+  "name": "agent-lab",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit -p .",
+    "agent": "bun run src/main.ts",
+    "triage": "bun run src/triage/main.ts",
+    "cli": "bun run src/cli.ts",
+    "mcp-server": "bun run mcp-server/index.ts",
+    "mcp": "bun run src/main-mcp.ts",
+    "mcp-pin": "bun run src/mcp-client.ts --pin",
+    "evals": "bun run evals/cli.ts",
+    "harness": "bun run harness/main.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/client": "^2.4.0",
+    "@modelcontextprotocol/server": "^2.4.0",
+    "zod": "^4"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^7.0.2"
+  }
+}

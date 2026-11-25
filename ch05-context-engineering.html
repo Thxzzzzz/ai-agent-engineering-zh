@@ -1,0 +1,450 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>上下文工程 · AI Agent 工程</title>
+<meta name="description" content="把每一次模型调用的上下文当成预算来管理：注意力预算与 context rot、组装顺序与提示缓存、即时检索、工具返回的截断，以及长任务的压缩、笔记与子 agent。">
+<link rel="stylesheet" href="assets/css/course.css">
+<script src="assets/js/manifest.js"></script>
+<script defer src="assets/js/course.js"></script>
+<style>
+  .pack-list { list-style: none; padding: 0; margin: 8px 0 0; }
+  .pack-list li { display: grid; grid-template-columns: 22px minmax(0, 1fr) auto auto; gap: 8px; align-items: center; padding: 6px 8px; border: 1px solid var(--border); border-radius: 8px; margin: 6px 0; background: var(--bg); font-size: 14px; }
+  .pack-list li.off { opacity: .5; }
+  .pack-list .nm small { display: block; color: var(--muted); font-size: 12px; line-height: 1.4; }
+  .pack-list .mv { display: flex; gap: 4px; }
+  .pack-list .mv button { padding: 1px 7px; }
+  .stack { display: flex; height: 22px; border-radius: 6px; overflow: hidden; background: var(--surface-2); margin-top: 6px; position: relative; }
+  .stack i { display: block; height: 100%; border-right: 1px solid var(--surface); }
+  .stack i.c { background: var(--ok); }
+  .stack i.u { background: var(--accent-2); }
+  .stack .limit { position: absolute; top: -4px; bottom: -4px; width: 2px; background: var(--danger); }
+  .legend { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 12px; color: var(--muted); margin-top: 6px; }
+  .legend b { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 4px; vertical-align: -1px; }
+</style>
+</head>
+<body data-page="ch05">
+<article id="content">
+<div class="eyebrow">第二部分 · 上下文与记忆 · 第 5 章</div>
+<h1>上下文工程</h1>
+<p class="lead">模型是无状态的，它每一轮"知道"的东西，全部来自你这一轮塞给它的上下文。上下文工程就是回答一个问题：<strong>在有限的窗口里，这一刻放什么、按什么顺序放、什么时候扔掉</strong>。这是 agent 质量、成本和延迟的总开关。</p>
+<div class="meta"><span>约 40 分钟</span><span>前置：第 2、4 章</span><span>含 1 个分步动画、1 个交互、3 道小测</span></div>
+
+<div class="goals"><b>学完你能</b>
+<ul>
+  <li>解释 context rot 与"注意力预算"，说明为什么上下文不是越多越好</li>
+  <li>按"稳定在前、易变在后"组装上下文，让提示缓存真正命中</li>
+  <li>在预加载与即时检索（just-in-time）之间做取舍，控制工具返回的体积</li>
+  <li>为长任务选择压缩、结构化笔记、子 agent 隔离三种手段</li>
+  <li>写出一个有预算、有截断、顺序可控的上下文组装器</li>
+</ul></div>
+
+<h2>1 · 从提示词工程到上下文工程</h2>
+<p>早期大家讨论的是"提示词怎么写"：措辞、角色、示例。到了 agent 时代，一次任务要跑几十轮，每一轮的输入里，你亲手写的系统提示可能只占一小部分，其余是对话历史、工具定义、工具返回、检索结果、记忆、文件内容……这些东西的总和才决定模型这一轮看到了什么。</p>
+<p>Anthropic 在《Effective context engineering for AI agents》（2025-09-29）里给了一个工程化的定义：</p>
+<blockquote>上下文工程，是在推理时<strong>选择并维护最优的 token 集合</strong>的一组策略——它的范围比提示词工程更大，包括提示词之外所有进入上下文的信息。</blockquote>
+<p>HumanLayer 的《12-Factor Agents》把同一件事说得更直白——第 3 条：<strong>Own your context window</strong>，自己掌控上下文窗口。不要让框架替你决定往里塞什么、按什么格式塞；上下文就是你和模型之间唯一的接口，它应该是你代码里一个看得见、测得了的产物。</p>
+
+<figure>
+<div class="diagram">
+<svg viewBox="0 0 740 230" width="740" role="img" aria-label="一次模型调用的上下文由多种来源拼成">
+  <rect class="box a" x="270" y="70" width="200" height="90" rx="12"/>
+  <text class="tb" x="370" y="104" text-anchor="middle">这一轮的上下文</text>
+  <text class="ts" x="370" y="126" text-anchor="middle">有限窗口 · 每个 token 都有成本</text>
+  <text class="ts" x="370" y="144" text-anchor="middle">也都在争夺模型的注意力</text>
+  <rect class="box m" x="20" y="14" width="170" height="40" rx="8"/><text class="t" x="105" y="39" text-anchor="middle">系统提示 / 规则</text>
+  <rect class="box m" x="20" y="70" width="170" height="40" rx="8"/><text class="t" x="105" y="95" text-anchor="middle">工具定义</text>
+  <rect class="box v" x="20" y="126" width="170" height="40" rx="8"/><text class="t" x="105" y="151" text-anchor="middle">记忆 / 用户档案</text>
+  <rect class="box m" x="20" y="182" width="170" height="40" rx="8"/><text class="t" x="105" y="207" text-anchor="middle">对话历史</text>
+  <rect class="box b" x="550" y="14" width="170" height="40" rx="8"/><text class="t" x="635" y="39" text-anchor="middle">工具返回</text>
+  <rect class="box g" x="550" y="70" width="170" height="40" rx="8"/><text class="t" x="635" y="95" text-anchor="middle">检索结果</text>
+  <rect class="box m" x="550" y="126" width="170" height="40" rx="8"/><text class="t" x="635" y="151" text-anchor="middle">文件 / 文档片段</text>
+  <rect class="box m" x="550" y="182" width="170" height="40" rx="8"/><text class="t" x="635" y="207" text-anchor="middle">当前时间、环境状态</text>
+  <path class="line" d="M190 34 C230 34 240 90 270 98" marker-end="url(#arr)"/>
+  <path class="line" d="M190 90 L270 108" marker-end="url(#arr)"/>
+  <path class="line" d="M190 146 L270 128" marker-end="url(#arr)"/>
+  <path class="line" d="M190 202 C230 202 240 150 270 140" marker-end="url(#arr)"/>
+  <path class="line" d="M550 34 C510 34 500 90 470 98" marker-end="url(#arr)"/>
+  <path class="line" d="M550 90 L470 108" marker-end="url(#arr)"/>
+  <path class="line" d="M550 146 L470 128" marker-end="url(#arr)"/>
+  <path class="line" d="M550 202 C510 202 500 150 470 140" marker-end="url(#arr)"/>
+</svg>
+</div>
+<figcaption>图 5-1 你亲手写的提示词只是上下文的一部分。上下文工程管理的是全部来源。</figcaption>
+</figure>
+
+<h2>2 · 注意力预算与 context rot</h2>
+<p>直觉上，窗口越大，塞得越多，模型知道得越多，效果越好。实际不是这样。Anthropic 那篇文章总结了一个被反复观察到的现象——<strong>context rot（上下文腐化）</strong>：上下文越满，模型从中准确召回某条信息的能力越差。</p>
+<p>原因可以从 Transformer 的结构理解：每个 token 都要和其他所有 token 计算注意力，n 个 token 就有 n² 对关系。上下文越长，注意力被摊得越薄；而且模型训练时见到的短序列远多于超长序列，对长距离依赖的处理经验本来就少。所以文章把它比作<strong>注意力预算</strong>：</p>
+<div class="callout note"><b>把每个 token 当成在花钱</b>
+<p>每放进去一个 token，都在消耗模型有限的注意力。目标不是"塞满"，而是找到<strong>信号最强的最小 token 集合</strong>，让模型最可能做出你想要的行为。</p></div>
+<p>这带来三条直接的工程后果：</p>
+<ul>
+  <li><strong>大窗口不是免费的午餐。</strong>窗口能放下，不等于模型能用好；无关内容会稀释关键信息，还会拉高成本与延迟。</li>
+  <li><strong>"以防万一"地塞信息是有代价的。</strong>每一段上下文都应该回答"模型这一轮用得上吗"。</li>
+  <li><strong>长任务必须有"清理"机制。</strong>对话越跑越长是 agent 的天性，必须主动压缩、外置、隔离（第 7 节）。</li>
+</ul>
+
+<h2>3 · 系统提示：找到合适的"高度"</h2>
+<p>Anthropic 用"高度（altitude）"描述系统提示的抽象程度，两个极端都会失败：</p>
+<table>
+<tr><th></th><th>太低：硬编码</th><th>合适的高度</th><th>太高：空泛</th></tr>
+<tr><td>样子</td><td>写满 if-else 式的规则："如果用户说 A 就回 B；如果邮件来自 C 就……"</td><td>讲清目标、原则、边界和判断依据，给几个典型例子</td><td>"你是一个乐于助人的助理，请尽力帮助用户。"</td></tr>
+<tr><td>问题</td><td>脆弱，规则互相打架，覆盖不了没写到的情况，维护成本越来越高</td><td>——</td><td>模型拿不到具体信号，只能靠猜，行为不稳定</td></tr>
+</table>
+<p>写好一份系统提示的几条实操建议：</p>
+<ul>
+  <li><strong>分段并加标题</strong>（背景、目标、规则、工具使用指引、输出要求），用 Markdown 标题或 XML 标签分隔，方便模型定位，也方便你维护。</li>
+  <li><strong>从最小可用版本开始</strong>，用真实失败案例驱动增补——每加一条规则，都应该能对应到一个具体的失败。</li>
+  <li><strong>例子要少而多样</strong>：few-shot 用几个有代表性、彼此不同的典型例子，而不是把所有边界情况都列一遍。例子是"画像"，不是"规则表"。</li>
+  <li><strong>解释原因</strong>："不要在回复里承诺具体日期，因为排期由项目经理确认"比"不要承诺日期"更能让模型泛化到相近情形。</li>
+</ul>
+
+<div class="quiz" data-answer="3">
+<p class="q">办公助理 agent 经常把"仅供参考"的抄送邮件也当成需要回复的邮件。下面哪种改法最符合"合适的高度"？</p>
+<ol>
+  <li>在系统提示里加一条：如果邮件标题包含"FYI"就不要回复</li>
+  <li>换一个更大的模型</li>
+  <li>写明判断原则："只有当发件人在等待你本人的决定、信息或行动时才需要回复；你只在抄送里、或邮件是通知性质时通常不需要"，并给 2–3 个不同类型的例子</li>
+  <li>把过去所有被误判的邮件都放进系统提示作为反例</li>
+</ol>
+<div class="explain">选项 1 是"太低"的硬编码，覆盖不了没写"FYI"的通知；选项 4 会撑爆上下文，还容易让模型机械模仿；选项 2 不解决信号缺失。选项 3 给了判断依据和少量多样的例子，是可以泛化的写法。</div>
+</div>
+
+<h2>4 · 组装顺序：稳定在前，易变在后</h2>
+<p>上下文里的内容不只有"放不放"的问题，还有"<strong>放在哪</strong>"的问题。顺序同时影响两件事：</p>
+<h3>4.1 提示缓存只认前缀</h3>
+<p>主流模型服务商都提供<strong>提示缓存（prompt caching）</strong>：如果这次请求的开头和最近某次请求的开头完全相同，这段相同前缀的计算结果可以复用，读取价格只有正常输入的一个零头（截至 2026-11 的官方文档：Anthropic 的缓存读取通常是基础输入价的 0.1 倍或更低，OpenAI 的自动缓存也是同一量级），延迟也明显下降。关键在于：</p>
+<ul>
+  <li>缓存按<strong>前缀</strong>匹配。中间任何一个字节变了，从那个位置往后全部失效。</li>
+  <li>Anthropic 的缓存层级顺序是 <code>tools → system → messages</code>，改动前一层会让后面各层一起失效。</li>
+  <li>所以：<strong>越稳定的内容越靠前，越易变的内容越靠后。</strong>"当前时间"这种每次都变的东西如果放在系统提示开头，整个缓存就废了。</li>
+</ul>
+<p>Manus 团队在《Context Engineering for AI Agents: Lessons from Building Manus》（2025-07-18）里把 <strong>KV-cache 命中率</strong>称为生产级 agent 最重要的单一指标：他们的 agent 输入与输出的 token 比例约为 100:1（每轮都要重新读入整段上下文，而只输出一个短的工具调用），缓存与未缓存的单价相差 10 倍。他们给出的三条纪律：</p>
+<ol>
+  <li><strong>前缀保持稳定</strong>：不要在系统提示里放精确到秒的时间戳。</li>
+  <li><strong>上下文只追加，不改写</strong>：不要回头修改历史里的动作或观察。</li>
+  <li><strong>序列化必须确定</strong>：同样的对象每次序列化出同样的字节（很多语言的 JSON 序列化不保证键顺序）。</li>
+</ol>
+<h3>4.2 位置也影响注意力</h3>
+<p>关键指令放在哪里也有讲究：大段资料放前面，具体任务与问题放在末尾，往往比反过来效果更好；最需要被遵守的约束在末尾再简短重申一次，也能对抗长上下文里的"中间遗忘"。这和缓存的要求恰好一致——易变的、和本轮直接相关的内容放后面。</p>
+
+<div class="widget" id="packer">
+<div class="w-title">上下文装箱器</div>
+<p style="margin-top:0;font-size:14px">一个办公助理 agent 要处理一封新邮件。勾选要放进上下文的块，用 ↑↓ 调整顺序，观察预算占用和<strong>可命中缓存的前缀比例</strong>。规则：遇到第一块"每次都变"的内容后，后面的内容都无法命中缓存；"追加型"的历史只有最新一条是新的。</p>
+<div class="w-row" style="grid-template-columns: 1fr 1fr">
+  <label>上下文预算 <b data-v="budget"></b><input type="range" min="8000" max="64000" step="4000" value="32000" data-in="budget"></label>
+  <label>保留最近消息条数 <b data-v="recent"></b><input type="range" min="0" max="80" step="5" value="20" data-in="recent"></label>
+</div>
+<ul class="pack-list" data-list></ul>
+<div class="stack" data-stack></div>
+<div class="legend"><span><b style="background:var(--ok)"></b>可命中缓存</span><span><b style="background:var(--accent-2)"></b>需要重新计算</span><span><b style="background:var(--danger)"></b>预算上限</span></div>
+<div class="w-out" data-out></div>
+</div>
+
+<h2>5 · 预加载，还是即时检索？</h2>
+<p>传统做法是<strong>预加载</strong>：在调用模型前，先把可能相关的资料（检索结果、文档、历史）一股脑查出来放进上下文。Anthropic 观察到越来越多的 agent 转向另一种策略——<strong>即时（just-in-time）检索</strong>：上下文里只放"引用"（文件路径、查询语句、链接、ID），模型需要时自己用工具去取。</p>
+<table>
+<tr><th></th><th>预加载</th><th>即时检索</th></tr>
+<tr><td>做法</td><td>调用前由代码查好、放进上下文</td><td>上下文只放引用，模型用 grep / 搜索 / 读文件工具按需取</td></tr>
+<tr><td>优点</td><td>一轮就能答，延迟低；行为可预测</td><td>上下文干净；信息总是最新的；能逐步探索，处理事先没想到的需求</td></tr>
+<tr><td>缺点</td><td>容易塞进无关内容；索引可能过期</td><td>多轮工具调用，更慢更贵；模型可能找错地方或不找</td></tr>
+<tr><td>适合</td><td>需要的信息可预测、体量小</td><td>信息量大、需求开放、探索式的任务（如编码）</td></tr>
+</table>
+<p>实际系统大多是<strong>混合</strong>的。Anthropic 举的例子是编码 agent：项目说明文件（如 <code>CLAUDE.md</code>、<code>AGENTS.md</code>）在开始时直接放进上下文，其余代码用 glob / grep 按需读取。12-Factor Agents 也有一条附加原则 <em>Pre-fetch all the context you might need</em>：如果你<strong>确定</strong>模型下一步一定会调用某个工具去拿某个信息，不如由代码提前取好放进去，省掉一轮来回。</p>
+<div class="callout tip"><b>判断口诀</b>
+<p><strong>确定会用的，预加载；可能会用的，给引用；不会用的，不放。</strong>对办公助理来说："发件人是谁、和我什么关系"几乎每次都要，预加载；"这个项目三个月前的讨论"可能要，给一个搜索工具；"公司全部制度文档"不放。</p></div>
+
+<h2>6 · 工具返回：上下文最大的污染源</h2>
+<p>在长任务里，占据上下文最多的往往不是你写的提示，而是<strong>工具返回</strong>：一次列表查询返回几百条记录、一次网页抓取返回整页 HTML、一个日志文件几万行。Anthropic《Writing effective tools for agents》（2025-09-11）给出的做法：</p>
+<ul>
+  <li><strong>分页、过滤、截断，并设上限。</strong>Claude Code 的工具返回默认上限是 25,000 token。截断时告诉模型"还有更多，可以用某参数继续取"。</li>
+  <li><strong>提供返回详略档位。</strong>例如 <code>response_format: "concise" | "detailed"</code>；原文实验中简洁档约只用详细档 1/3 的 token。</li>
+  <li><strong>返回语义字段，不返回技术 ID。</strong>返回人名、标题，而不是一串 UUID；模型用不上的字段只是噪音。</li>
+  <li><strong>与其包装底层 API，不如设计面向任务的工具。</strong><code>search_contacts(query)</code> 比 <code>list_contacts()</code> 好——后者逼模型把整个通讯录读进上下文再自己找。</li>
+  <li><strong>错误信息要可执行。</strong>"参数 date 格式应为 YYYY-MM-DD，你传的是 '下周三'"比一个堆栈好得多。</li>
+</ul>
+<h3>6.1 更进一步：让中间结果根本不进上下文</h3>
+<p>Anthropic《Code execution with MCP》（2025-11-04）提出了另一种思路：把工具呈现为一个代码 API（例如文件系统里的 <code>./servers/drive/getDocument.ts</code>），让 agent <strong>写代码</strong>来调用工具、过滤和拼接数据，只把最终需要的结果返回给模型。原文示例里，一个需要在两个系统之间搬运大文档的任务，上下文从约 15 万 token 降到约 2 千 token（节省 98.7%）。代价是你需要一个安全的代码执行沙箱、资源限制和监控（第 9、11 章）。</p>
+
+<div class="quiz" data-answer="2">
+<p class="q">agent 需要"找出上个月所有金额超过 5000 元、还没审批的报销单"。工具设计上最好的选择是？</p>
+<ol>
+  <li>提供 <code>list_all_expenses()</code>，返回全部报销单，让模型自己筛</li>
+  <li>提供 <code>search_expenses(month, min_amount, status, limit)</code>，返回带标题、金额、申请人的精简列表，并提示是否还有下一页</li>
+  <li>提供 <code>get_expense(id)</code>，让模型逐个查询</li>
+  <li>把全部报销单预加载进系统提示</li>
+</ol>
+<div class="explain">筛选应该发生在工具里（你的代码），而不是模型的注意力里。选项 2 把过滤条件做成参数、限制条数、返回语义字段、提示分页，上下文最干净。选项 1 和 4 会把成百上千条无关记录塞进上下文；选项 3 需要模型先知道 ID，且要调用很多次。</div>
+</div>
+
+<h2>7 · 长任务：压缩、笔记与子 agent</h2>
+<p>一个需要几十上百轮的任务（整理一季度的会议纪要、迁移一批文档、修一个复杂的 bug），无论怎么精简，上下文终究会被填满。Anthropic 总结了三种手段，下面的动画演示前两种，以及第三种如何配合：</p>
+
+<figure class="anim" data-dim>
+<div class="diagram">
+<svg viewBox="0 0 760 400" width="760" role="img" aria-label="压缩前后的上下文变化">
+  <text class="tb" x="160" y="30" text-anchor="middle">压缩前的上下文</text>
+  <rect class="box m" x="60" y="44" width="200" height="300" rx="8" style="fill:none"/>
+  <g data-k="s"><rect class="box m" x="66" y="50" width="188" height="28" rx="5"/><text class="t" x="160" y="69" text-anchor="middle">系统提示 + 工具定义</text></g>
+  <g data-k="task"><rect class="box a" x="66" y="82" width="188" height="24" rx="5"/><text class="t" x="160" y="99" text-anchor="middle">任务目标</text></g>
+  <g data-k="r1"><rect class="box b" x="66" y="110" width="188" height="44" rx="5"/><text class="t" x="160" y="136" text-anchor="middle">第 1–10 轮：调用与结果</text></g>
+  <g data-k="r2"><rect class="box b" x="66" y="158" width="188" height="54" rx="5"/><text class="t" x="160" y="189" text-anchor="middle">第 11–25 轮</text></g>
+  <g data-k="r3"><rect class="box b" x="66" y="216" width="188" height="64" rx="5"/><text class="t" x="160" y="245" text-anchor="middle">第 26–40 轮</text><text class="ts" x="160" y="264" text-anchor="middle">大量工具输出</text></g>
+  <g data-k="r4"><rect class="box r" x="66" y="284" width="188" height="54" rx="5"/><text class="t" x="160" y="309" text-anchor="middle">第 41–48 轮</text><text class="ts" x="160" y="327" text-anchor="middle">开始遗忘早期约定</text></g>
+  <g data-k="warn"><path class="line r dash" d="M40 284 H280"/><text class="ts" x="160" y="364" text-anchor="middle">虚线：设定的压缩阈值（如窗口的 80%）</text></g>
+
+  <g data-k="arrow"><path class="line a" d="M270 190 H360" marker-end="url(#arr-a)"/><text class="ta" x="315" y="180" text-anchor="middle">压缩</text></g>
+
+  <text class="tb" x="470" y="30" text-anchor="middle" data-k="after">压缩后的上下文</text>
+  <g data-k="after"><rect class="box m" x="370" y="44" width="200" height="300" rx="8" style="fill:none"/></g>
+  <g data-k="after"><rect class="box m" x="376" y="50" width="188" height="28" rx="5"/><text class="t" x="470" y="69" text-anchor="middle">系统提示 + 工具定义</text></g>
+  <g data-k="after"><rect class="box a" x="376" y="82" width="188" height="24" rx="5"/><text class="t" x="470" y="99" text-anchor="middle">任务目标</text></g>
+  <g data-k="sum"><rect class="box v" x="376" y="110" width="188" height="44" rx="5"/><text class="t" x="470" y="130" text-anchor="middle">历史摘要</text><text class="ts" x="470" y="147" text-anchor="middle">决定、进度、未解决问题</text></g>
+  <g data-k="recent"><rect class="box b" x="376" y="158" width="188" height="44" rx="5"/><text class="t" x="470" y="178" text-anchor="middle">最近几轮 + 最近的文件</text><text class="ts" x="470" y="195" text-anchor="middle">原样保留</text></g>
+  <g data-k="free"><text class="ts" x="470" y="270" text-anchor="middle">腾出的空间</text><text class="ts" x="470" y="288" text-anchor="middle">可以继续工作</text></g>
+
+  <g data-k="notes"><rect class="box g" x="610" y="50" width="136" height="110" rx="8"/><text class="tb" x="678" y="76" text-anchor="middle">NOTES.md</text><text class="ts" x="678" y="98" text-anchor="middle">写在上下文之外</text><text class="ts" x="678" y="116" text-anchor="middle">进度、待办、结论</text><text class="ts" x="678" y="134" text-anchor="middle">随时可以读回</text></g>
+  <g data-k="notesline"><path class="line g dash" d="M564 130 H610" marker-end="url(#arr-g)" marker-start="url(#arr-g)"/></g>
+  <g data-k="sub"><rect class="box w" x="610" y="200" width="136" height="110" rx="8"/><text class="tb" x="678" y="226" text-anchor="middle">子 agent</text><text class="ts" x="678" y="248" text-anchor="middle">独立的干净上下文</text><text class="ts" x="678" y="266" text-anchor="middle">大量探索在里面做</text><text class="ts" x="678" y="284" text-anchor="middle">只回传 1–2k 摘要</text></g>
+  <g data-k="subline"><path class="line b" d="M610 250 C590 250 590 186 564 186" marker-end="url(#arr-b)"/></g>
+</svg>
+</div>
+<ol class="anim-steps">
+  <li data-show="s task" data-hl="s task">任务开始。上下文里只有系统提示、工具定义和任务目标，干净、紧凑。</li>
+  <li data-show="r1 r2" data-hl="r1 r2">agent 一轮轮调用工具。每轮的调用和返回都追加进上下文——这是 agent loop 的天性。</li>
+  <li data-show="r3 warn" data-hl="r3 warn">工具返回越来越多。到第 40 轮左右，占用越过了你设定的压缩阈值。</li>
+  <li data-show="r4" data-hl="r4">如果不处理：成本和延迟线性上涨，早期约定被"淹没"（context rot），最终撑爆窗口、任务中断。</li>
+  <li data-show="arrow after sum" data-hl="arrow sum">触发<strong>压缩（compaction）</strong>：让模型把历史总结成摘要——保留做过的决定、当前进度、未解决的问题，丢弃冗余的工具输出。</li>
+  <li data-show="recent free" data-hl="recent free">最近几轮与最近读过的文件<strong>原样保留</strong>（Claude Code 压缩时保留摘要和最近 5 个文件）。腾出的空间让任务可以继续。压缩的难点是"留什么"：丢掉的细节如果之后要用，就找不回来了。</li>
+  <li data-show="notes notesline" data-hl="notes notesline"><strong>结构化笔记</strong>：agent 定期把进度、待办、关键结论写进上下文之外的文件（如 <code>NOTES.md</code>），压缩或重启后读回来。笔记不受压缩影响，是跨越上下文边界的"外部记忆"。</li>
+  <li data-show="sub subline" data-hl="sub subline"><strong>子 agent 隔离</strong>：把"需要读大量材料"的子任务交给一个拥有独立上下文的子 agent，它在自己的窗口里探索，只把 1–2k token 的精炼结论交回主 agent。主上下文因此始终保持干净。</li>
+</ol>
+<figcaption>图 5-2 长任务的上下文管理。三种手段可以叠加使用。</figcaption>
+</figure>
+
+<table>
+<tr><th>手段</th><th>适合</th><th>风险与对策</th></tr>
+<tr><td>压缩（compaction）</td><td>需要大量来回对话、上下文连续性重要的任务</td><td>摘要丢失关键细节 → 用真实的长 trace 调压缩提示词；先尽量召回（宁多勿漏），再逐步精简；保留引用（路径、链接）而不是内容本身，确保"可恢复"</td></tr>
+<tr><td>结构化笔记</td><td>有明确里程碑、可以迭代推进的任务</td><td>笔记变成流水账 → 规定固定结构（目标、已完成、进行中、待决、约定）；笔记要能独立读懂</td></tr>
+<tr><td>子 agent 隔离</td><td>可以并行、需要大量阅读的探索型子任务</td><td>子 agent 之间决策冲突、token 成倍增加 → 只让子 agent 做"读"，写操作留在主 agent（第 11 章）</td></tr>
+</table>
+
+<p>除了压缩，模型服务商也开始在 API 层提供"上下文编辑"能力：自动清理早期已经用不上的工具返回。Anthropic 在 2025-09-29 公布的内部评测里，仅用上下文编辑就让一项长任务的效果提升 29%，配合记忆工具提升 39%，在 100 轮的搜索任务里 token 消耗下降 84%。这类能力本质上就是本节手段的"托管版"。</p>
+
+<h2>8 · Manus 的六条实战经验</h2>
+<p>Manus 是一个通用 agent 产品，它的一个典型任务大约需要 50 次工具调用。他们在 2025-07 发布的经验总结，至今仍是上下文工程最有价值的一手资料之一：</p>
+<table>
+<tr><th>经验</th><th>做法</th><th>背后的原因</th></tr>
+<tr><td>围绕 KV-cache 设计</td><td>稳定前缀、只追加、确定性序列化；必要时显式标注缓存断点</td><td>输入输出约 100:1，缓存命中率直接决定成本和首 token 延迟</td></tr>
+<tr><td>屏蔽工具，而不是删除</td><td>工具定义保持不变，用状态机在解码时屏蔽当前不该用的工具；工具名用统一前缀（如 <code>browser_</code>、<code>shell_</code>）便于成组约束</td><td>动态增删工具会让缓存失效，且历史里引用了已删除的工具会让模型困惑</td></tr>
+<tr><td>把文件系统当上下文</td><td>大块内容写进文件，上下文里只留路径；压缩必须是可恢复的（网页内容可丢，URL 要留）</td><td>文件系统容量无限、持久，且 agent 可以自己读写</td></tr>
+<tr><td>用复述操控注意力</td><td>让 agent 维护一个 <code>todo.md</code>，每完成一步就重写一遍，把目标"推"到上下文末尾</td><td>对抗长任务里的目标漂移和"中间遗忘"</td></tr>
+<tr><td>把错误留在上下文里</td><td>失败的调用和报错信息不要清理掉</td><td>模型看到失败后会更新判断，减少重复犯同样的错（12-Factor 第 9 条也主张把错误压缩后放回上下文）</td></tr>
+<tr><td>不要被 few-shot 带偏</td><td>在动作和观察的序列化格式、措辞上引入少量受控变化</td><td>上下文里全是相同模式的历史，模型会陷入机械模仿，在批量任务里尤其明显</td></tr>
+</table>
+
+<div class="callout warn"><b>"屏蔽而不是删除"与"按需加载工具"并不矛盾</b>
+<p>工具很多时（比如接了几十个 MCP 服务），把全部定义常驻上下文本身就是负担。这时的思路是第 11 章的"渐进披露"：先只给模型一个能查找工具的工具，或者像 Agent Skills 那样只放名称和一句描述。关键是<strong>常驻部分要稳定</strong>，变化发生在上下文末尾。</p></div>
+
+<h2>9 · 实现：一个有预算的上下文组装器</h2>
+<p>把以上原则落到代码里，核心是把"上下文"从散落各处的字符串拼接，变成一个<strong>显式、可测试</strong>的组装步骤。下面是一个简化但完整的实现思路：</p>
+<pre data-title="context-builder.ts"><code class="lang-ts">
+// 稳定性决定位置：越稳定越靠前，才能命中提示缓存
+type Stability = 'static' | 'session' | 'append' | 'volatile';
+const ORDER: Record&lt;Stability, number&gt; = { static: 0, session: 1, append: 2, volatile: 3 };
+
+interface Section {
+  name: string;
+  stability: Stability;
+  text: string;
+  priority: number;   // 超预算时先砍 priority 低的
+  minTokens?: number; // 允许截断到的最小长度；不设则要么全留要么全砍
+}
+
+// 粗略估算：中文约 1 字 ≈ 1 token 以上，英文约 4 字符 ≈ 1 token。
+// 生产中用服务商的 token 计数接口校准。
+const estimate = (s: string) =&gt; Math.ceil(s.length / 1.5);
+
+export function buildContext(sections: Section[], budget: number) {
+  const kept = [...sections];
+  let total = kept.reduce((n, s) =&gt; n + estimate(s.text), 0);
+
+  // 1. 超预算：按优先级从低到高，先截断、再整段丢弃
+  const byPriority = [...kept].sort((a, b) =&gt; a.priority - b.priority);
+  for (const s of byPriority) {
+    if (total &lt;= budget) break;
+    const size = estimate(s.text);
+    const over = total - budget;
+    if (s.minTokens !== undefined &amp;&amp; size - over &gt;= s.minTokens) {
+      s.text = truncate(s.text, size - over);
+      total -= over;
+    } else {
+      kept.splice(kept.indexOf(s), 1);
+      total -= size;
+    }
+  }
+
+  // 2. 稳定的在前，易变的在后；同级保持原顺序（sort 是稳定排序）
+  kept.sort((a, b) =&gt; ORDER[a.stability] - ORDER[b.stability]);
+  return { text: kept.map((s) =&gt; `## ${s.name}\n${s.text}`).join('\n\n'), tokens: total };
+}
+
+function truncate(text: string, tokens: number) {
+  const chars = Math.floor(tokens * 1.5) - 40;
+  // 截断要告诉模型"还有更多"，并给出取回的方式
+  return text.slice(0, chars) + '\n…（已截断，如需完整内容请调用 read_more 工具）';
+}
+</code></pre>
+<p>这段代码体现了几个值得在真实系统里保留的设计：</p>
+<ul>
+  <li><strong>上下文是一个纯函数的输出</strong>：同样的输入得到同样的字节，可以写单元测试，也天然满足"确定性序列化"。</li>
+  <li><strong>稳定性是一等公民</strong>：每段内容声明自己多久变一次，排序由它决定，而不是靠写代码的人记住。</li>
+  <li><strong>预算超限有明确策略</strong>：谁先被截断、谁先被丢弃，由优先级决定，并且截断有提示。</li>
+  <li>把组装结果连同 token 数写进 trace（第 14 章），出问题时你能看到模型<strong>那一轮到底看到了什么</strong>——这是排查 agent 问题最重要的一手证据。</li>
+</ul>
+
+<div class="quiz" data-answer="4">
+<p class="q">团队发现缓存命中率几乎为 0。排查后最可能的原因是？</p>
+<ol>
+  <li>对话历史太长</li>
+  <li>工具定义太多</li>
+  <li>用户问题每次都不一样</li>
+  <li>系统提示开头写着"当前时间：2026-11-25 14:03:27"，后面才是固定的规则和工具说明</li>
+</ol>
+<div class="explain">缓存按前缀匹配。用户问题本来就在末尾，变化不影响前面的命中；历史长、工具多反而让可缓存部分更大。精确到秒的时间戳放在最前面，会让后面每一个字节都无法命中——这正是 Manus 点名的反模式。把时间挪到上下文末尾，或者只精确到日期。</div>
+</div>
+
+<h2>10 · 反模式清单</h2>
+<ul>
+  <li><strong>"窗口够大，全塞进去"</strong>：成本、延迟、准确率三输。窗口大小是上限，不是目标。</li>
+  <li><strong>在上下文前部放易变内容</strong>：时间戳、随机 ID、会话计数器放在开头，缓存全部失效。</li>
+  <li><strong>回头改写历史</strong>：为了"整洁"修改之前的工具返回，既破坏缓存，又让模型看到的因果链断裂。要清理就用压缩或上下文编辑，一次性地做。</li>
+  <li><strong>每轮动态增删工具</strong>：缓存失效，且历史里引用的工具突然不存在。</li>
+  <li><strong>工具返回原样回灌</strong>：一个网页、一个 JSON 列表直接塞进去。永远在工具侧过滤、截断、精简。</li>
+  <li><strong>不可恢复的压缩</strong>：摘要里没留路径和链接，之后需要细节时再也找不回来。</li>
+  <li><strong>看不见上下文</strong>：上下文由框架在内部拼接，出了问题只能猜。每一轮的完整输入都应该能被记录和回放。</li>
+</ul>
+
+<div class="callout case review-link"><b>真实项目复盘</b>
+<p>本章的知识点在两个真实项目里缺位时发生了什么，以及"有这块知识"时会怎么设计：</p>
+<ul><li><a href="review.html#f-N2">N2</a> · niuma 的分析提示词从 1291 字涨到 6058 字，53 处"不要/一律/除非"</li><li><a href="review.html#f-N12">N12</a> · niuma 的上下文只按条数截断，没有 token 预算</li><li><a href="review.html#f-D10">D10</a> · devtask 同一条规则一个月翻了三次</li></ul></div>
+
+<div class="takeaways"><b>本章要点</b>
+<ul>
+  <li>上下文工程 = 推理时选择并维护最优 token 集合；它比提示词工程范围更大。</li>
+  <li>context rot：上下文越满，召回越差。每个 token 都在消耗注意力预算。</li>
+  <li>系统提示要在"硬编码规则"和"空泛指导"之间找到合适的高度，例子少而多样。</li>
+  <li>稳定在前、易变在后、只追加、确定性序列化——这是提示缓存命中的前提。</li>
+  <li>确定会用的预加载，可能会用的给引用；工具返回要分页、过滤、截断。</li>
+  <li>长任务用压缩、结构化笔记、子 agent 隔离三件套，压缩必须可恢复。</li>
+</ul></div>
+
+<h2>参考资料</h2>
+<ul class="refs">
+  <li><a href="https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents" target="_blank" rel="noopener">Effective context engineering for AI agents</a> <span class="src">Anthropic · 2025-09-29 · 定义、context rot、合适的高度、即时检索、长任务三件套</span></li>
+  <li><a href="https://manus.im/blog/Context-Engineering-for-AI-Agents-Lessons-from-Building-Manus" target="_blank" rel="noopener">Context Engineering for AI Agents: Lessons from Building Manus</a> <span class="src">Manus · 2025-07-18 · KV-cache、屏蔽工具、文件系统、复述、保留错误</span></li>
+  <li><a href="https://www.anthropic.com/engineering/writing-tools-for-agents" target="_blank" rel="noopener">Writing effective tools for agents — with agents</a> <span class="src">Anthropic · 2025-09-11 · 工具返回的分页、截断与详略档位</span></li>
+  <li><a href="https://www.anthropic.com/engineering/code-execution-with-mcp" target="_blank" rel="noopener">Code execution with MCP</a> <span class="src">Anthropic · 2025-11-04 · 让中间结果不进上下文</span></li>
+  <li><a href="https://claude.com/blog/context-management" target="_blank" rel="noopener">Context management：上下文编辑与记忆工具</a> <span class="src">Anthropic · 2025-09-29 · 上下文编辑与记忆工具</span></li>
+  <li><a href="https://platform.claude.com/docs/en/build-with-claude/prompt-caching" target="_blank" rel="noopener">Prompt caching（Anthropic 文档）</a> <span class="src">缓存层级、断点、价格倍数（2026-11 核实）</span></li>
+  <li><a href="https://developers.openai.com/api/docs/guides/prompt-caching" target="_blank" rel="noopener">Prompt caching（OpenAI 文档）</a> <span class="src">自动缓存与 cached_tokens 统计</span></li>
+  <li><a href="https://github.com/humanlayer/12-factor-agents" target="_blank" rel="noopener">12-Factor Agents</a> <span class="src">HumanLayer · 第 3 条 Own your context window、第 9 条 Compact errors</span></li>
+</ul>
+</article>
+
+<script>
+window.addEventListener('DOMContentLoaded', () => {
+  const root = document.getElementById('packer');
+  const KIND = {
+    static: { label: '稳定', cls: 'ok' },
+    append: { label: '追加型', cls: 'accent' },
+    volatile: { label: '每次都变', cls: 'warn' },
+  };
+  // tokens 为示意数值；"最近消息"的大小由滑块决定（每条约 350 token）
+  const blocks = [
+    { id: 'time', name: '当前时间（精确到秒）', note: '每次请求都不同', tokens: 20, kind: 'volatile', on: true },
+    { id: 'sys', name: '系统提示：角色、规则、输出要求', note: '几乎不变', tokens: 2200, kind: 'static', on: true },
+    { id: 'tools', name: '工具定义（12 个工具）', note: '版本发布时才变', tokens: 3600, kind: 'static', on: true },
+    { id: 'profile', name: '用户档案：身份、语气、底线', note: '偶尔更新', tokens: 1500, kind: 'static', on: true },
+    { id: 'summary', name: '这个会话的历史摘要', note: '压缩时才更新', tokens: 1200, kind: 'static', on: true },
+    { id: 'recent', name: '最近的消息', note: '只在末尾追加新消息', tokens: 0, kind: 'append', on: true },
+    { id: 'rag', name: '检索结果：相关的 5 段文档', note: '每封邮件都不同', tokens: 4500, kind: 'volatile', on: true },
+    { id: 'raw', name: '附件全文（未截断）', note: '每封邮件都不同', tokens: 14000, kind: 'volatile', on: false },
+    { id: 'email', name: '本轮要处理的新邮件', note: '每次都不同', tokens: 600, kind: 'volatile', on: true },
+  ];
+  const state = { budget: 32000, recent: 20 };
+  const list = root.querySelector('[data-list]');
+  const stack = root.querySelector('[data-stack]');
+  const out = root.querySelector('[data-out]');
+  const fmt = (n) => n.toLocaleString('zh-CN');
+  const size = (b) => (b.id === 'recent' ? state.recent * 350 : b.tokens);
+
+  function render() {
+    root.querySelector('[data-v="budget"]').textContent = fmt(state.budget) + ' tokens';
+    root.querySelector('[data-v="recent"]').textContent = state.recent + ' 条';
+    list.innerHTML = '';
+    blocks.forEach((b, i) => {
+      const li = Course.el('li', { class: b.on ? '' : 'off' });
+      const cb = Course.el('input', { type: 'checkbox', 'aria-label': '放入上下文' });
+      cb.checked = b.on;
+      cb.addEventListener('change', () => { b.on = cb.checked; render(); });
+      const up = Course.el('button', { class: 'btn small', type: 'button', text: '↑', 'aria-label': '上移' });
+      const down = Course.el('button', { class: 'btn small', type: 'button', text: '↓', 'aria-label': '下移' });
+      up.disabled = i === 0;
+      down.disabled = i === blocks.length - 1;
+      up.addEventListener('click', () => { [blocks[i - 1], blocks[i]] = [blocks[i], blocks[i - 1]]; render(); });
+      down.addEventListener('click', () => { [blocks[i + 1], blocks[i]] = [blocks[i], blocks[i + 1]]; render(); });
+      li.append(
+        cb,
+        Course.el('span', { class: 'nm', html: `${b.name}<small>${b.note}</small>` }),
+        Course.el('span', { class: 'pill ' + KIND[b.kind].cls, text: `${KIND[b.kind].label} · ${fmt(size(b))}` }),
+        Course.el('span', { class: 'mv' }, [up, down]),
+      );
+      list.append(li);
+    });
+
+    // 按顺序累计：遇到第一块"每次都变"之前的内容都能命中缓存；追加型只有最新一条（约 350 token）是新的
+    let total = 0, cached = 0, broken = false;
+    stack.innerHTML = '';
+    const scale = Math.max(state.budget, blocks.filter((b) => b.on).reduce((n, b) => n + size(b), 0));
+    for (const b of blocks) {
+      if (!b.on) continue;
+      const n = size(b);
+      let c = 0;
+      if (!broken) {
+        if (b.kind === 'static') c = n;
+        else if (b.kind === 'append') { c = Math.max(0, n - 350); broken = true; }
+        else broken = true;
+      }
+      total += n; cached += c;
+      if (c > 0) stack.append(Course.el('i', { class: 'c', title: `${b.name}：可缓存 ${fmt(c)}`, style: `width:${(c / scale) * 100}%` }));
+      if (n - c > 0) stack.append(Course.el('i', { class: 'u', title: `${b.name}：需计算 ${fmt(n - c)}`, style: `width:${((n - c) / scale) * 100}%` }));
+    }
+    stack.append(Course.el('span', { class: 'limit', style: `left:calc(${(state.budget / scale) * 100}% - 1px)` }));
+
+    const ratio = total ? cached / total : 0;
+    // 相对成本：缓存读取按 0.1 倍计（常见量级），与"完全不命中"对比
+    const rel = total ? (cached * 0.1 + (total - cached)) / total : 0;
+    const fill = total / state.budget;
+    let msg = `<span class="stat"><b>${fmt(total)}</b><small>总 token</small></span>
+      <span class="stat"><b>${Math.round(fill * 100)}%</b><small>占预算</small></span>
+      <span class="stat"><b>${Math.round(ratio * 100)}%</b><small>可命中缓存的前缀</small></span>
+      <span class="stat"><b>${Math.round(rel * 100)}%</b><small>输入成本（相对不命中）</small></span><br>`;
+    if (fill > 1) msg += '<b style="color:var(--danger)">超出预算：</b>必须截断或丢弃一些块。最该先砍的通常是未截断的大块原文。';
+    else if (fill > 0.75) msg += '<b style="color:var(--warn)">接近上限：</b>放得下不等于用得好，context rot 会让关键信息更难被注意到。';
+    else if (blocks[0].on && blocks[0].kind === 'volatile') msg += '提示：第一块就是"每次都变"的内容，后面全部无法命中缓存。试试把它移到末尾。';
+    else if (ratio < 0.5) msg += '提示：把"每次都变"的块往下移，让稳定的内容连成一段前缀。';
+    else msg += '不错：稳定内容在前形成了长前缀，易变内容集中在末尾。';
+    out.innerHTML = msg;
+  }
+
+  root.querySelectorAll('[data-in]').forEach((input) => {
+    input.addEventListener('input', () => { state[input.dataset.in] = Number(input.value); render(); });
+  });
+  render();
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,914 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P3 审批流 · AI Agent 工程</title>
+<meta name="description" content="把模型起草的回复变成待审批的提案：SQLite 状态机、事务性发件箱、幂等键、崩溃恢复，以及决定何时可以自动批准的策略与护栏。">
+<link rel="stylesheet" href="assets/css/course.css">
+<script src="assets/js/manifest.js"></script>
+<script defer src="assets/js/course.js"></script>
+<style>
+  .sim-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-top: 12px; }
+  .sim-box { background: var(--surface-2); border-radius: 8px; padding: 10px 12px; font-size: 13.5px; }
+  .sim-box b { display: block; font-size: 12px; color: var(--muted); font-weight: 500; margin-bottom: 4px; }
+  .sim-log { font: 12.5px/1.65 var(--mono); max-height: 190px; overflow-y: auto; white-space: pre-wrap; }
+  .sim-log .bad { color: var(--danger); }
+  .sim-log .good { color: var(--ok); }
+  .sim-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+  .big-num { font-size: 30px; font-weight: 700; line-height: 1.1; }
+</style>
+</head>
+<body data-page="p3">
+<article id="content">
+<div class="eyebrow">跟练项目 · P3</div>
+<h1>P3 · 提案与审批：不批准就不发，批准两次也只发一条</h1>
+<p class="lead">代表你对外说话的 agent，第一条铁律是"一切对外动作皆提案"：模型只能提议，发不发由人（或人明确授权的规则）决定。这个项目把 P2 的回复草稿变成提案，并解决随之而来的所有工程问题：状态怎么流转、批准两次怎么办、发到一半进程崩了怎么办。</p>
+<div class="meta"><span>约 150 分钟</span><span>前置：P2、第 8 章、第 10 章</span><span>产出：SQLite 库 + 命令行审批工具 + 10 个测试</span></div>
+
+<div class="goals"><b>做完你能</b>
+<ul>
+  <li>用"带条件的 UPDATE + 影响行数"实现并发安全的状态机</li>
+  <li>用事务性发件箱（transactional outbox）保证"状态改了"和"要发的消息记下了"同时成立</li>
+  <li>用幂等键让重试、重复批准、崩溃恢复都不会重复发送</li>
+  <li>写一个策略层：默认人工审批，只有显式开启且全部护栏通过时才自动批准</li>
+</ul></div>
+
+<h2>1 · 成品是什么</h2>
+<p>一个命令行工具。分诊结果里需要回复的工单变成待审批的提案；你可以列出、查看、改写后批准、拒绝（并写理由）；批准后的消息经发件箱发出。下面是一次实际运行：</p>
+<pre data-title="终端"><code class="lang-bash">
+$ bun run cli list
+3e3d6d84  pending   同事甲  收到，下午给你
+$ bun run cli approve 3e3d6d84 --edit "收到，3 点前给你"
+已批准 3e3d6d84，执行 send 发出
+$ bun run cli approve 3e3d6d84
+✗ 提案 3e3d6d84 当前是 approved，不能改成 approved
+$ bun run cli send
+{ sent: 1, failed: 0 }
+$ bun run cli list
+3e3d6d84  done      同事甲  收到，3 点前给你
+</code></pre>
+
+<h2>2 · 状态机</h2>
+<p>先把一条提案的一生画清楚。所有状态变化都只经过一个函数 <code>transition()</code>，它只允许图上画出来的箭头。</p>
+<figure class="anim" data-dim>
+<div class="diagram">
+<svg viewBox="0 0 720 290" width="720" role="img" aria-label="提案状态机">
+  <g data-k="pending"><rect class="box a" x="20" y="118" width="120" height="44" rx="10"/><text class="tb" x="80" y="145" text-anchor="middle">pending</text></g>
+  <g data-k="approved"><rect class="box g" x="200" y="118" width="120" height="44" rx="10"/><text class="tb" x="260" y="145" text-anchor="middle">approved</text></g>
+  <g data-k="executing"><rect class="box w" x="380" y="118" width="120" height="44" rx="10"/><text class="tb" x="440" y="145" text-anchor="middle">executing</text></g>
+  <g data-k="done"><rect class="box g" x="580" y="50" width="120" height="44" rx="10"/><text class="tb" x="640" y="77" text-anchor="middle">done</text></g>
+  <g data-k="failed"><rect class="box r" x="580" y="190" width="120" height="44" rx="10"/><text class="tb" x="640" y="217" text-anchor="middle">failed</text></g>
+  <g data-k="rejected"><rect class="box m" x="200" y="20" width="120" height="44" rx="10"/><text class="tb" x="260" y="47" text-anchor="middle">rejected</text></g>
+  <g data-k="expired"><rect class="box m" x="200" y="230" width="120" height="44" rx="10"/><text class="tb" x="260" y="257" text-anchor="middle">expired</text></g>
+  <g data-k="t-approve"><path class="line g" d="M140 140 H200" marker-end="url(#arr-g)"/><text class="ts" x="170" y="132" text-anchor="middle">批准</text></g>
+  <g data-k="t-reject"><path class="line" d="M80 118 C80 60 150 42 200 42" marker-end="url(#arr)"/><text class="ts" x="96" y="72">拒绝</text></g>
+  <g data-k="t-expire"><path class="line" d="M80 162 C80 230 150 252 200 252" marker-end="url(#arr)"/><text class="ts" x="96" y="218">过期</text></g>
+  <g data-k="t-exec"><path class="line" d="M320 140 H380" marker-end="url(#arr)"/><text class="ts" x="350" y="132" text-anchor="middle">取出</text></g>
+  <g data-k="t-done"><path class="line g" d="M500 130 C540 110 550 80 580 72" marker-end="url(#arr-g)"/><text class="ts" x="520" y="92">已送达</text></g>
+  <g data-k="t-fail"><path class="line r" d="M500 150 C540 170 550 200 580 212" marker-end="url(#arr-r)"/><text class="ts" x="508" y="196">重试用尽</text></g>
+  <g data-k="t-retry"><path class="line b dash" d="M580 222 C430 230 300 205 270 162" marker-end="url(#arr-b)"/><text class="ts" x="420" y="246" text-anchor="middle">人再批准一次</text></g>
+  <g data-k="t-recover"><path class="line r dash" d="M440 118 C440 85 150 92 100 118" marker-end="url(#arr-r)"/><text class="ts" x="350" y="86" text-anchor="middle">启动恢复</text></g>
+</svg>
+</div>
+<ol class="anim-steps">
+  <li data-show="pending" data-hl="pending">分析得出一条回复草稿，策略判定需要审批，于是落库为 <code>pending</code>。它带一个有效期：过时的草稿宁可作废也别晚发。</li>
+  <li data-show="rejected t-reject expired t-expire" data-hl="t-reject t-expire rejected expired">两种终点：人拒绝（必须写理由——那是改进提示词最好的材料），或者超过有效期没人处理而过期。</li>
+  <li data-show="approved t-approve" data-hl="t-approve approved">人批准（可以先改写）。在<strong>同一个事务</strong>里：状态改成 <code>approved</code>，并在发件箱写一行"要发的消息"，主键是幂等键。</li>
+  <li data-show="executing t-exec" data-hl="t-exec executing">发送器从发件箱取出消息，先把状态改成 <code>executing</code>：表示"正在和外部世界打交道，结果未知"。</li>
+  <li data-show="done t-done" data-hl="t-done done">对方确认收到，状态改成 <code>done</code>，记下对方返回的消息 id。</li>
+  <li data-show="failed t-fail" data-hl="t-fail failed">网络或对方服务出错：指数退避重试；超过次数就停，标为 <code>failed</code>，把错误原因展示给人。</li>
+  <li data-show="t-retry" data-hl="t-retry failed approved">人看过原因后可以再批准一次。正文没改，幂等键就不变——如果其实上次已经送达，对方会去重。</li>
+  <li data-show="t-recover" data-hl="t-recover executing pending">进程在 <code>executing</code> 时崩溃：重启后不知道到底发没发出去。不自动重发，退回 <code>pending</code> 让人决定；人再批准时用的仍是同一个幂等键，不会发两遍。</li>
+</ol>
+</figure>
+
+<h2>3 · 动手试：批准两次会发两条吗？</h2>
+<p>下面是 P3 代码逻辑的一个浏览器内模拟。按顺序点按钮，或者故意乱点，看提案状态、发件箱和"对方实际收到几条"怎么变。试试这几个场景：连点两次批准；改写后批准；"响应丢失"后的重试；发送途中崩溃再重启。</p>
+<div class="widget" id="sim">
+<div class="w-title">审批与发送模拟器</div>
+<div class="sim-actions">
+  <button class="btn small primary" type="button" data-act="approve">批准</button>
+  <button class="btn small" type="button" data-act="edit">改写后批准</button>
+  <button class="btn small" type="button" data-act="reject">拒绝</button>
+  <button class="btn small primary" type="button" data-act="send">发送</button>
+  <button class="btn small" type="button" data-act="lose">发送（响应丢失）</button>
+  <button class="btn small" type="button" data-act="crash">发送（中途崩溃）</button>
+  <button class="btn small" type="button" data-act="recover">重启恢复</button>
+  <button class="btn small" type="button" data-act="reset">↺ 重置</button>
+</div>
+<div class="sim-grid">
+  <div class="sim-box"><b>提案状态</b><div data-status></div></div>
+  <div class="sim-box"><b>发件箱</b><div data-outbox></div></div>
+  <div class="sim-box"><b>对方实际收到</b><div class="big-num" data-delivered>0</div><div data-delivered-list></div></div>
+</div>
+<div class="sim-box" style="margin-top:12px"><b>日志</b><div class="sim-log" data-log></div></div>
+</div>
+
+<h2>4 · 练到的能力</h2>
+<table>
+<tr><th>能力</th><th>落在哪个文件</th><th>理论在哪</th></tr>
+<tr><td>提案模式与 L4 审批者</td><td><code>src/proposals.ts</code>、<code>src/cli.ts</code></td><td><a href="ch08-hitl-autonomy.html">第 8 章</a></td></tr>
+<tr><td>状态机、事务性发件箱、幂等键</td><td><code>src/proposals.ts</code>、<code>src/outbox.ts</code></td><td><a href="ch10-durable-execution.html">第 10 章</a></td></tr>
+<tr><td>崩溃恢复与"结果未知"的处理</td><td><code>recoverInterrupted</code></td><td><a href="ch10-durable-execution.html">第 10 章</a></td></tr>
+<tr><td>策略与护栏（敏感词、频率、静默时段）</td><td><code>src/policy.ts</code></td><td><a href="ch08-hitl-autonomy.html">第 8 章</a>、<a href="ch09-security.html">第 9 章</a></td></tr>
+</table>
+
+<h2>5 · 分步实现</h2>
+<div class="callout tip"><b>参考实现</b>
+<p>本项目的完整代码在课程仓库的 <code>agent-lab/</code> 目录：<code>src/store/</code>、<code>src/proposals.ts</code>、<code>src/policy.ts</code>、<code>src/outbox.ts</code>、<code>src/cli.ts</code> 与 <code>tests/approval.test.ts</code>。所有项目共用一个仓库、一套测试，说明见 <a href="agent-lab/README.md">agent-lab/README.md</a>。建议先自己写，卡住了再对照。</p></div>
+
+<h3>第 1 步：迁移 <code>src/store/migrations.ts</code></h3>
+<p>建表语句写在你这个项目自己的迁移清单里，按顺序执行，执行到第几个记在 SQLite 的 <code>user_version</code>。规则只有一条：<strong>只追加，不修改已经发布的迁移</strong>。P4 会在末尾追加第 2 个。下面是加完 P4 之后的完整文件，现在只需要写第 1 个：</p>
+<pre data-title="src/store/migrations.ts"><code class="lang-ts">
+// 迁移按顺序执行，已执行到第几个记在 SQLite 的 user_version 里。只追加，不修改已发布的迁移。
+export const migrations: string[] = [
+  // 1：提案、发件箱、事件日志（P3）
+  `
+  CREATE TABLE proposals (
+    id            TEXT PRIMARY KEY,
+    kind          TEXT NOT NULL,              -- reply：代发回复；profile_update：改人物档案（P4）
+    target        TEXT NOT NULL,              -- 发给谁 / 改谁的档案
+    body          TEXT NOT NULL,              -- 模型起草的内容
+    final_body    TEXT,                       -- 批准时的内容（可能被人改写过）
+    status        TEXT NOT NULL CHECK (status IN ('pending','approved','rejected','expired','executing','done','failed')),
+    confidence    REAL NOT NULL,
+    source_ref    TEXT NOT NULL,              -- 依据的工单 / 消息 id
+    auto_approved INTEGER NOT NULL DEFAULT 0,
+    reason        TEXT,                       -- 拒绝理由、策略判断
+    error         TEXT,
+    created_at    INTEGER NOT NULL,
+    updated_at    INTEGER NOT NULL,
+    expires_at    INTEGER NOT NULL
+  );
+  CREATE INDEX proposals_status ON proposals(status);
+  CREATE TABLE outbox (
+    idempotency_key TEXT PRIMARY KEY,         -- 提案 id + 正文的哈希：同一内容只会有一行
+    proposal_id     TEXT NOT NULL REFERENCES proposals(id),
+    target          TEXT NOT NULL,
+    body            TEXT NOT NULL,
+    status          TEXT NOT NULL CHECK (status IN ('queued','sent','failed')),
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    remote_id       TEXT,
+    last_error      TEXT,
+    created_at      INTEGER NOT NULL,
+    sent_at         INTEGER
+  );
+  CREATE TABLE events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    proposal_id TEXT NOT NULL,
+    type        TEXT NOT NULL,
+    detail      TEXT,
+    at          INTEGER NOT NULL
+  );
+  `,
+  // 2：长期记忆与人物档案（P4）
+  `
+  CREATE TABLE memories (
+    id                TEXT PRIMARY KEY,
+    subject           TEXT NOT NULL,          -- 关于谁 / 什么：一个人、一个项目，或 "me"
+    content           TEXT NOT NULL,          -- 一句话事实
+    source_message_id TEXT NOT NULL,          -- 出处，可追溯
+    importance        INTEGER NOT NULL CHECK (importance BETWEEN 1 AND 10),
+    origin            TEXT NOT NULL CHECK (origin IN ('auto', 'manual')),
+    created_at        INTEGER NOT NULL,       -- 我们什么时候记下的（系统时间）
+    last_accessed_at  INTEGER NOT NULL,       -- 最近一次被检索到
+    valid_from        INTEGER NOT NULL,       -- 这件事从什么时候起成立（事件时间）
+    valid_to          INTEGER,                -- 什么时候不再成立；NULL = 仍然有效
+    supersedes        TEXT REFERENCES memories(id)
+  );
+  CREATE INDEX memories_valid_subject ON memories(subject) WHERE valid_to IS NULL;
+  CREATE VIRTUAL TABLE memories_fts USING fts5(memory_id UNINDEXED, subject, content, tokenize = 'trigram');
+  CREATE TABLE profiles (
+    subject      TEXT PRIMARY KEY,
+    profile      TEXT NOT NULL,               -- 模型综合出的档案（JSON）
+    manual_notes TEXT NOT NULL DEFAULT '',    -- 人手写的备注，自动流程永不覆盖
+    updated_at   INTEGER NOT NULL
+  );
+  `,
+];
+</code></pre>
+<div class="callout note"><b>为什么状态用 CHECK 约束</b><p>状态拼错一个字母（<code>'aproved'</code>）是很难发现的 bug：那条记录从此不在任何查询里出现。数据库层的 CHECK 让它在写入时就报错。</p></div>
+
+<h3>第 2 步：打开数据库 <code>src/store/db.ts</code></h3>
+<p>WAL 模式让命令行和后台进程可以同时读写；<code>busy_timeout</code> 让写冲突时等一会儿而不是立刻失败；每个迁移在一个事务里执行，失败就整个回滚。</p>
+<pre data-title="src/store/db.ts"><code class="lang-ts">
+import { Database } from 'bun:sqlite';
+import { migrations } from './migrations';
+
+// WAL：CLI 和后台进程可以同时读写同一个库；busy_timeout：写冲突时等一会儿而不是立刻报错。
+export function openDb(path = 'agent-lab.db'): Database {
+  const db = new Database(path, { create: true, strict: true });
+  db.run('PRAGMA journal_mode = WAL');
+  db.run('PRAGMA busy_timeout = 5000');
+  db.run('PRAGMA foreign_keys = ON');
+  migrate(db);
+  return db;
+}
+
+function migrate(db: Database): void {
+  const { user_version: current } = db.query('PRAGMA user_version').get() as { user_version: number };
+  for (let v = current; v &lt; migrations.length; v++) {
+    db.transaction(() =&gt; {
+      db.run(migrations[v]!);
+      db.run(`PRAGMA user_version = ${v + 1}`);
+    })();
+  }
+}
+</code></pre>
+
+<h3>第 3 步：提案与状态机 <code>src/proposals.ts</code></h3>
+<p>整个项目最重要的三个函数：</p>
+<ul>
+  <li><code>transition()</code>：状态迁移的唯一入口。它不是"先读状态、判断、再写"，而是一条 <code>UPDATE … WHERE id = ? AND status IN (允许的起点)</code>，用影响的行数判断成没成。两个进程同时批准同一条，数据库保证只有一个能成功。</li>
+  <li><code>approve()</code>：在一个事务里改状态并写发件箱。幂等键是"提案 id + 正文"的哈希：改写后的正文是另一条消息，得到另一个键；原文重发得到同一个键。</li>
+  <li><code>recoverInterrupted()</code>：启动时把卡在 <code>executing</code> 的提案退回 <code>pending</code>。</li>
+</ul>
+<pre data-title="src/proposals.ts"><code class="lang-ts">
+import type { Database } from 'bun:sqlite';
+import { createHash, randomUUID } from 'node:crypto';
+
+export type Status = 'pending' | 'approved' | 'rejected' | 'expired' | 'executing' | 'done' | 'failed';
+export type Proposal = {
+  id: string;
+  kind: string;
+  target: string;
+  body: string;
+  final_body: string | null;
+  status: Status;
+  confidence: number;
+  source_ref: string;
+  auto_approved: number;
+  reason: string | null;
+  error: string | null;
+  created_at: number;
+  updated_at: number;
+  expires_at: number;
+};
+
+export class ConflictError extends Error {}
+
+const DAY = 24 * 3600 * 1000;
+
+export function createProposal(
+  db: Database,
+  p: { kind: string; target: string; body: string; confidence: number; sourceRef: string; ttlMs?: number },
+  now = Date.now(),
+): Proposal {
+  const id = randomUUID().slice(0, 8);
+  db.query(
+    `INSERT INTO proposals (id, kind, target, body, status, confidence, source_ref, created_at, updated_at, expires_at)
+     VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)`,
+  ).run(id, p.kind, p.target, p.body, p.confidence, p.sourceRef, now, now, now + (p.ttlMs ?? DAY));
+  logEvent(db, id, 'created', null, now);
+  return getProposal(db, id)!;
+}
+
+export const getProposal = (db: Database, id: string) =&gt;
+  db.query('SELECT * FROM proposals WHERE id = ?').get(id) as Proposal | null;
+
+export const listProposals = (db: Database, status?: Status) =&gt;
+  (status
+    ? db.query('SELECT * FROM proposals WHERE status = ? ORDER BY created_at').all(status)
+    : db.query('SELECT * FROM proposals ORDER BY created_at').all()) as Proposal[];
+
+export const logEvent = (db: Database, proposalId: string, type: string, detail: string | null, now = Date.now()) =&gt;
+  db.query('INSERT INTO events (proposal_id, type, detail, at) VALUES (?, ?, ?, ?)').run(proposalId, type, detail, now);
+
+// 状态迁移只走这一个函数：UPDATE … WHERE status IN (允许的起点)，靠影响行数判断成没成。
+// 两个进程同时批准同一条，只有一个能把 pending 改掉，另一个拿到 ConflictError。
+export function transition(
+  db: Database,
+  id: string,
+  from: Status[],
+  to: Status,
+  fields: { final_body?: string; reason?: string | null; error?: string | null; auto_approved?: number } = {},
+  now = Date.now(),
+): void {
+  const sets = ['status = ?', 'updated_at = ?'];
+  const args: (string | number | null)[] = [to, now];
+  for (const [k, v] of Object.entries(fields)) {
+    sets.push(`${k} = ?`);
+    args.push(v as string | number | null);
+  }
+  const placeholders = from.map(() =&gt; '?').join(', ');
+  const res = db.query(`UPDATE proposals SET ${sets.join(', ')} WHERE id = ? AND status IN (${placeholders})`).run(...args, id, ...from);
+  if (res.changes !== 1) {
+    const current = getProposal(db, id);
+    throw new ConflictError(current ? `提案 ${id} 当前是 ${current.status}，不能改成 ${to}` : `没有提案 ${id}`);
+  }
+  logEvent(db, id, to, fields.reason ?? fields.error ?? null, now);
+}
+
+export const idempotencyKey = (proposalId: string, body: string) =&gt;
+  createHash('sha256').update(`${proposalId}\n${body}`).digest('hex').slice(0, 32);
+
+// 批准：改状态 + 写发件箱放在同一个事务里（transactional outbox）。要么都成，要么都没发生。
+export function approve(db: Database, id: string, opts: { editedBody?: string; auto?: boolean } = {}, now = Date.now()): void {
+  db.transaction(() =&gt; {
+    const p = getProposal(db, id);
+    if (!p) throw new ConflictError(`没有提案 ${id}`);
+    const body = opts.editedBody ?? p.body;
+    // failed 的可以再批准一次：同样的正文得到同样的幂等键，对方服务会去重
+    transition(db, id, ['pending', 'failed'], 'approved', { final_body: body, auto_approved: opts.auto ? 1 : 0, error: null }, now);
+    if (p.kind !== 'reply') return; // 非对外发送的提案（如 P4 的档案修改）由各自的执行器处理
+    const key = idempotencyKey(id, body);
+    const existing = db.query('SELECT status FROM outbox WHERE idempotency_key = ?').get(key) as { status: string } | null;
+    if (existing?.status === 'sent') {
+      transition(db, id, ['approved'], 'done', { reason: '这段内容之前已经发出过' }, now);
+      return;
+    }
+    db.query(
+      `INSERT INTO outbox (idempotency_key, proposal_id, target, body, status, created_at) VALUES (?, ?, ?, ?, 'queued', ?)
+       ON CONFLICT(idempotency_key) DO UPDATE SET status = 'queued', last_error = NULL WHERE outbox.status = 'failed'`,
+    ).run(key, id, p.target, body, now);
+  })();
+}
+
+export const reject = (db: Database, id: string, reason: string, now = Date.now()) =&gt;
+  transition(db, id, ['pending', 'failed'], 'rejected', { reason }, now);
+
+// 过期：待审批太久的草稿多半已经不合时宜，宁可作废也不要晚发。
+export function expireStale(db: Database, now = Date.now()): number {
+  const stale = db.query("SELECT id FROM proposals WHERE status = 'pending' AND expires_at &lt; ?").all(now) as { id: string }[];
+  for (const { id } of stale) transition(db, id, ['pending'], 'expired', { reason: '超过有效期未处理' }, now);
+  return stale.length;
+}
+
+// 启动恢复：上次进程在"发送中"退出，不知道到底发没发出去。不自动重发，退回待审批让人决定；
+// 再批准时用的是同一个幂等键，对方若已收到会去重，不会发两遍。
+export function recoverInterrupted(db: Database, now = Date.now()): number {
+  const stuck = db.query("SELECT id FROM proposals WHERE status = 'executing'").all() as { id: string }[];
+  db.transaction(() =&gt; {
+    for (const { id } of stuck) {
+      transition(db, id, ['executing'], 'pending', { error: '上次发送时进程中断，不确定是否已发出；可直接重新批准，不会重复发送' }, now);
+      db.query("UPDATE outbox SET status = 'failed', last_error = '进程中断' WHERE proposal_id = ? AND status = 'queued'").run(id);
+    }
+  })();
+  return stuck.length;
+}
+</code></pre>
+
+<h3>第 4 步：发件箱与发送器 <code>src/outbox.ts</code></h3>
+<p>发送器只做一件事：把排队的消息送出去，处理重试。注意每次成功都在一个事务里同时更新发件箱和提案状态。</p>
+<pre data-title="src/outbox.ts"><code class="lang-ts">
+import type { Database } from 'bun:sqlite';
+import { transition } from './proposals';
+
+// 外部发送接口的抽象。真实实现可以是邮件、IM、工单系统；要求它支持幂等键（或自己按幂等键去重）。
+export interface Sender {
+  send(msg: { idempotencyKey: string; target: string; body: string }): Promise&lt;{ remoteId: string }&gt;;
+}
+
+type Row = { idempotency_key: string; proposal_id: string; target: string; body: string; attempts: number };
+
+// 把发件箱里排队的消息发出去。每条：approved → executing → done；失败重试，超过次数标 failed 交还给人。
+export async function drainOutbox(db: Database, sender: Sender, opts: { maxAttempts?: number; now?: () =&gt; number } = {}) {
+  const maxAttempts = opts.maxAttempts ?? 3;
+  const now = opts.now ?? Date.now;
+  const rows = db.query("SELECT * FROM outbox WHERE status = 'queued' ORDER BY created_at").all() as Row[];
+  const report = { sent: 0, failed: 0 };
+  for (const row of rows) {
+    transition(db, row.proposal_id, ['approved'], 'executing', {}, now());
+    for (let attempt = row.attempts + 1; ; attempt++) {
+      try {
+        const { remoteId } = await sender.send({ idempotencyKey: row.idempotency_key, target: row.target, body: row.body });
+        db.transaction(() =&gt; {
+          db.query("UPDATE outbox SET status = 'sent', attempts = ?, remote_id = ?, sent_at = ? WHERE idempotency_key = ?").run(
+            attempt,
+            remoteId,
+            now(),
+            row.idempotency_key,
+          );
+          transition(db, row.proposal_id, ['executing'], 'done', {}, now());
+        })();
+        report.sent++;
+        break;
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        db.query('UPDATE outbox SET attempts = ?, last_error = ? WHERE idempotency_key = ?').run(attempt, message, row.idempotency_key);
+        if (attempt &gt;= maxAttempts) {
+          db.transaction(() =&gt; {
+            db.query("UPDATE outbox SET status = 'failed' WHERE idempotency_key = ?").run(row.idempotency_key);
+            transition(db, row.proposal_id, ['executing'], 'failed', { error: `发送失败 ${attempt} 次：${message}` }, now());
+          })();
+          report.failed++;
+          break;
+        }
+        await Bun.sleep(200 * 2 ** (attempt - 1)); // 指数退避
+      }
+    }
+  }
+  return report;
+}
+</code></pre>
+
+<h3>第 5 步：模拟外部服务与真实发送器</h3>
+<p>测试用的 <code>FakeMessageApi</code> 实现了"按幂等键去重"，还能模拟两种最难缠的故障：前几次直接失败；以及"其实发出去了，但响应在路上丢了"。后者是分布式系统里最经典的陷阱：你以为失败了，重试一次，对方就收到两条。</p>
+<pre data-title="src/fake-message-api.ts"><code class="lang-ts">
+import type { Sender } from './outbox';
+
+// 模拟一个支持幂等键的外部消息服务：同一个键只投递一次，重复请求返回第一次的结果。
+// 还能模拟两种故障：前 N 次直接失败；"其实发出去了，但响应在路上丢了"。
+export class FakeMessageApi implements Sender {
+  readonly delivered: { target: string; body: string; remoteId: string }[] = [];
+  private readonly byKey = new Map&lt;string, string&gt;();
+  failNext = 0;
+  loseResponseNext = 0;
+
+  async send(msg: { idempotencyKey: string; target: string; body: string }) {
+    if (this.failNext &gt; 0) {
+      this.failNext--;
+      throw new Error('503 Service Unavailable');
+    }
+    let remoteId = this.byKey.get(msg.idempotencyKey);
+    if (!remoteId) {
+      remoteId = `m${this.delivered.length + 1}`;
+      this.byKey.set(msg.idempotencyKey, remoteId);
+      this.delivered.push({ target: msg.target, body: msg.body, remoteId });
+    }
+    if (this.loseResponseNext &gt; 0) {
+      this.loseResponseNext--;
+      throw new Error('连接超时（对方其实已经收到）');
+    }
+    return { remoteId };
+  }
+}
+</code></pre>
+<p>命令行默认用 <code>JsonlSender</code> 把消息写进本地文件；设置了 <code>SEND_WEBHOOK_URL</code> 就改用 <code>WebhookSender</code>，幂等键放在 <code>Idempotency-Key</code> 请求头里——这是支付等行业通行的做法，接收方按这个头去重。</p>
+<pre data-title="src/senders.ts"><code class="lang-ts">
+import { appendFileSync, existsSync, readFileSync } from 'node:fs';
+import type { Sender } from './outbox';
+
+// 本地演示用：把"发出去的消息"追加到一个 JSONL 文件，按幂等键去重。
+export class JsonlSender implements Sender {
+  constructor(private readonly path = 'sent.jsonl') {}
+
+  async send(msg: { idempotencyKey: string; target: string; body: string }) {
+    const lines = existsSync(this.path) ? readFileSync(this.path, 'utf8').split('\n').filter(Boolean) : [];
+    const found = lines.map((l) =&gt; JSON.parse(l) as { key: string; remoteId: string }).find((r) =&gt; r.key === msg.idempotencyKey);
+    if (found) return { remoteId: found.remoteId };
+    const remoteId = `local-${lines.length + 1}`;
+    appendFileSync(this.path, `${JSON.stringify({ key: msg.idempotencyKey, remoteId, target: msg.target, body: msg.body, at: new Date().toISOString() })}\n`);
+    return { remoteId };
+  }
+}
+
+// 接真实服务：POST 到一个 webhook（自动化平台、内部网关等），幂等键放在 Idempotency-Key 头里。
+export class WebhookSender implements Sender {
+  constructor(private readonly url: string) {}
+
+  async send(msg: { idempotencyKey: string; target: string; body: string }) {
+    const res = await fetch(this.url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'idempotency-key': msg.idempotencyKey },
+      body: JSON.stringify({ target: msg.target, text: msg.body }),
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!res.ok) throw new Error(`webhook 返回 ${res.status}`);
+    const data = (await res.json().catch(() =&gt; ({}))) as { id?: string };
+    return { remoteId: data.id ?? msg.idempotencyKey };
+  }
+}
+</code></pre>
+
+<h3>第 6 步：策略层 <code>src/policy.ts</code></h3>
+<p>策略决定一条新提案是"等人批准"还是"可以自动批准"。默认值是最保守的：所有对象都要审批。自动批准必须按对象显式开启，并且每条护栏都要通过；任何一条不过，就退回人工审批，同时把原因写下来。</p>
+<pre data-title="src/policy.ts"><code class="lang-ts">
+import type { Database } from 'bun:sqlite';
+
+// 策略层：决定一条新提案是等人批准（suggest），还是可以自动批准（auto）。
+// 默认一切 suggest；auto 必须按对象显式开启，而且每条护栏都要通过。
+export type Mode = 'off' | 'suggest' | 'auto';
+export type Policy = {
+  modes: Record&lt;string, Mode&gt;; // 按发送对象设置；没设置的用 defaultMode
+  defaultMode: Mode;
+  minConfidence: number;
+  maxAutoPerHour: number;
+  denyKeywords: string[];
+  quietHours: { start: number; end: number } | null; // 本地小时，支持跨午夜，如 { start: 22, end: 8 }
+};
+
+export const defaultPolicy: Policy = {
+  modes: {},
+  defaultMode: 'suggest',
+  minConfidence: 0.85,
+  maxAutoPerHour: 3,
+  denyKeywords: ['合同', '报价', '付款', '薪资', '密码', '离职', '法务'],
+  quietHours: { start: 22, end: 8 },
+};
+
+export type Decision = { action: 'drop' | 'pending' | 'auto'; reasons: string[] };
+
+export function decide(
+  db: Database,
+  policy: Policy,
+  p: { target: string; body: string; confidence: number; sourceText: string },
+  now = new Date(),
+): Decision {
+  const mode = policy.modes[p.target] ?? policy.defaultMode;
+  if (mode === 'off') return { action: 'drop', reasons: ['该对象已关闭'] };
+  if (mode === 'suggest') return { action: 'pending', reasons: ['该对象需要人工审批'] };
+
+  const reasons: string[] = [];
+  if (p.confidence &lt; policy.minConfidence) reasons.push(`置信度 ${p.confidence} 低于 ${policy.minConfidence}`);
+  const hit = policy.denyKeywords.find((k) =&gt; p.body.includes(k) || p.sourceText.includes(k));
+  if (hit) reasons.push(`命中敏感词「${hit}」`);
+  const { n } = db
+    .query('SELECT COUNT(*) AS n FROM proposals WHERE target = ? AND auto_approved = 1 AND created_at &gt; ?')
+    .get(p.target, now.getTime() - 3600_000) as { n: number };
+  if (n &gt;= policy.maxAutoPerHour) reasons.push(`近 1 小时已自动发送 ${n} 条`);
+  if (policy.quietHours &amp;&amp; inQuietHours(now.getHours(), policy.quietHours)) reasons.push('静默时段');
+  return reasons.length ? { action: 'pending', reasons } : { action: 'auto', reasons: ['全部护栏通过'] };
+}
+
+const inQuietHours = (h: number, q: { start: number; end: number }) =&gt; (q.start &lt;= q.end ? h &gt;= q.start &amp;&amp; h &lt; q.end : h &gt;= q.start || h &lt; q.end);
+</code></pre>
+<div class="callout warn"><b>护栏不是安全边界</b><p>敏感词、置信度、频率上限能挡住"明显不该自动发"的情况，但挡不住精心构造的提示注入。真正的边界是：自动批准只对低风险的对象和动作开放，并且发出后能撤回、能追责（第 8、9 章）。</p></div>
+
+<h3>第 7 步：命令行 <code>src/cli.ts</code></h3>
+<p><code>triage</code> 命令把 P2 的结果接进来：需要追问的生成追问提案，需要回复的生成回复提案，交给策略层决定是否自动批准。每次启动先做崩溃恢复。</p>
+<pre data-title="src/cli.ts"><code class="lang-ts">
+import { parseArgs } from 'node:util';
+import { OpenAICompatibleModel } from './models/openai-compatible';
+import { drainOutbox } from './outbox';
+import { decide, defaultPolicy } from './policy';
+import { approve, ConflictError, createProposal, expireStale, getProposal, listProposals, recoverInterrupted, reject, type Status } from './proposals';
+import { JsonlSender, WebhookSender } from './senders';
+import { openDb } from './store/db';
+import type { Ticket } from './triage/schema';
+import { triageBatch } from './triage/pipeline';
+
+const HELP = `用法：bun run src/cli.ts &lt;命令&gt;
+  triage &lt;tickets.json&gt;          分诊工单，需要回复的生成提案（按策略决定是否自动批准）
+  list [--status pending]        列出提案
+  show &lt;id&gt;                      查看一条提案
+  approve &lt;id&gt; [--edit 新正文]    批准（可改写后批准）
+  reject &lt;id&gt; --reason 理由       拒绝
+  send                           把发件箱里排队的消息发出去
+  expire                         作废过期的待审批提案`;
+
+const { positionals, values } = parseArgs({
+  allowPositionals: true,
+  options: { status: { type: 'string' }, edit: { type: 'string' }, reason: { type: 'string' } },
+});
+const [command, arg] = positionals;
+const db = openDb(process.env.AGENT_LAB_DB ?? 'agent-lab.db');
+const recovered = recoverInterrupted(db);
+if (recovered) console.log(`⚠ 有 ${recovered} 条提案在上次发送时中断，已退回待审批`);
+const sender = process.env.SEND_WEBHOOK_URL ? new WebhookSender(process.env.SEND_WEBHOOK_URL) : new JsonlSender();
+
+try {
+  switch (command) {
+    case 'triage': {
+      if (!arg) throw new Error('缺少 tickets.json');
+      const tickets = (await Bun.file(arg).json()) as Ticket[];
+      for (const r of await triageBatch(OpenAICompatibleModel.fromEnv(), tickets)) {
+        if (!r.ok) {
+          console.log(`✗ ${r.ticket.id} 分析失败：${r.error}`);
+          continue;
+        }
+        const body = r.route.action === 'clarify' ? r.analysis.missing_info.join('\n') : r.analysis.reply_draft;
+        if (!body || r.route.action === 'archive') continue;
+        const d = decide(db, defaultPolicy, { target: r.ticket.from, body, confidence: r.analysis.confidence, sourceText: r.ticket.body });
+        if (d.action === 'drop') continue;
+        const p = createProposal(db, { kind: 'reply', target: r.ticket.from, body, confidence: r.analysis.confidence, sourceRef: r.ticket.id });
+        if (d.action === 'auto') approve(db, p.id, { auto: true });
+        console.log(`${d.action === 'auto' ? '⚡ 自动批准' : '• 待审批'} ${p.id} → ${p.target}（${d.reasons.join('；')}）`);
+      }
+      break;
+    }
+    case 'list':
+      for (const p of listProposals(db, values.status as Status | undefined)) {
+        console.log(`${p.id}  ${p.status.padEnd(9)} ${p.target}  ${(p.final_body ?? p.body).slice(0, 40).replace(/\n/g, ' ')}`);
+      }
+      break;
+    case 'show':
+      console.log(getProposal(db, arg ?? '') ?? '没有这条提案');
+      break;
+    case 'approve':
+      approve(db, arg ?? '', { editedBody: values.edit });
+      console.log(`已批准 ${arg}，执行 send 发出`);
+      break;
+    case 'reject':
+      if (!values.reason) throw new Error('拒绝时请写 --reason，它是改进提示词最好的材料');
+      reject(db, arg ?? '', values.reason);
+      console.log(`已拒绝 ${arg}`);
+      break;
+    case 'send':
+      console.log(await drainOutbox(db, sender));
+      break;
+    case 'expire':
+      console.log(`作废 ${expireStale(db)} 条`);
+      break;
+    default:
+      console.log(HELP);
+  }
+} catch (err) {
+  console.error(err instanceof ConflictError ? `✗ ${err.message}` : err);
+  process.exitCode = 1;
+} finally {
+  db.close();
+}
+</code></pre>
+
+<h2>6 · 测试</h2>
+<pre data-title="tests/approval.test.ts"><code class="lang-ts">
+import { describe, expect, test } from 'bun:test';
+import { FakeMessageApi } from '../src/fake-message-api';
+import { drainOutbox } from '../src/outbox';
+import { decide, defaultPolicy } from '../src/policy';
+import { approve, ConflictError, createProposal, getProposal, recoverInterrupted, reject, transition } from '../src/proposals';
+import { openDb } from '../src/store/db';
+
+const setup = () =&gt; {
+  const db = openDb(':memory:');
+  const p = createProposal(db, { kind: 'reply', target: '同事甲', body: '收到，下午给你。', confidence: 0.9, sourceRef: 't1' });
+  return { db, p, api: new FakeMessageApi() };
+};
+
+describe('审批与发送', () =&gt; {
+  test('同一条提案批准两次，只发出一条', async () =&gt; {
+    const { db, p, api } = setup();
+    approve(db, p.id);
+    expect(() =&gt; approve(db, p.id)).toThrow(ConflictError);
+    await drainOutbox(db, api);
+    await drainOutbox(db, api);
+    expect(api.delivered.length).toBe(1);
+    expect(getProposal(db, p.id)!.status).toBe('done');
+  });
+
+  test('改写后批准，发出的是改写后的正文', async () =&gt; {
+    const { db, p, api } = setup();
+    approve(db, p.id, { editedBody: '收到，3 点前给你。' });
+    await drainOutbox(db, api);
+    expect(api.delivered[0]!.body).toBe('收到，3 点前给你。');
+  });
+
+  test('偶发失败会重试，重试成功只算一条', async () =&gt; {
+    const { db, p, api } = setup();
+    api.failNext = 2;
+    approve(db, p.id);
+    const r = await drainOutbox(db, api, { maxAttempts: 3 });
+    expect(r).toEqual({ sent: 1, failed: 0 });
+    expect(api.delivered.length).toBe(1);
+  });
+
+  test('"发出去了但响应丢了"：重试靠幂等键去重，对方只收到一条', async () =&gt; {
+    const { db, p, api } = setup();
+    api.loseResponseNext = 1;
+    approve(db, p.id);
+    await drainOutbox(db, api);
+    expect(api.delivered.length).toBe(1);
+    expect(getProposal(db, p.id)!.status).toBe('done');
+  });
+
+  test('重试用尽标为 failed，人再批准一次可以继续', async () =&gt; {
+    const { db, p, api } = setup();
+    api.failNext = 5;
+    approve(db, p.id);
+    expect(await drainOutbox(db, api, { maxAttempts: 2 })).toEqual({ sent: 0, failed: 1 });
+    expect(getProposal(db, p.id)!.status).toBe('failed');
+    api.failNext = 0;
+    approve(db, p.id);
+    await drainOutbox(db, api);
+    expect(api.delivered.length).toBe(1);
+  });
+
+  test('进程在发送中崩溃：恢复后退回待审批，再批准不会重复发送', async () =&gt; {
+    const { db, p, api } = setup();
+    approve(db, p.id);
+    // 模拟：对方已经收到，但我们还没来得及把状态写成 done 进程就退出了
+    await api.send({ idempotencyKey: (db.query('SELECT idempotency_key k FROM outbox').get() as { k: string }).k, target: p.target, body: p.body });
+    transition(db, p.id, ['approved'], 'executing');
+    expect(recoverInterrupted(db)).toBe(1);
+    expect(getProposal(db, p.id)!.status).toBe('pending');
+    approve(db, p.id);
+    await drainOutbox(db, api);
+    expect(api.delivered.length).toBe(1);
+  });
+
+  test('拒绝后不能再批准', () =&gt; {
+    const { db, p } = setup();
+    reject(db, p.id, '语气太随意');
+    expect(() =&gt; approve(db, p.id)).toThrow(ConflictError);
+  });
+});
+
+describe('策略', () =&gt; {
+  const at10 = new Date('2026-11-25T10:00:00');
+  const auto = { ...defaultPolicy, modes: { 同事甲: 'auto' as const } };
+
+  test('默认需要审批，哪怕置信度很高', () =&gt; {
+    const { db } = setup();
+    expect(decide(db, defaultPolicy, { target: '同事乙', body: '好的', confidence: 0.99, sourceText: '' }, at10).action).toBe('pending');
+  });
+
+  test('auto 对象命中敏感词时退回人工审批', () =&gt; {
+    const { db } = setup();
+    const d = decide(db, auto, { target: '同事甲', body: '好的', confidence: 0.95, sourceText: '合同今天能签吗' }, at10);
+    expect(d.action).toBe('pending');
+    expect(d.reasons.join()).toContain('合同');
+  });
+
+  test('auto 对象超过每小时上限后退回人工审批', () =&gt; {
+    const { db } = setup();
+    for (let i = 0; i &lt; 3; i++) {
+      const p = createProposal(db, { kind: 'reply', target: '同事甲', body: '收到', confidence: 0.95, sourceRef: `s${i}` }, at10.getTime());
+      approve(db, p.id, { auto: true }, at10.getTime());
+    }
+    expect(decide(db, auto, { target: '同事甲', body: '收到', confidence: 0.95, sourceText: '' }, at10).action).toBe('pending');
+  });
+});
+</code></pre>
+<table>
+<tr><th>测试</th><th>拦的是</th></tr>
+<tr><td>批准两次只发一条</td><td>状态检查缺失或幂等键随机生成，导致重复发送</td></tr>
+<tr><td>改写后批准</td><td>发出去的是模型的原稿，而不是人改过的版本</td></tr>
+<tr><td>偶发失败会重试</td><td>一次网络抖动就让提案失败</td></tr>
+<tr><td>响应丢失后重试</td><td>"其实已送达"的消息因为重试被发了两遍</td></tr>
+<tr><td>重试用尽后可再批准</td><td>失败的提案卡死，人无法重新处理</td></tr>
+<tr><td>崩溃恢复</td><td>重启后自动重发"可能已经发过"的消息，或者提案永远卡在 executing</td></tr>
+<tr><td>拒绝后不能批准</td><td>状态机允许了不该有的箭头</td></tr>
+<tr><td>默认需要审批 / 敏感词 / 频率上限</td><td>策略在没有显式授权时自动放行；护栏被绕过</td></tr>
+</table>
+
+<div class="quiz" data-answer="2">
+<p class="q">为什么"改状态为 approved"和"写入发件箱"必须放在同一个数据库事务里？</p>
+<ol>
+  <li>为了让代码更短</li>
+  <li>否则进程可能在两步之间崩溃：状态显示已批准，但要发的消息没有记下来（或者反过来），系统进入不一致的状态</li>
+  <li>因为 SQLite 不支持多条语句</li>
+  <li>为了让发送更快</li>
+</ol>
+<div class="explain">这就是事务性发件箱模式要解决的问题：业务状态的变化和"要通知外部"这件事必须原子地一起成立。发件箱之后的投递是"至少一次"，所以接收方需要按幂等键去重——两半合起来，才得到"效果上恰好一次"。</div>
+</div>
+
+<h2>7 · 验收标准</h2>
+<ul class="checklist">
+  <li><code>bun test</code> 全部通过</li>
+  <li>用真实模型跑 <code>bun run cli triage tickets.json</code>，生成的提案状态都是 pending（默认策略）</li>
+  <li>改写后批准、发送，<code>sent.jsonl</code> 里是改写后的正文，且只有一行</li>
+  <li>手动把一条提案改成 executing 再运行任意命令，能看到恢复提示，提案回到 pending</li>
+  <li>能画出状态机，并说清每条箭头由谁、在什么条件下触发</li>
+</ul>
+
+<h2>8 · 进阶挑战</h2>
+<ol>
+  <li><strong>撤回</strong>：给已发出的消息加一个 24 小时内可撤回的动作（需要发送接口支持按 remote_id 撤回），撤回本身也是一条要记录的事件。</li>
+  <li><strong>后台发送器</strong>：写一个常驻进程，每隔几秒 drain 一次发件箱，并处理 SIGTERM——退出前等正在发的那条完成。</li>
+  <li><strong>放权建议</strong>：统计某个对象最近 30 条提案的"原样批准率"，超过阈值时生成一条"要不要对他开启自动批准"的设置提案——它本身也要审批。</li>
+  <li><strong>草稿被取代</strong>：同一张工单有了新消息、生成新草稿时，旧的 pending 提案自动作废。</li>
+  <li><strong>审批卡片</strong>：把审批入口从命令行换成一个本地网页或你常用的聊天工具的交互卡片，后端仍然只调用 <code>approve()</code>、<code>reject()</code>。</li>
+</ol>
+
+<h2>9 · 常见坑</h2>
+<ul>
+  <li><strong>先 SELECT 判断、再 UPDATE</strong>：两个请求同时读到 pending，都"批准"成功。状态判断必须写在 UPDATE 的 WHERE 里。</li>
+  <li><strong>在事务里调用外部接口</strong>：网络请求可能很慢，会长时间锁住数据库。事务里只做本地读写，外部调用放在事务之外。</li>
+  <li><strong>幂等键用随机 UUID</strong>：每次重试都是新键，对方无法去重。键必须由"这条消息是什么"决定。</li>
+  <li><strong>崩溃后自动重发</strong>：只有当你确定对方支持幂等键时才安全。不确定时，交给人决定。</li>
+  <li><strong>拒绝不写理由</strong>：拒绝理由是 P4 反思、P6 评测最宝贵的数据，CLI 里强制要求填写。</li>
+</ul>
+
+<div class="takeaways"><b>本项目要点</b>
+<ul>
+  <li>一切对外动作皆提案；"自动"只是提案被策略自动批准，走的是同一条路径。</li>
+  <li>状态迁移只用一个函数，判断写在 UPDATE 的 WHERE 里，靠影响行数判断成败。</li>
+  <li>事务性发件箱 + 幂等键 = 效果上恰好一次。</li>
+  <li>结果未知（发送中崩溃）时不自动重发，交给人；同一个幂等键保证人再批准也不会重复。</li>
+  <li>默认人工审批；自动批准要显式开启、通过全部护栏，并记下判断理由。</li>
+</ul></div>
+
+<h2>参考资料</h2>
+<ul class="refs">
+  <li><a href="https://microservices.io/patterns/data/transactional-outbox.html" target="_blank" rel="noopener">Pattern: Transactional outbox</a> <span class="src">microservices.io · 业务状态与待发消息原子写入、至少一次投递</span></li>
+  <li><a href="https://docs.stripe.com/api/idempotent_requests" target="_blank" rel="noopener">Idempotent requests</a> <span class="src">Stripe · Idempotency-Key 请求头，重试返回首次结果</span></li>
+  <li><a href="https://arxiv.org/abs/2506.12469" target="_blank" rel="noopener">Levels of Autonomy for AI Agents</a> <span class="src">Feng, McDonald, Zhang · 2025 · L4 审批者：只批有后果的动作</span></li>
+  <li><a href="https://ai.meta.com/blog/practical-ai-agent-security/" target="_blank" rel="noopener">Agents Rule of Two</a> <span class="src">Meta · 2025-10-31 · 发送前经人批准草稿的邮件助理示例</span></li>
+  <li><a href="https://openai.github.io/openai-agents-js/guides/human-in-the-loop/" target="_blank" rel="noopener">Human-in-the-loop（OpenAI Agents SDK）</a> <span class="src">工具级审批、中断与恢复的另一种实现</span></li>
+  <li><a href="https://bun.sh/docs/api/sqlite" target="_blank" rel="noopener">bun:sqlite</a> <span class="src">Bun · 事务、预编译语句、changes</span></li>
+</ul>
+</article>
+<script>
+window.addEventListener('DOMContentLoaded', () => {
+  const box = document.getElementById('sim');
+  const $ = (s) => box.querySelector(s);
+  const ORIGINAL = '收到，下午给你。';
+  const EDITED = '收到，3 点前给你。';
+  let s;
+  const hash = (text) => {
+    let h = 2166136261;
+    for (const ch of text) h = Math.imul(h ^ ch.codePointAt(0), 16777619) >>> 0;
+    return h.toString(16).padStart(8, '0');
+  };
+  const reset = () => {
+    s = { status: 'pending', finalBody: null, outbox: [], remote: new Map(), delivered: [], log: [] };
+    log('创建提案 p1：「' + ORIGINAL + '」→ pending');
+    render();
+  };
+  const log = (text, cls = '') => s.log.push([text, cls]);
+  const keyOf = (body) => hash('p1\n' + body);
+  const approve = (body) => {
+    if (!['pending', 'failed'].includes(s.status)) {
+      log(`✗ 拒绝：提案当前是 ${s.status}，不能批准（UPDATE 影响 0 行）`, 'bad');
+      return;
+    }
+    s.status = 'approved';
+    s.finalBody = body;
+    const key = keyOf(body);
+    const row = s.outbox.find((r) => r.key === key);
+    if (row && row.status === 'sent') {
+      s.status = 'done';
+      log(`批准；幂等键 ${key} 之前已送达 → 直接 done`, 'good');
+    } else if (row) {
+      row.status = 'queued';
+      log(`批准；幂等键 ${key} 已存在且失败过 → 重新排队（同一个键）`);
+    } else {
+      s.outbox.push({ key, body, status: 'queued' });
+      log(`批准（同一事务写入发件箱），幂等键 ${key}`);
+    }
+  };
+  const remoteSend = (row) => {
+    let id = s.remote.get(row.key);
+    if (id) {
+      log(`对方：幂等键 ${row.key} 已处理过，返回原结果 ${id}，不重复投递`, 'good');
+      return id;
+    }
+    id = 'm' + (s.delivered.length + 1);
+    s.remote.set(row.key, id);
+    s.delivered.push(row.body);
+    log(`对方：投递成功 ${id}`);
+    return id;
+  };
+  const send = (mode) => {
+    const rows = s.outbox.filter((r) => r.status === 'queued');
+    if (!rows.length) {
+      log('发件箱里没有排队的消息');
+      return;
+    }
+    for (const row of rows) {
+      s.status = 'executing';
+      log('取出消息 → executing');
+      if (mode === 'crash') {
+        remoteSend(row);
+        log('💥 进程在写回结果前崩溃：提案停在 executing', 'bad');
+        return;
+      }
+      if (mode === 'lose') {
+        remoteSend(row);
+        log('✗ 等待响应超时（其实对方已收到），退避后重试…', 'bad');
+      }
+      const id = remoteSend(row);
+      row.status = 'sent';
+      s.status = 'done';
+      log(`收到确认 ${id} → done`, 'good');
+    }
+  };
+  const recover = () => {
+    if (s.status !== 'executing') {
+      log('没有卡在 executing 的提案');
+      return;
+    }
+    s.status = 'pending';
+    s.outbox.filter((r) => r.status === 'queued').forEach((r) => (r.status = 'failed'));
+    log('启动恢复：不确定是否已发出 → 退回 pending，等人决定（发件箱该行标 failed）。原文再批准不会重复；改写后再批准是一条新消息。');
+  };
+  const actions = {
+    approve: () => approve(ORIGINAL),
+    edit: () => approve(EDITED),
+    reject: () => {
+      if (!['pending', 'failed'].includes(s.status)) return log(`✗ 提案当前是 ${s.status}，不能拒绝`, 'bad');
+      s.status = 'rejected';
+      log('拒绝，理由：语气太随意');
+    },
+    send: () => send('ok'),
+    lose: () => send('lose'),
+    crash: () => send('crash'),
+    recover,
+    reset,
+  };
+  const pillOf = { pending: 'accent', approved: 'ok', executing: 'warn', done: 'ok', failed: 'danger', rejected: '', expired: '' };
+  const render = () => {
+    $('[data-status]').innerHTML = `<span class="pill ${pillOf[s.status]}">${s.status}</span>${s.finalBody ? `<div style="margin-top:6px">正文：${Course.escape(s.finalBody)}</div>` : ''}`;
+    $('[data-outbox]').innerHTML = s.outbox.length
+      ? s.outbox.map((r) => `<div><code>${r.key}</code> <span class="pill ${r.status === 'sent' ? 'ok' : r.status === 'failed' ? 'danger' : 'warn'}">${r.status}</span></div>`).join('')
+      : '<span style="color:var(--muted)">（空）</span>';
+    $('[data-delivered]').textContent = s.delivered.length;
+    $('[data-delivered]').style.color = s.delivered.length > 1 ? 'var(--danger)' : 'var(--text)';
+    $('[data-delivered-list]').innerHTML = s.delivered.map((b) => `<div>「${Course.escape(b)}」</div>`).join('');
+    const logEl = $('[data-log]');
+    logEl.innerHTML = s.log.map(([t, c]) => `<div class="${c}">${Course.escape(t)}</div>`).join('');
+    logEl.scrollTop = logEl.scrollHeight;
+  };
+  box.querySelectorAll('[data-act]').forEach((b) =>
+    b.addEventListener('click', () => {
+      actions[b.dataset.act]();
+      render();
+    }),
+  );
+  reset();
+});
+</script>
+</body>
+</html>

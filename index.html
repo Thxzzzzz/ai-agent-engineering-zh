@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI Agent 工程</title>
+<meta name="description" content="一套中文引导式教程：从 agent loop、上下文工程、记忆、安全、可靠执行到评测与可观测，配 7 个跟练项目，目标是胜任高级 AI Agent 工程师。">
+<link rel="stylesheet" href="assets/css/course.css">
+<script src="assets/js/manifest.js"></script>
+<script defer src="assets/js/course.js"></script>
+</head>
+<body data-page="index">
+<article id="content">
+<section class="hero">
+  <div class="eyebrow">中文引导式教程 · 2026 版</div>
+  <h1>AI Agent 工程</h1>
+  <p class="lead">从"会调模型 API"到"能设计、交付并长期运维一个生产级 agent 系统"。16 章理论 + 1 章真实项目复盘 + 7 个跟练项目 + 1 个毕业项目，每章配图解、分步动画或可以动手玩的交互组件。</p>
+  <div class="big-progress"><div class="bar"><i data-progress-bar style="width:0"></i></div><span class="pill" data-progress-text>0 / 0</span></div>
+</section>
+
+<h2>这门课要把你带到哪里</h2>
+<p>一个<strong>高级 Agent 工程师</strong>和"能写出 demo 的人"之间的差距，几乎都不在提示词上，而在这些问题上：</p>
+<div class="cards">
+  <div class="card"><b>它为什么这样做？</b><small>能读懂 trace，定位是上下文缺了、工具描述含糊，还是模型能力边界。</small></div>
+  <div class="card"><b>它会不会闯祸？</b><small>知道提示注入怎么发生，用架构而不是祈祷来限制后果；高风险动作必须经人审批。</small></div>
+  <div class="card"><b>它挂了会怎样？</b><small>进程崩溃、网络抖动、模型超时之后，不重发、不丢单、能从断点继续。</small></div>
+  <div class="card"><b>它是变好还是变差？</b><small>有评测集、有回归、有线上指标，改一句提示词前后能拿数字说话。</small></div>
+  <div class="card"><b>它值不值这个钱？</b><small>算得清 token、缓存命中和模型分级，知道延迟花在了哪里。</small></div>
+  <div class="card"><b>它该做多大？</b><small>知道什么时候用一次调用、什么时候用 workflow、什么时候才需要 agent 或多 agent。</small></div>
+</div>
+
+<h2>学习路线</h2>
+<figure>
+<div class="diagram">
+<svg viewBox="0 0 760 300" width="760" role="img" aria-label="课程路线图">
+  <rect class="box a" x="20" y="20" width="160" height="110" rx="12"/>
+  <text class="tb" x="100" y="48" text-anchor="middle">基础</text>
+  <text class="ts" x="100" y="72" text-anchor="middle">Agent 是什么 · 模型工程</text>
+  <text class="ts" x="100" y="92" text-anchor="middle">结构化输出与工具</text>
+  <text class="ts" x="100" y="112" text-anchor="middle">手写 Agent Loop</text>
+  <rect class="box v" x="210" y="20" width="160" height="110" rx="12"/>
+  <text class="tb" x="290" y="48" text-anchor="middle">上下文与记忆</text>
+  <text class="ts" x="290" y="72" text-anchor="middle">上下文工程</text>
+  <text class="ts" x="290" y="92" text-anchor="middle">记忆系统</text>
+  <text class="ts" x="290" y="112" text-anchor="middle">检索与知识库</text>
+  <rect class="box r" x="400" y="20" width="160" height="110" rx="12"/>
+  <text class="tb" x="480" y="48" text-anchor="middle">可控与可靠</text>
+  <text class="ts" x="480" y="72" text-anchor="middle">人在回路与自主度</text>
+  <text class="ts" x="480" y="92" text-anchor="middle">安全与权限</text>
+  <text class="ts" x="480" y="112" text-anchor="middle">状态机、幂等与持久化</text>
+  <rect class="box b" x="590" y="20" width="160" height="110" rx="12"/>
+  <text class="tb" x="670" y="48" text-anchor="middle">协作与规模</text>
+  <text class="ts" x="670" y="72" text-anchor="middle">MCP · A2A · Skills</text>
+  <text class="ts" x="670" y="92" text-anchor="middle">长任务与编码 Agent</text>
+  <text class="ts" x="670" y="112" text-anchor="middle">评测 · 可观测 · 成本</text>
+  <path class="line" d="M180 75 H210" marker-end="url(#arr)"/><path class="line" d="M370 75 H400" marker-end="url(#arr)"/><path class="line" d="M560 75 H590" marker-end="url(#arr)"/>
+  <rect class="box g" x="210" y="190" width="350" height="70" rx="12"/>
+  <text class="tb" x="385" y="218" text-anchor="middle">参考架构 + 毕业项目</text>
+  <text class="ts" x="385" y="242" text-anchor="middle">把所有部件拼成一个可以放进作品集的 agent 系统</text>
+  <path class="line g" d="M670 130 C670 170 600 225 560 225" marker-end="url(#arr-g)"/>
+  <rect class="box w" x="20" y="190" width="160" height="70" rx="12"/>
+  <text class="tb" x="100" y="218" text-anchor="middle">跟练项目 P1–P7</text>
+  <text class="ts" x="100" y="242" text-anchor="middle">每学完一部分做一个</text>
+  <path class="line b dash" d="M100 130 V190" marker-end="url(#arr-b)"/>
+  <path class="line b" d="M180 225 H210" marker-end="url(#arr-b)"/>
+</svg>
+</div>
+<figcaption>四个部分按依赖顺序排列；每部分学完，做对应的跟练项目巩固。</figcaption>
+</figure>
+
+<h2>怎么用这门课</h2>
+<ol class="steps">
+  <li><strong>按顺序读，但别只读。</strong>每章都有分步动画（点"下一步"）、交互组件和小测。小测答错了不要紧，解释比答案重要。</li>
+  <li><strong>每部分做一个跟练项目。</strong>项目用 TypeScript（Bun 运行时），从 100 行的最小 agent 一路长成带审批、记忆、评测和可观测的系统。所有项目都能用"假模型"离线跑测试，真实模型只在最后接入。</li>
+  <li><strong>对照真实项目复盘。</strong>每章末尾的"真实项目复盘"提示框，指向两个真实项目里因缺少这块知识而走的弯路；第五部分的复盘章把 31 条发现汇总成热力图、根因分析和整改清单。</li>
+  <li><strong>用能力自测检验自己。</strong>附录里的清单列出了高级 Agent 工程师应当能独立完成的事；勾不上的条目，回到对应章节。</li>
+  <li><strong>读一手资料。</strong>每章末尾列出原始出处（官方博客、规范、论文）。这个领域变化很快，课程内容截至 2026 年 11 月核实过，之后请以原文为准。</li>
+</ol>
+
+<h2>全部章节</h2>
+<div id="chapter-list"></div>
+
+<div class="callout note"><b>关于时效</b>
+<p>本课程中的规范版本、价格倍数、基准分数等事实性内容，均在 2026-11 对照官方文档或原论文核实，并在正文中注明日期。模型名称和价格变化最快，课程里只讲"怎么算、怎么选"，不绑定具体型号。</p></div>
+</article>
+<script>
+window.addEventListener('DOMContentLoaded', () => {
+  const box = document.getElementById('chapter-list');
+  for (const part of window.COURSE.parts) {
+    if (part.items.every((i) => i.id === 'index')) continue;
+    const block = Course.el('div', { class: 'part-block' }, [Course.el('h3', { text: part.name })]);
+    for (const item of part.items) {
+      if (item.id === 'index') continue;
+      const no = item.id.startsWith('ch') ? item.id.slice(2) : item.id.startsWith('p') && item.id.length === 2 ? item.id.toUpperCase() : '·';
+      block.append(
+        Course.el('a', { class: 'ch-row', href: item.file, 'data-id': item.id }, [
+          Course.el('span', { class: 'no', text: no }),
+          Course.el('span', { class: 'ti', text: item.title }),
+          Course.el('span', { class: 'mi', text: item.minutes ? `约 ${item.minutes} 分钟` : '' }),
+        ]),
+      );
+    }
+    box.append(block);
+  }
+  Course.updateProgress();
+});
+</script>
+</body>
+</html>

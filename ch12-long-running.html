@@ -1,0 +1,576 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>长任务与编码 Agent · AI Agent 工程</title>
+<meta name="description" content="长任务为什么会失败，harness 如何让 agent 跨会话接力；编排编码 agent 的工程实践：headless 调用、worktree 隔离、hooks 守门、用 git 与 CI 判断真实进度。">
+<link rel="stylesheet" href="assets/css/course.css">
+<script src="assets/js/manifest.js"></script>
+<script defer src="assets/js/course.js"></script>
+<style>
+  .toggles { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 6px 16px; margin: 8px 0 12px; }
+  .toggles label { display: flex; gap: 8px; align-items: flex-start; font-size: 14px; line-height: 1.5; }
+  .toggles input { margin-top: 4px; accent-color: var(--accent); }
+  .sess { border-left: 3px solid var(--border); padding: 4px 0 4px 12px; margin: 8px 0; font-size: 14px; }
+  .sess.good { border-left-color: var(--ok); }
+  .sess.bad { border-left-color: var(--danger); }
+  .sess.meh { border-left-color: var(--warn); }
+  .sess b { display: block; }
+  .verdict { margin-top: 12px; display: flex; flex-wrap: wrap; gap: 18px; align-items: center; }
+</style>
+</head>
+<body data-page="ch12">
+<article id="content">
+<div class="eyebrow">第四部分 · 协作与规模 · 第 12 章</div>
+<h1>长任务与编码 Agent 的驾驭</h1>
+<p class="lead">让 agent 回答一个问题只要几秒；让它实现一个功能、修完 CI、处理完评审意见，可能要几小时、跨好几个会话。这一章讲怎样给长任务搭一副"驾驭器"（harness），以及当你要编排的是现成的编码 agent 时，哪些工程手段能让它可控、可追踪、可收尾。</p>
+<div class="meta"><span>约 45 分钟</span><span>前置：第 4、5、8、10 章</span><span>含 1 个分步动画、1 个模拟器、3 道小测</span></div>
+
+<div class="goals"><b>学完你能</b>
+<ul>
+  <li>说清 harness 由哪些部件组成，以及"拆掉不再承重的组件"的含义</li>
+  <li>识别长任务的两类典型失败，并用功能清单、进度文件、端到端验证去对付它们</li>
+  <li>用 headless 模式调用编码 agent，拿到结构化结果与会话 ID，并能续跑</li>
+  <li>用 git worktree 隔离并行任务，用 hooks 写确定性的守门逻辑</li>
+  <li>设计一个从授权、执行、跟进到收尾的完整任务生命周期，用 git 和 CI 而不是 agent 自述判断进度</li>
+</ul></div>
+
+<h2>1 · Harness：模型之外的一切</h2>
+<p>同一个模型，放在不同的"外壳"里，表现可以天差地别。这个外壳就叫 <strong>harness</strong>（驾驭器）：循环本身、工具集、上下文管理（压缩、笔记、子 agent）、权限与审批、持久化、验证手段、以及会话之间如何交接。可以粗略地写成：</p>
+<blockquote><strong>Agent = 模型 + Harness</strong>。模型决定"能想到什么"，harness 决定"能稳定地做成什么"。</blockquote>
+<p>Harness 不是越多越好。Anthropic 在 2026-03 的《Harness design for long-running application development》里描述过一个演化：他们先为长任务加了"sprint 合同"等机制，等到更强的模型出现后，又把 sprint 删掉了。原则只有一句——<strong>拆掉不再承重的组件</strong>。每个 harness 部件都在弥补模型的某个短板；短板消失了，部件就成了负担：多余的 token、多余的延迟、多余的出错点。</p>
+
+<div class="callout deep"><b>把 harness 当成"假设清单"来维护</b>
+<p>给每个部件写下它在弥补什么："进度文件——因为新会话不记得上次做到哪""端到端验证——因为模型会在单测通过后就宣布完成"。模型升级后，用第 13 章的评测逐项去掉、对比结果。假设不再成立的部件，删。</p></div>
+
+<h2>2 · 长任务的两类失败</h2>
+<p>Anthropic 在 2025-11-26 的《Effective harnesses for long-running agents》里，让 agent 从零构建一个完整的应用，观察到两类反复出现的失败：</p>
+<table>
+<tr><th>失败</th><th>表现</th><th>根因</th></tr>
+<tr><td><strong>一次做太多</strong></td><td>想在一个会话里做完整个应用，上下文中途耗尽，留下一堆半成品，下一个会话面对的是一个说不清状态的代码库</td><td>上下文窗口是有限的；agent 不会自己控制每次的工作量</td></tr>
+<tr><td><strong>过早宣布完成</strong></td><td>看到部分功能能跑，或单元测试、curl 通过，就宣布"全部完成"，实际上端到端用不了</td><td>没有客观的完成标准；agent 倾向于对自己的工作乐观</td></tr>
+</table>
+<p>这两类失败和模型"聪不聪明"关系不大，它们是<strong>结构性</strong>的：没有外部记忆，就无法跨会话接力；没有外部验证，就无法可信地判断完成。所以解法也是结构性的。</p>
+
+<h2>3 · 跨会话接力：Initializer + Coding Agent</h2>
+<p>同一篇文章给出的方案是两个角色，它们的系统提示和工具完全相同，只有第一条提示不同：</p>
+<figure>
+<div class="diagram">
+<svg viewBox="0 0 740 260" width="740" role="img" aria-label="initializer 与 coding agent 通过文件接力">
+  <rect class="box a" x="20" y="30" width="150" height="70" rx="12"/>
+  <text class="tb" x="95" y="60" text-anchor="middle">Initializer</text>
+  <text class="ts" x="95" y="82" text-anchor="middle">只跑一次</text>
+  <rect class="box b" x="230" y="30" width="140" height="70" rx="12"/>
+  <text class="tb" x="300" y="60" text-anchor="middle">Coding 会话 1</text>
+  <text class="ts" x="300" y="82" text-anchor="middle">做 1 个功能</text>
+  <rect class="box b" x="410" y="30" width="140" height="70" rx="12"/>
+  <text class="tb" x="480" y="60" text-anchor="middle">Coding 会话 2</text>
+  <text class="ts" x="480" y="82" text-anchor="middle">做 1 个功能</text>
+  <rect class="box b" x="590" y="30" width="130" height="70" rx="12"/>
+  <text class="tb" x="655" y="60" text-anchor="middle">会话 N …</text>
+  <text class="ts" x="655" y="82" text-anchor="middle">直到全部通过</text>
+  <path class="line" d="M170 65 H230" marker-end="url(#arr)"/>
+  <path class="line" d="M370 65 H410" marker-end="url(#arr)"/>
+  <path class="line" d="M550 65 H590" marker-end="url(#arr)"/>
+  <rect class="box g" x="20" y="160" width="700" height="80" rx="12"/>
+  <text class="tb" x="370" y="186" text-anchor="middle">共享的外部记忆（都在仓库里）</text>
+  <text class="ts" x="140" y="216" text-anchor="middle">feature_list.json</text>
+  <text class="ts" x="300" y="216" text-anchor="middle">claude-progress.txt</text>
+  <text class="ts" x="450" y="216" text-anchor="middle">init.sh</text>
+  <text class="ts" x="600" y="216" text-anchor="middle">git 提交历史</text>
+  <path class="line g dash" d="M95 100 V160" marker-end="url(#arr-g)"/>
+  <path class="line g dash" d="M300 100 V160" marker-end="url(#arr-g)" marker-start="url(#arr-g)"/>
+  <path class="line g dash" d="M480 100 V160" marker-end="url(#arr-g)" marker-start="url(#arr-g)"/>
+  <path class="line g dash" d="M655 100 V160" marker-end="url(#arr-g)" marker-start="url(#arr-g)"/>
+</svg>
+</div>
+<figcaption>图 12-1 会话之间不共享上下文，只共享仓库里的文件。每个会话开工时读，收工时写。</figcaption>
+</figure>
+
+<ul>
+  <li><strong>Initializer</strong> 只运行一次：搭好环境，写出 <code>init.sh</code>（启动开发环境、跑基本测试的脚本）、进度文件，做第一次 git 提交，并把需求展开成一份 <strong>JSON 格式的功能清单</strong>——文中的例子超过 200 条，初始全部标记为未通过。</li>
+  <li><strong>Coding agent</strong> 每个会话只做<strong>一个</strong>功能，做完提交，并在进度文件里写一段摘要。</li>
+</ul>
+
+<pre data-title="feature_list.json（节选）"><code class="lang-json">
+[
+  {
+    "id": "export-filter-01",
+    "description": "月报导出页可以按部门筛选，默认显示全部部门",
+    "steps": ["打开月报页", "在部门下拉框选择一个部门", "点击导出", "下载的 CSV 只含该部门的行"],
+    "passes": false
+  },
+  {
+    "id": "export-filter-02",
+    "description": "筛选条件为空时导出按钮置灰并提示原因",
+    "steps": ["清空月份", "导出按钮不可点击", "悬停显示'请先选择月份'"],
+    "passes": false
+  }
+]
+</code></pre>
+
+<p>几个看似细小、实际关键的设计：</p>
+<ul>
+  <li><strong>用 JSON 而不是 Markdown</strong>：模型更不容易随手改写 JSON 的结构。规则是 coding agent <strong>只许改 <code>passes</code> 字段</strong>，不许删改功能描述和测试步骤——否则"让测试通过"最省事的办法就是改测试。</li>
+  <li><strong>每次开工的固定流程</strong>：确认工作目录 → 读 git log 和进度文件 → 从清单里挑优先级最高的未通过功能 → 运行 <code>init.sh</code> 和基本的端到端测试，先确认环境是好的，再开始新工作。</li>
+  <li><strong>明确要求端到端验证</strong>：文中用浏览器自动化工具（Puppeteer MCP）像真实用户一样点一遍。没有这条要求时，模型经常跑完单测或 curl 就宣布功能完成。</li>
+</ul>
+
+<div class="quiz" data-answer="2">
+<p class="q">为什么功能清单要求 coding agent "只许改 passes 字段"？</p>
+<ol>
+  <li>为了让 JSON 文件更小，节省 token</li>
+  <li>防止 agent 通过修改或删除验收标准来"完成"任务</li>
+  <li>因为 JSON 不支持修改其他字段</li>
+  <li>为了让多个 agent 可以同时写这个文件</li>
+</ol>
+<div class="explain">验收标准是"外部的、客观的完成定义"，一旦允许 agent 修改，它就既是运动员又是裁判。这和第 13 章评测里"不要让被测系统接触评分逻辑"是同一个原则。</div>
+</div>
+
+<h2>4 · 把评估者独立出来</h2>
+<p>2026-03 的后续文章把角色拆成了三个，灵感来自生成对抗网络（GAN）：</p>
+<table>
+<tr><th>角色</th><th>职责</th></tr>
+<tr><td><strong>Planner</strong></td><td>把需求拆成若干 sprint，每个 sprint 开始前与 generator 约定"合同"：做什么、怎么验收、硬性阈值</td></tr>
+<tr><td><strong>Generator</strong></td><td>按合同实现</td></tr>
+<tr><td><strong>Evaluator</strong></td><td>用 Playwright 像真实用户一样实测，按合同判定是否通过；不通过则给出具体意见</td></tr>
+</table>
+<p>为什么要独立？因为<strong>让同一个 agent 评估自己的工作，它会倾向于宽容</strong>；一个独立的评估者更容易被调成"持怀疑态度"的角色。代价也很直观：文中同一个任务，单个 agent 直接做花费约 9 美元，但核心功能不可用；完整的 planner/generator/evaluator harness 花费约 200 美元，产出能真正使用。</p>
+<p>这组数字值得反复体会：<strong>便宜但不可用的结果，成本是无穷大</strong>。同时也提醒你，harness 的每个部件都有价格，要用评测证明它值得。</p>
+
+<h2>5 · 大脑与手分离</h2>
+<p>当 agent 从"在你电脑上跑一会儿"变成"在服务端长时间运行的产品"时，架构会再变一次。Anthropic 在 2026-04 的《Scaling Managed Agents: Decoupling the brain from the hands》里把系统拆成三块：</p>
+<figure>
+<div class="diagram">
+<svg viewBox="0 0 740 210" width="740" role="img" aria-label="harness、sandbox、session 三者分离">
+  <rect class="box a" x="30" y="30" width="200" height="90" rx="12"/>
+  <text class="tb" x="130" y="62" text-anchor="middle">Harness（大脑）</text>
+  <text class="ts" x="130" y="86" text-anchor="middle">无状态：调模型、选工具</text>
+  <text class="ts" x="130" y="106" text-anchor="middle">wake(sessionId) 即可恢复</text>
+  <rect class="box b" x="510" y="30" width="200" height="90" rx="12"/>
+  <text class="tb" x="610" y="62" text-anchor="middle">Sandbox（手）</text>
+  <text class="ts" x="610" y="86" text-anchor="middle">执行命令与代码</text>
+  <text class="ts" x="610" y="106" text-anchor="middle">按需创建，不持有凭据</text>
+  <rect class="box v" x="270" y="140" width="200" height="56" rx="12"/>
+  <text class="tb" x="370" y="164" text-anchor="middle">Session</text>
+  <text class="ts" x="370" y="184" text-anchor="middle">耐久的事件日志</text>
+  <path class="line a" d="M230 75 H510" marker-end="url(#arr-a)"/>
+  <text class="ts" x="370" y="66" text-anchor="middle">execute(name, input) → string</text>
+  <path class="line" d="M150 120 C150 168 230 168 270 168" marker-end="url(#arr)" marker-start="url(#arr)"/>
+  <rect class="box g" x="560" y="146" width="150" height="44" rx="10"/>
+  <text class="t" x="635" y="173" text-anchor="middle">凭据库 → 代理</text>
+  <path class="line g dash" d="M610 146 V120" marker-end="url(#arr-g)"/>
+</svg>
+</div>
+<figcaption>图 12-2 Harness 无状态、Sandbox 可替换、Session 持久。任何一个部件挂掉，都可以从事件日志恢复。</figcaption>
+</figure>
+<ul>
+  <li><strong>工具接口统一成</strong> <code>execute(name, input) → string</code>：harness 不关心手在哪里、是什么。</li>
+  <li><strong>Harness 无状态</strong>：所有状态都在 session 的事件日志里，进程崩了用 <code>wake(sessionId)</code> 接着跑——这和第 10 章"状态机 + 持久化"是同一个思想。</li>
+  <li><strong>按需创建容器</strong>：只在真正要执行时才起沙箱，首个 token 的延迟中位数降低约 60%，p95 降低超过 90%。</li>
+  <li><strong>凭据不进沙箱</strong>：沙箱里跑的是模型生成的代码，凭据经代理从凭据库取用，模型永远看不到原文。</li>
+</ul>
+<p>OpenAI 在 2026-04-15 对 Agents SDK 的升级走的是同一个方向：harness 与计算分离、原生沙箱、凭据不进沙箱、支持快照与恢复。两家不约而同，说明这已经是长任务 agent 的标准架构。</p>
+
+<h2>6 · 编排现成的编码 agent</h2>
+<p>多数时候你不会从零写一个编码 agent，而是<strong>编排</strong>一个现成的：Claude Code、OpenAI Codex 等。你的程序负责接需求、准备环境、启动 agent、跟进进度、汇报结果；编码 agent 负责在仓库里干活。这时你写的就是一个"外层 harness"。</p>
+
+<h3>Headless 调用：把编码 agent 当成一个函数</h3>
+<table>
+<tr><th>能力</th><th>Claude Code</th><th>OpenAI Codex</th></tr>
+<tr><td>非交互运行</td><td><code>claude -p "&lt;提示&gt;"</code></td><td><code>codex exec "&lt;提示&gt;"</code></td></tr>
+<tr><td>机器可读输出</td><td><code>--output-format json</code> 或 <code>stream-json</code></td><td><code>--json</code>（JSONL 事件流）</td></tr>
+<tr><td>约束最终输出的结构</td><td><code>--json-schema</code>，结果在 <code>structured_output</code> 字段</td><td><code>--output-schema</code></td></tr>
+<tr><td>续跑同一会话</td><td><code>--resume &lt;session_id&gt;</code></td><td><code>codex exec resume</code></td></tr>
+<tr><td>权限与沙箱</td><td><code>--allowedTools</code>、<code>--permission-mode</code></td><td>默认只读沙箱；<code>--sandbox workspace-write</code> 允许写工作区（旧的 <code>--full-auto</code> 已移除）</td></tr>
+<tr><td>费用</td><td>JSON 输出里带 <code>total_cost_usd</code></td><td>见事件流中的用量</td></tr>
+</table>
+<p>官方还建议脚本调用 Claude Code 时加 <code>--bare</code>，并说明它将来会成为 <code>-p</code> 的默认行为。下面是一个用 Bun 启动编码 agent、拿回结构化结果的写法（参数细节以各自 <code>--help</code> 和官方文档为准）：</p>
+
+<pre data-title="run-coding-agent.ts"><code class="lang-ts">
+// 让编码 agent 在指定 worktree 里工作，并要求它用固定结构汇报结果
+const ReportSchema = {
+  type: 'object',
+  properties: {
+    status: { type: 'string', enum: ['done', 'blocked', 'needs_input'] },
+    summary: { type: 'string' },
+    questions: { type: 'array', items: { type: 'string' } },
+  },
+  required: ['status', 'summary', 'questions'],
+  additionalProperties: false,
+};
+
+export async function runCodingAgent(opts: { worktree: string; prompt: string; resume?: string }) {
+  const args = [
+    'claude', '-p', opts.prompt,
+    '--output-format', 'json',
+    '--json-schema', JSON.stringify(ReportSchema),
+    '--permission-mode', 'acceptEdits',
+    '--allowedTools', 'Read,Edit,Write,Bash(bun test:*),Bash(git:*)',
+  ];
+  if (opts.resume) args.push('--resume', opts.resume);
+
+  const proc = Bun.spawn(args, { cwd: opts.worktree, stdout: 'pipe', stderr: 'pipe' });
+  const [stdout, code] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+  if (code !== 0) throw new Error(`编码 agent 异常退出（${code}）：${await new Response(proc.stderr).text()}`);
+
+  const out = JSON.parse(stdout);
+  return {
+    sessionId: out.session_id as string,   // 存下来：之后续跑、交接都靠它
+    costUsd: out.total_cost_usd as number, // 记账，第 14 章的预算控制用
+    report: out.structured_output,          // agent 的自述，仅供参考，见第 8 节
+  };
+}
+</code></pre>
+
+<div class="callout warn"><b>权限要按任务收紧</b>
+<p>无人值守运行时，没人能在终端里点"允许"。正确的做法不是一把打开所有权限，而是只放行这个任务需要的工具（如只允许跑测试和 git），其余一律拒绝；真正有风险的动作（推主干、删分支、对外发消息）留给你的编排器在审批后执行。</p></div>
+
+<h3>Worktree：每个任务一个独立的工作目录</h3>
+<p>同时跑两个编码 agent，如果它们在同一个目录里工作，互相覆盖改动是迟早的事。<code>git worktree</code> 让同一个仓库检出多个工作目录，每个在自己的分支上：</p>
+<pre data-title="为任务建 / 删 worktree"><code class="lang-bash">
+# 从最新主干为任务新开分支和工作目录
+git fetch origin
+git worktree add ../worktrees/export-filter -b feat/export-filter origin/main
+
+# 任务结束、确认分支已合并或不再需要后再清理
+git worktree remove ../worktrees/export-filter
+git branch -d feat/export-filter   # -d 只删已合并的分支；未合并时会拒绝，这正是你想要的保护
+</code></pre>
+<p>Claude Code 也内置了这个能力：<code>claude -w &lt;name&gt;</code> 会在 <code>.claude/worktrees/&lt;name&gt;</code> 下、分支 <code>worktree-&lt;name&gt;</code> 上开一个会话（配合 <code>-p</code> 时不会自动清理）。它的后台会话（agent view，2026-05 起的研究预览）会在写文件前自动隔离到各自的 worktree，会推分支、开 draft PR，但从不推主干、不强推、不合并——这几条"从不"，也是你自己的编排器应该遵守的底线。</p>
+
+<h2>7 · Hooks：在 agent 生命周期里插入确定性代码</h2>
+<p>提示词里写"完成前一定要提交代码"，agent 大多数时候会照做，但不是每次。<strong>Hooks</strong> 让你在 agent 生命周期的特定时刻运行你自己的代码，把"大多数时候"变成"每一次"。Claude Code 的常用事件包括：</p>
+<table>
+<tr><th>事件</th><th>时机</th><th>典型用途</th></tr>
+<tr><td><code>SessionStart</code></td><td>会话开始</td><td>注入任务背景、进度摘要</td></tr>
+<tr><td><code>UserPromptSubmit</code></td><td>用户提交提示</td><td>补充上下文、拦截不合规请求</td></tr>
+<tr><td><code>PreToolUse</code></td><td>工具执行前</td><td>按规则 allow / deny / ask / defer</td></tr>
+<tr><td><code>PostToolUse</code></td><td>工具执行后</td><td>自动格式化、记录审计日志</td></tr>
+<tr><td><code>PreCompact</code></td><td>压缩上下文前</td><td>把关键决定写进笔记，防止压缩丢失</td></tr>
+<tr><td><code>Stop</code></td><td>agent 准备停下</td><td><strong>检查是否真的完成，不满足就让它继续</strong></td></tr>
+</table>
+<p>（完整列表目前有三十多个事件，以官方文档为准。）</p>
+
+<h3>示例：提交检查</h3>
+<p>一个非常实用的守卫：agent 停下时如果还有未提交或未推送的改动，就拦下来提醒它一次。</p>
+<pre data-title="stop-guard.ts（Claude Code 的 Stop hook）"><code class="lang-ts">
+// 从 stdin 读取 hook 输入；输出 {"decision":"block","reason":…} 让 agent 继续工作
+const input = await Bun.stdin.json();
+
+// 防死循环：如果这次停止本身就是被 Stop hook 拦下后的继续，就放行
+if (input.stop_hook_active) process.exit(0);
+
+const git = (...args: string[]) =>
+  Bun.spawnSync(['git', ...args], { cwd: input.cwd }).stdout.toString().trim();
+
+const dirty = git('status', '--porcelain');
+const unpushed = git('log', '--oneline', '@{u}..HEAD'); // 无上游分支时为空，这里按"无未推送"处理
+
+if (dirty || unpushed) {
+  const reason = [
+    '停下前请处理：',
+    dirty && `有未提交的改动：\n${dirty}`,
+    unpushed && `有未推送的提交：\n${unpushed}`,
+    '如果这些改动是有意不提交的，在回复里说明原因后再停下。',
+  ].filter(Boolean).join('\n');
+  console.log(JSON.stringify({ decision: 'block', reason }));
+}
+process.exit(0);
+</code></pre>
+<pre data-title=".claude/settings.json"><code class="lang-json">
+{
+  "hooks": {
+    "Stop": [
+      { "hooks": [{ "type": "command", "command": "bun /path/to/stop-guard.ts" }] }
+    ]
+  }
+}
+</code></pre>
+
+<div class="callout danger"><b>三个最常见的 hook 陷阱</b>
+<ul>
+  <li><strong>退出码 1 不阻断</strong>：要阻断必须退出码 2（stderr 作为理由），或者输出 <code>decision: "block"</code> 的 JSON。很多人用 <code>exit 1</code> 以为拦住了，其实什么都没发生。</li>
+  <li><strong>死循环</strong>：Stop hook 每次都 block，agent 就永远停不下来。务必检查 <code>stop_hook_active</code>；系统另有上限，连续续跑 8 次后强制结束（可用 <code>CLAUDE_CODE_STOP_HOOK_BLOCK_CAP</code> 调整），但别依赖它。</li>
+  <li><strong>多个 PreToolUse 冲突</strong>：优先级是 deny &gt; defer &gt; ask &gt; allow，任何一个 deny 都会生效；<code>defer</code> 只在 <code>-p</code> 模式下有意义。</li>
+</ul></div>
+
+<div class="quiz" data-answer="3">
+<p class="q">你写了一个 Stop hook，在测试没通过时 <code>exit 1</code> 并在 stderr 打印"测试未通过"。实际运行中 agent 照样停下了。最可能的原因是？</p>
+<ol>
+  <li>hook 没有执行权限</li>
+  <li>stderr 的内容太长被截断</li>
+  <li>退出码 1 不表示阻断，应该用退出码 2 或输出 decision: "block"</li>
+  <li>Stop hook 只能在交互模式下生效</li>
+</ol>
+<div class="explain">这是 hooks 最经典的陷阱：非 0 不等于阻断。退出码 2 才是阻断信号（stderr 会作为理由交给 agent），或者以 0 退出并输出包含 <code>decision: "block"</code> 和 <code>reason</code> 的 JSON。</div>
+</div>
+
+<h2>8 · 相信 git，不相信自述</h2>
+<p>编码 agent 说"已完成，测试全部通过"——你应该怎么对待这句话？答案是：<strong>当成线索，不当成事实</strong>。agent 的自述会有乐观偏差，会遗漏，偶尔也会编。编排器应该自己去读客观状态：</p>
+<pre data-title="read-progress.ts：从 git 与 GitHub 读客观进度"><code class="lang-ts">
+const sh = (cmd: string[], cwd: string) => Bun.spawnSync(cmd, { cwd }).stdout.toString().trim();
+
+export function readProgress(worktree: string, branch: string) {
+  const head = sh(['git', 'rev-parse', '--short', 'HEAD'], worktree);
+  const dirty = sh(['git', 'status', '--porcelain'], worktree) !== '';
+  const prJson = sh(['gh', 'pr', 'view', branch, '--json', 'url,state,reviewDecision,statusCheckRollup'], worktree);
+  const pr = prJson ? JSON.parse(prJson) : null;
+  const checks: { conclusion: string | null }[] = pr?.statusCheckRollup ?? [];
+  return {
+    head,
+    dirty,
+    prUrl: pr?.url ?? null,
+    ci: checks.length === 0 ? 'none'
+      : checks.some((c) => c.conclusion === 'FAILURE') ? 'failed'
+      : checks.every((c) => c.conclusion === 'SUCCESS') ? 'passed' : 'running',
+    reviewDecision: pr?.reviewDecision ?? null, // 例如 CHANGES_REQUESTED
+  };
+}
+</code></pre>
+<p>有了这些客观信号，"完成"就可以被定义成可检查的条件：<strong>有 PR、没有未提交改动、CI 全绿、没有待处理的评审意见、验收点逐条对照过</strong>。只有满足条件，编排器才去通知人；不满足，就把具体差距（哪个检查失败了、评审意见原文）回传给 agent 继续做。</p>
+
+<h2>9 · 一个任务的完整生命周期</h2>
+<p>把前面的部件串起来，看一个"给月报导出加部门筛选"的开发任务从开始到收尾经过了哪些环节。注意每一步是谁在做决定：</p>
+
+<figure class="anim" data-dim>
+<div class="diagram">
+<svg viewBox="0 0 760 410" width="760" role="img" aria-label="编码任务生命周期泳道图">
+  <rect class="box m" x="10" y="20" width="740" height="80" rx="8"/>
+  <rect class="box m" x="10" y="120" width="740" height="80" rx="8"/>
+  <rect class="box m" x="10" y="220" width="740" height="80" rx="8"/>
+  <rect class="box m" x="10" y="320" width="740" height="80" rx="8"/>
+  <text class="tb" x="55" y="65" text-anchor="middle">人</text>
+  <text class="tb" x="55" y="165" text-anchor="middle">编排器</text>
+  <text class="tb" x="55" y="258" text-anchor="middle">编码</text>
+  <text class="tb" x="55" y="276" text-anchor="middle">agent</text>
+  <text class="tb" x="55" y="358" text-anchor="middle">仓库</text>
+  <text class="tb" x="55" y="376" text-anchor="middle">与 CI</text>
+
+  <g data-k="h1"><rect class="box w" x="110" y="35" width="100" height="50" rx="8"/><text class="tb" x="160" y="57" text-anchor="middle">批准任务</text><text class="ts" x="160" y="75" text-anchor="middle">看过需求与范围</text></g>
+  <g data-k="o1"><rect class="box a" x="110" y="135" width="100" height="50" rx="8"/><text class="tb" x="160" y="157" text-anchor="middle">建 worktree</text><text class="ts" x="160" y="175" text-anchor="middle">独立分支</text></g>
+  <g data-k="r1"><rect class="box g" x="110" y="335" width="100" height="50" rx="8"/><text class="tb" x="160" y="357" text-anchor="middle">新分支</text><text class="ts" x="160" y="375" text-anchor="middle">从最新主干检出</text></g>
+  <g data-k="o2"><rect class="box a" x="240" y="135" width="100" height="50" rx="8"/><text class="tb" x="290" y="157" text-anchor="middle">启动 agent</text><text class="ts" x="290" y="175" text-anchor="middle">需求 + 验收点</text></g>
+  <g data-k="a2"><rect class="box b" x="240" y="235" width="100" height="50" rx="8"/><text class="tb" x="290" y="257" text-anchor="middle">实现功能</text><text class="ts" x="290" y="275" text-anchor="middle">读约定与进度</text></g>
+  <g data-k="a3"><rect class="box b" x="370" y="235" width="100" height="50" rx="8"/><text class="tb" x="420" y="257" text-anchor="middle">提交并推送</text><text class="ts" x="420" y="275" text-anchor="middle">开 PR</text></g>
+  <g data-k="r3"><rect class="box r" x="370" y="335" width="100" height="50" rx="8"/><text class="tb" x="420" y="357" text-anchor="middle">PR 已开</text><text class="ts" x="420" y="375" text-anchor="middle">CI 失败 ✗</text></g>
+  <g data-k="o4"><rect class="box a" x="500" y="135" width="100" height="50" rx="8"/><text class="tb" x="550" y="157" text-anchor="middle">它停下时</text><text class="ts" x="550" y="175" text-anchor="middle">读 git / PR / CI</text></g>
+  <g data-k="a4"><rect class="box b" x="500" y="235" width="100" height="50" rx="8"/><text class="tb" x="550" y="257" text-anchor="middle">按意见修复</text><text class="ts" x="550" y="275" text-anchor="middle">再次提交</text></g>
+  <g data-k="r4"><rect class="box g" x="500" y="335" width="100" height="50" rx="8"/><text class="tb" x="550" y="357" text-anchor="middle">CI 通过 ✓</text><text class="ts" x="550" y="375" text-anchor="middle">无待处理意见</text></g>
+  <g data-k="o5"><rect class="box a" x="630" y="135" width="100" height="50" rx="8"/><text class="tb" x="680" y="157" text-anchor="middle">判定完成</text><text class="ts" x="680" y="175" text-anchor="middle">对照验收点</text></g>
+  <g data-k="h5"><rect class="box w" x="630" y="35" width="100" height="50" rx="8"/><text class="tb" x="680" y="57" text-anchor="middle">完成通知</text><text class="ts" x="680" y="75" text-anchor="middle">附 PR 与结果</text></g>
+  <g data-k="r5"><rect class="box m" x="630" y="335" width="100" height="50" rx="8"/><text class="tb" x="680" y="357" text-anchor="middle">收尾清理</text><text class="ts" x="680" y="375" text-anchor="middle">确认后再删除</text></g>
+
+  <g data-k="e1"><path class="line" d="M160 85 V135" marker-end="url(#arr)"/></g>
+  <g data-k="e1b"><path class="line g dash" d="M160 185 V335" marker-end="url(#arr-g)"/></g>
+  <g data-k="e2"><path class="line a" d="M210 160 H240" marker-end="url(#arr-a)"/></g>
+  <g data-k="e2b"><path class="line a" d="M290 185 V235" marker-end="url(#arr-a)"/></g>
+  <g data-k="e3"><path class="line b" d="M340 260 H370" marker-end="url(#arr-b)"/></g>
+  <g data-k="e3b"><path class="line b" d="M420 285 V335" marker-end="url(#arr-b)"/></g>
+  <g data-k="e4"><path class="line r" d="M470 340 L500 182" marker-end="url(#arr-r)"/></g>
+  <g data-k="e5"><path class="line a" d="M550 185 V235" marker-end="url(#arr-a)"/></g>
+  <g data-k="e6"><path class="line b" d="M550 285 V335" marker-end="url(#arr-b)"/></g>
+  <g data-k="e7"><path class="line g" d="M600 340 L630 182" marker-end="url(#arr-g)"/></g>
+  <g data-k="e8"><path class="line g" d="M680 135 V85" marker-end="url(#arr-g)"/></g>
+  <g data-k="e9"><path class="line dash" d="M680 185 V335" marker-end="url(#arr)"/></g>
+</svg>
+</div>
+<ol class="anim-steps">
+  <li data-show="h1" data-hl="h1">需求先变成一张任务卡：目标、范围、验收点、涉及的仓库。<strong>只有人批准后才启动</strong>——编码 agent 会消耗可观的费用，还会改动代码仓库，这是一个高风险动作（第 8 章的 L4 审批者）。</li>
+  <li data-show="e1 o1 e1b r1" data-hl="e1 o1 e1b r1">编排器从最新主干为任务建独立的分支和 worktree。并行的任务各有各的目录，互不干扰。</li>
+  <li data-show="e2 o2 e2b a2" data-hl="e2 o2 e2b a2">编排器以 headless 模式启动编码 agent，提示里带上需求原文、验收点和仓库约定（AGENTS.md 会被自动读取），并只放行这个任务需要的工具。记下返回的会话 ID。</li>
+  <li data-show="e3 a3 e3b r3" data-hl="e3 a3 e3b r3">agent 实现、提交、推送并开 PR。如果它想在留有未提交改动时停下，Stop hook 会拦下它一次。CI 开始运行——这一次失败了。</li>
+  <li data-show="e4 o4" data-hl="r3 e4 o4">agent 每停下一轮，编排器就<strong>自己去读</strong> git、PR 和 CI 的状态，而不是只听 agent 说"完成了"。它发现了 CI 失败和一条评审意见。</li>
+  <li data-show="e5 a4 e6 r4" data-hl="e5 a4 e6 r4">编排器把失败的检查名称、日志摘要和评审意见原文回传给同一个会话（<code>--resume</code>），agent 修复后再次提交。CI 通过，评审意见已处理。</li>
+  <li data-show="e7 o5 e8 h5" data-hl="r4 e7 o5 e8 h5">客观条件全部满足：有 PR、工作区干净、CI 全绿、验收点逐条对照过。编排器这才通知人，附上 PR 链接和对照结果。</li>
+  <li data-show="e9 r5" data-hl="e9 r5">收尾：确认分支已合并或不再需要后，清理 worktree 和分支；发现未合并的改动时先停下来问，不擅自删除。会话记录归档，供日后复盘与评测使用。</li>
+</ol>
+<figcaption>图 12-3 编码任务的生命周期。橙色是人，蓝色是编排器的确定性代码，黄色是编码 agent，绿色/红色是仓库与 CI 的客观状态。</figcaption>
+</figure>
+
+<div class="quiz" data-answer="1">
+<p class="q">编码 agent 在结构化汇报里写 <code>status: "done"</code>，但编排器读到 PR 的 CI 还在运行中。编排器最合理的做法是？</p>
+<ol>
+  <li>暂不通知人，等 CI 结束；失败就把失败详情回传给同一个会话继续修</li>
+  <li>立即通知人"任务已完成"，因为 agent 说完成了</li>
+  <li>立即关闭 agent 并删除 worktree，节省资源</li>
+  <li>让 agent 自己去改 CI 配置，让检查更快通过</li>
+</ol>
+<div class="explain">agent 的自述是线索，客观状态才是事实。完成的判定应该是可检查的条件，CI 还没结束就不满足条件。选项 4 是"改测试来通过测试"的变体，必须禁止。</div>
+</div>
+
+<h2>10 · 动手：长任务驾驭器模拟器</h2>
+<p>下面这个模拟器把前面讲的 harness 部件做成了开关。目标是 6 个功能，跑 5 个会话。先全部关掉跑一次，再逐个打开，观察每个部件分别解决了哪种失败。（这是示意性的模拟，用来建立直觉，数字不是实测结果。）</p>
+
+<div class="widget" id="harness-sim">
+<div class="w-title">长任务驾驭器模拟器</div>
+<div class="toggles">
+  <label><input type="checkbox" data-c="F"> <span><b>功能清单</b>（JSON，只许改 passes）</span></label>
+  <label><input type="checkbox" data-c="P"> <span><b>进度文件</b>（每会话收工写摘要）</span></label>
+  <label><input type="checkbox" data-c="E"> <span><b>端到端验证</b>（像用户一样实测）</span></label>
+  <label><input type="checkbox" data-c="S"> <span><b>提交检查</b>（Stop hook）</span></label>
+  <label><input type="checkbox" data-c="V"> <span><b>独立评估者</b>（不让 agent 自评）</span></label>
+</div>
+<button class="btn primary" type="button" data-run>运行 5 个会话</button>
+<button class="btn" type="button" data-all>全部打开</button>
+<button class="btn" type="button" data-none>全部关闭</button>
+<div data-log></div>
+<div class="verdict" data-verdict></div>
+</div>
+
+<h2>11 · 交接与收尾</h2>
+<h3>换一个 agent 接手</h3>
+<p>有时需要中途换 agent：当前 agent 卡住了、想换一个更擅长的、或者原会话已经无法恢复。交接的要点是<strong>把接手者需要的上下文显式地交给它</strong>，并让它先核对现场：</p>
+<pre data-title="交接提示的骨架"><code class="lang-ts">
+const handoffPrompt = `
+你将接手一个进行到一半的开发任务。
+## 原始需求
+${task.requirement}
+## 验收点
+${task.acceptance.map((a, i) => `${i + 1}. ${a}`).join('\n')}
+## 当前状态（由编排器从 git / CI 读取，不是上一个 agent 的自述）
+分支：${progress.branch}，最新提交：${progress.head}，PR：${progress.prUrl ?? '尚未创建'}，CI：${progress.ci}
+## 最近发生的事
+${recentEvents.join('\n')}
+## 开始前请先
+1. 运行 git status 和 git log -5，核对上面的状态，并检查是否有未提交的改动。
+2. 如有未提交的改动，先判断它们是否属于本任务，再决定提交还是询问。
+`;
+</code></pre>
+<p>一个稳妥的细节：<strong>确认新 agent 已经成功启动并收到了交接提示之后</strong>，再关闭旧的那个、更新任务记录。顺序反过来，一旦新 agent 启动失败，任务就无人负责了。</p>
+
+<h3>收尾</h3>
+<ul>
+  <li>收尾是一个有破坏性的动作（删目录、删分支），要有闸门：分支已合并、工作区干净、没有开着的 PR——任何一条不满足就停下来问人。</li>
+  <li>不是编排器创建的目录（比如用户手工检出的）一律保留。</li>
+  <li>把会话记录、花费、最终状态归档。失败的任务尤其要留着：它们是第 13 章评测集最好的来源。</li>
+</ul>
+
+<h2>12 · 常见反模式</h2>
+<ul>
+  <li><strong>一个会话做所有事</strong>：上下文中途耗尽，留下说不清的半成品。每个会话只做一件事。</li>
+  <li><strong>让 agent 自己判定完成</strong>：没有外部的、不可修改的验收标准，"完成"就只是一种心情。</li>
+  <li><strong>相信自述</strong>："测试都通过了"——去读 CI。</li>
+  <li><strong>所有权限一把打开</strong>：无人值守不等于无限授权。按任务放行最小工具集，推主干、合并、删除留给审批后的编排器。</li>
+  <li><strong>多个 agent 共用一个工作目录</strong>：用 worktree 隔离。</li>
+  <li><strong>Stop hook 无条件阻断</strong>：没有 <code>stop_hook_active</code> 判断，agent 永远停不下来。</li>
+  <li><strong>只加不减的 harness</strong>：模型升级后不重新评估，harness 越来越重、越来越慢。</li>
+</ul>
+
+<div class="callout case review-link"><b>真实项目复盘</b>
+<p>本章的知识点在两个真实项目里缺位时发生了什么，以及"有这块知识"时会怎么设计：</p>
+<ul><li><a href="review.html#f-D5">D5</a> · devtask 的"完成"由模型用自由文本宣布</li><li><a href="review.html#f-D6">D6</a> · devtask 没用 headless/ACP 持有会话</li><li><a href="review.html#f-N10">N10</a> · niuma 的交付通知只要带任意链接就算有"客观证据"</li></ul></div>
+
+<div class="takeaways"><b>本章要点</b>
+<ul>
+  <li>Agent = 模型 + harness；harness 的每个部件都在弥补一个模型短板，短板消失就拆掉。</li>
+  <li>长任务的两类失败：一次做太多、过早宣布完成。对策：功能清单（只许改 passes）、进度文件、每会话一个功能、强制端到端验证、独立评估者。</li>
+  <li>长时间运行的 agent 走向"大脑（无状态 harness）/ 手（沙箱）/ 会话（事件日志）"三分，凭据不进沙箱。</li>
+  <li>编排编码 agent：headless 调用拿结构化结果与会话 ID；worktree 隔离；hooks 写确定性守门；退出码 2 才阻断。</li>
+  <li>授权后才启动，用 git 与 CI 判断进度，满足客观条件才通知人，收尾前有闸门。</li>
+</ul></div>
+
+<h2>参考资料</h2>
+<ul class="refs">
+  <li><a href="https://www.anthropic.com/engineering/effective-harnesses-for-long-running-agents" target="_blank" rel="noopener">Effective harnesses for long-running agents</a> <span class="src">Anthropic · 2025-11-26 · initializer 与 coding agent、功能清单、端到端验证</span></li>
+  <li><a href="https://www.anthropic.com/research/harness-design-long-running-apps" target="_blank" rel="noopener">Harness design for long-running application development</a> <span class="src">Anthropic · 2026-03-24 · 规划者 / 生成者 / 评估者</span></li>
+  <li><a href="https://www.anthropic.com/research/managed-agents" target="_blank" rel="noopener">Scaling Managed Agents: Decoupling the brain from the hands</a> <span class="src">Anthropic · 2026-04-08 · 大脑、手、会话三者分离</span></li>
+  <li><a href="https://openai.com/index/the-next-evolution-of-the-agents-sdk/" target="_blank" rel="noopener">The next evolution of the Agents SDK</a> <span class="src">OpenAI · 2026-04-15 · harness 与计算分离、原生沙箱</span></li>
+  <li><a href="https://code.claude.com/docs/en/headless" target="_blank" rel="noopener">Claude Code：headless 模式</a> · <a href="https://code.claude.com/docs/en/agent-sdk/overview" target="_blank" rel="noopener">Agent SDK 概览</a> <span class="src">Anthropic 官方文档</span></li>
+  <li><a href="https://code.claude.com/docs/en/hooks" target="_blank" rel="noopener">Claude Code：Hooks</a> <span class="src">事件列表、退出码与 decision 语义</span></li>
+  <li><a href="https://code.claude.com/docs/en/worktrees" target="_blank" rel="noopener">Claude Code：Worktrees</a> · <a href="https://code.claude.com/docs/en/agent-view" target="_blank" rel="noopener">Agent view</a> <span class="src">并行会话与后台 agent</span></li>
+  <li><a href="https://learn.chatgpt.com/docs/non-interactive-mode" target="_blank" rel="noopener">Codex：非交互模式</a> · <a href="https://learn.chatgpt.com/docs/cloud" target="_blank" rel="noopener">Codex Cloud</a> <span class="src">OpenAI 官方文档</span></li>
+  <li><a href="https://agents.md/" target="_blank" rel="noopener">AGENTS.md</a> <span class="src">编码 agent 读取的仓库说明</span></li>
+</ul>
+</article>
+
+<script>
+window.addEventListener('DOMContentLoaded', () => {
+  const box = document.getElementById('harness-sim');
+  const boxes = [...box.querySelectorAll('input[data-c]')];
+  const log = box.querySelector('[data-log]');
+  const verdict = box.querySelector('[data-verdict]');
+  const TOTAL = 6;
+
+  function simulate(on) {
+    const lines = [];
+    let done = 0;
+    // 会话 1
+    if (on.F) {
+      lines.push(['good', '会话 1', 'Initializer 把需求展开成 6 条功能清单（全部未通过），写好 init.sh，做了第一次提交；接着实现第 1 个功能。']);
+      done = 1;
+    } else {
+      lines.push(['bad', '会话 1', '没有功能清单：agent 想一次做完全部功能，做到一半上下文耗尽，留下大量半成品。']);
+      done = 0.5;
+      if (!on.S) lines.push(['bad', '', '它在留有未提交改动的状态下停了下来，没有人提醒它提交。']);
+      else lines.push(['meh', '', 'Stop hook 拦下了它：半成品已提交，至少不会丢。']);
+    }
+    // 会话 2–5
+    for (let s = 2; s <= 5; s++) {
+      let gain;
+      let text;
+      if (on.F && on.P) {
+        gain = 1.5;
+        text = '读进度文件和 git log，几步就找回上下文；挑出下一个未通过的功能完成，并顺手完成了一个小功能。';
+      } else if (on.F) {
+        gain = 1;
+        text = '从清单挑出下一个未通过的功能，但不知道上一会话踩过哪些坑，花了不少步骤重新摸索代码。';
+      } else if (on.P) {
+        gain = 0.75;
+        text = '读进度文件知道大致做到哪了，但没有清晰的完成定义，在已做过的部分上反复打磨。';
+      } else {
+        gain = 0.5;
+        text = '不知道上一会话做到哪，重新探索整个代码库，重复实现了部分已有功能。';
+      }
+      if (!on.S && s === 3) {
+        lines.push(['bad', `会话 ${s}`, text + ' 但它停下时有未提交的改动，下一个会话从干净的工作区开始——这一会话的成果丢失。']);
+        continue;
+      }
+      done = Math.min(TOTAL, done + gain);
+      lines.push([on.F ? 'good' : 'meh', `会话 ${s}`, text]);
+    }
+    let claimed = Math.floor(done);
+    const notes = [];
+    if (!on.F) {
+      notes.push('没有清单，agent 在第 5 个会话宣布"全部完成"（过早宣布完成）。');
+      claimed = TOTAL;
+    }
+    const realDone = Math.floor(done);
+    let broken = 0;
+    if (!on.E) {
+      broken = Math.max(1, Math.ceil(Math.min(claimed, realDone) / 3));
+      notes.push(`没有端到端验证：有 ${broken} 个功能只跑过单测或 curl 就标为通过，实际在页面上用不了。`);
+    }
+    let quality = 0;
+    if (!on.V) {
+      quality = 1;
+      notes.push('没有独立评估者：agent 自评偏宽容，有 1 个功能的边界情况（如筛选为空）没处理，但被它判为通过。');
+    }
+    const working = Math.max(0, Math.min(claimed, realDone) - broken - quality);
+    return { lines, claimed, working, notes };
+  }
+
+  function run() {
+    const on = Object.fromEntries(boxes.map((b) => [b.dataset.c, b.checked]));
+    const r = simulate(on);
+    log.innerHTML = r.lines
+      .map(([cls, title, text]) => `<div class="sess ${cls}">${title ? `<b>${title}</b>` : ''}${Course.escape(text)}</div>`)
+      .join('');
+    const good = r.working === TOTAL && r.claimed === TOTAL;
+    verdict.innerHTML =
+      `<span class="stat"><b>${r.claimed} / ${TOTAL}</b><small>agent 声称完成</small></span>` +
+      `<span class="stat"><b style="color:${good ? 'var(--ok)' : 'var(--danger)'}">${r.working} / ${TOTAL}</b><small>实际可用</small></span>` +
+      `<div class="w-out" style="flex:1;min-width:240px">${
+        r.notes.length ? r.notes.map((n) => Course.escape(n)).join('<br>') : '全部部件就位：每个会话一个功能、跨会话接力顺畅、完成由外部验证与独立评估者确认。代价是更多的会话、更多的 token——用评测确认它值得。'
+      }</div>`;
+  }
+
+  box.querySelector('[data-run]').addEventListener('click', run);
+  box.querySelector('[data-all]').addEventListener('click', () => { boxes.forEach((b) => (b.checked = true)); run(); });
+  box.querySelector('[data-none]').addEventListener('click', () => { boxes.forEach((b) => (b.checked = false)); run(); });
+  run();
+});
+</script>
+</body>
+</html>

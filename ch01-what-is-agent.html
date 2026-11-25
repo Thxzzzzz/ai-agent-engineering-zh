@@ -1,0 +1,365 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent 是什么 · AI Agent 工程</title>
+<meta name="description" content="从增强型 LLM 到 agent loop，分清 workflow 与 agent，认识五种编排模式与自主度分级。">
+<link rel="stylesheet" href="assets/css/course.css">
+<script src="assets/js/manifest.js"></script>
+<script defer src="assets/js/course.js"></script>
+</head>
+<body data-page="ch01">
+<article id="content">
+<div class="eyebrow">第一部分 · 基础 · 第 1 章</div>
+<h1>Agent 是什么：从 LLM 到智能体</h1>
+<p class="lead">"Agent"是这几年被用得最滥的词之一。这一章先把它钉死：它到底由什么组成，和"写死流程再调几次模型"有什么本质区别，以及什么时候<strong>不该</strong>用它。</p>
+<div class="meta"><span>约 30 分钟</span><span>前置：调用过任意一个大模型 API</span><span>含 1 个分步动画、1 个交互、3 道小测</span></div>
+
+<div class="goals"><b>学完你能</b>
+<ul>
+  <li>用一句话说清 agent 的定义，并画出 agent loop 的每一步</li>
+  <li>区分 <strong>workflow</strong> 与 <strong>agent</strong>，说出五种经典编排模式各适合什么</li>
+  <li>用"自主度分级"描述一个系统里人和 agent 各自的角色</li>
+  <li>面对一个需求时，按"复杂度阶梯"选出最简单够用的方案</li>
+</ul></div>
+
+<h2>1 · 一句话定义</h2>
+<p>业界目前最常被引用的定义来自 Anthropic 的《Building effective agents》（2024-12）：</p>
+<blockquote><strong>Workflow</strong>：用预先写好的代码路径来编排 LLM 和工具。<br><strong>Agent</strong>：由 LLM 动态地决定自己的流程和工具使用，自己掌控如何完成任务。</blockquote>
+<p>换成工程师的话：<strong>agent 是一个"模型在循环里调用工具、根据环境反馈决定下一步"的程序</strong>。三个关键词——<em>循环</em>、<em>工具</em>、<em>反馈</em>——缺一个都不算 agent：</p>
+<ul>
+  <li>没有循环：模型只回答一次，那是一次 API 调用。</li>
+  <li>没有工具：模型只能"说"不能"做"，影响不了外部世界，也拿不到新信息。</li>
+  <li>没有反馈：模型做了动作却看不到结果，等于闭眼开车。</li>
+</ul>
+<p>Lilian Weng 2023 年那篇经典综述把 agent 拆成 <strong>LLM（大脑）+ 规划 + 记忆 + 工具使用</strong> 四块。这个拆法到今天仍然好用，本课程的第一、二部分基本就是沿着它展开的。</p>
+
+<figure>
+<div class="diagram">
+<svg viewBox="0 0 720 250" width="720" role="img" aria-label="增强型 LLM：模型连接检索、工具、记忆">
+  <rect class="box a" x="270" y="90" width="180" height="70" rx="12"/>
+  <text class="tb" x="360" y="120" text-anchor="middle">LLM</text>
+  <text class="ts" x="360" y="142" text-anchor="middle">推理 · 决策 · 生成</text>
+  <rect class="box g" x="40" y="20" width="160" height="56" rx="10"/>
+  <text class="tb" x="120" y="45" text-anchor="middle">检索</text>
+  <text class="ts" x="120" y="64" text-anchor="middle">查资料、查历史</text>
+  <rect class="box b" x="520" y="20" width="160" height="56" rx="10"/>
+  <text class="tb" x="600" y="45" text-anchor="middle">工具</text>
+  <text class="ts" x="600" y="64" text-anchor="middle">发消息、改文件、调 API</text>
+  <rect class="box v" x="280" y="186" width="160" height="56" rx="10"/>
+  <text class="tb" x="360" y="211" text-anchor="middle">记忆</text>
+  <text class="ts" x="360" y="230" text-anchor="middle">跨会话保留的知识</text>
+  <path class="line g" d="M200 52 C240 60 250 90 270 105" marker-end="url(#arr-g)" marker-start="url(#arr-g)"/>
+  <path class="line b" d="M520 52 C480 60 470 90 450 105" marker-end="url(#arr-b)" marker-start="url(#arr-b)"/>
+  <path class="line" d="M360 160 L360 186" marker-end="url(#arr)" marker-start="url(#arr)"/>
+</svg>
+</div>
+<figcaption>图 1-1 增强型 LLM（augmented LLM）：agent 的基本构件。模型本身只会读写文本，检索、工具、记忆让它连上外部世界。</figcaption>
+</figure>
+
+<h2>2 · Agent Loop：一步一步看它怎么干活</h2>
+<p>下面用一个办公场景走一遍：用户说"<em>把下周三的周会挪到周四同一时间，并通知参会人</em>"。点"下一步"，看每一轮里模型、工具和环境之间发生了什么。</p>
+
+<figure class="anim" data-dim>
+<div class="diagram">
+<svg viewBox="0 0 760 330" width="760" role="img" aria-label="agent loop 分步动画">
+  <!-- 用户 -->
+  <g data-k="user">
+    <rect class="box" x="20" y="130" width="120" height="64" rx="10"/>
+    <text class="tb" x="80" y="158" text-anchor="middle">用户</text>
+    <text class="ts" x="80" y="178" text-anchor="middle">给出目标</text>
+  </g>
+  <!-- 上下文 -->
+  <g data-k="ctx">
+    <rect class="box m" x="200" y="20" width="200" height="74" rx="10"/>
+    <text class="tb" x="300" y="46" text-anchor="middle">上下文（消息列表）</text>
+    <text class="ts" x="300" y="66" text-anchor="middle">system · user · assistant</text>
+    <text class="ts" x="300" y="84" text-anchor="middle">tool_call · tool_result …</text>
+  </g>
+  <!-- 模型 -->
+  <g data-k="llm">
+    <rect class="box a" x="220" y="140" width="160" height="70" rx="12"/>
+    <text class="tb" x="300" y="170" text-anchor="middle">LLM</text>
+    <text class="ts" x="300" y="191" text-anchor="middle">决定下一步做什么</text>
+  </g>
+  <!-- 工具 -->
+  <g data-k="tool">
+    <rect class="box b" x="470" y="140" width="150" height="70" rx="10"/>
+    <text class="tb" x="545" y="168" text-anchor="middle">工具执行器</text>
+    <text class="ts" x="545" y="190" text-anchor="middle">你的代码</text>
+  </g>
+  <!-- 环境 -->
+  <g data-k="env">
+    <rect class="box g" x="660" y="110" width="84" height="130" rx="10"/>
+    <text class="tb" x="702" y="160" text-anchor="middle">日历</text>
+    <text class="tb" x="702" y="182" text-anchor="middle">邮件</text>
+    <text class="ts" x="702" y="204" text-anchor="middle">外部世界</text>
+  </g>
+  <!-- 停止 -->
+  <g data-k="final">
+    <rect class="box g" x="200" y="262" width="200" height="54" rx="10"/>
+    <text class="tb" x="300" y="286" text-anchor="middle">最终答复</text>
+    <text class="ts" x="300" y="305" text-anchor="middle">模型不再调用工具 → 循环结束</text>
+  </g>
+  <g data-k="e1"><path class="line" d="M140 162 L220 170" marker-end="url(#arr)"/></g>
+  <g data-k="e2"><path class="line a" d="M300 94 L300 140" marker-end="url(#arr-a)"/></g>
+  <g data-k="e3"><path class="line b" d="M380 175 L470 175" marker-end="url(#arr-b)"/><text class="ts" x="425" y="166" text-anchor="middle">tool_call</text></g>
+  <g data-k="e4"><path class="line g" d="M620 175 L660 175" marker-end="url(#arr-g)" marker-start="url(#arr-g)"/></g>
+  <g data-k="e5"><path class="line g" d="M545 140 C545 60 470 57 400 57" marker-end="url(#arr-g)"/><text class="ts" x="556" y="100">tool_result 追加进上下文</text></g>
+  <g data-k="e6"><path class="line" d="M300 210 L300 262" marker-end="url(#arr)"/></g>
+</svg>
+</div>
+<ol class="anim-steps">
+  <li data-show="user e1 ctx" data-hl="user e1 ctx">用户给出目标。你的程序把它和<strong>系统提示</strong>（角色、规则、可用工具的说明）一起放进上下文——一个按时间排列的消息列表。</li>
+  <li data-show="llm e2" data-hl="llm e2">把整个上下文发给模型。模型读完后判断：信息不够，得先查一下"下周三的周会"是哪一个、谁参加。</li>
+  <li data-show="tool e3" data-hl="e3 tool">模型<strong>不直接执行</strong>任何东西，它只输出一个结构化的 <code>tool_call</code>：<code>search_events({"date":"下周三","keyword":"周会"})</code>。真正执行的是你写的代码。</li>
+  <li data-show="env e4" data-hl="tool e4 env">工具执行器调用日历 API，拿到结果：周会 10:00–11:00，参会人 6 位。这一步发生在你的进程里，可以加权限检查、超时、重试。</li>
+  <li data-show="e5" data-hl="e5 ctx">执行结果以 <code>tool_result</code> 的形式<strong>追加</strong>到上下文。这就是"反馈"：模型下一轮能看到它的动作造成了什么。</li>
+  <li data-hl="llm e2 e3 tool e4 env">第二轮：模型调用 <code>update_event</code> 把时间改到周四；第三轮调用 <code>send_email</code> 通知参会人。每一轮都是"读上下文 → 出动作 → 拿结果 → 追加"。</li>
+  <li data-show="e6 final" data-hl="llm e6 final">当模型认为目标已达成，它不再调用工具，而是输出一段普通文本。你的循环检测到"没有 tool_call"就退出，把这段文本交给用户。</li>
+  <li data-hl="ctx">注意：整个过程里，<strong>模型是无状态的</strong>。它"记得"前面做过什么，只因为你每次都把完整的上下文重新发给它。上下文怎么组织，是第 5 章的主题。</li>
+</ol>
+<figcaption>图 1-2 Agent loop。可以点"自动播放"，或用圆点跳到任意一步。</figcaption>
+</figure>
+
+<p>把这个过程写成伪代码，核心只有十几行。第 4 章和跟练项目 P1 会把它写成能跑的 TypeScript：</p>
+<pre data-title="agent loop 的骨架（伪代码）"><code class="lang-ts">
+const messages = [system(prompt), user(goal)];
+for (let step = 0; step < MAX_STEPS; step++) {
+  const reply = await model.generate({ messages, tools });
+  messages.push(reply);                       // 模型的回答（可能带 tool_call）
+  if (reply.toolCalls.length === 0) return reply.text;  // 不再调用工具 = 完成
+  for (const call of reply.toolCalls) {
+    const result = await runTool(call);       // 你的代码执行，可做权限检查
+    messages.push(toolResult(call.id, result)); // 结果回灌，形成反馈
+  }
+}
+throw new Error('超过最大步数仍未完成');
+</code></pre>
+
+<div class="callout note"><b>工程师视角</b>
+<p>"模型决定做什么，代码决定能不能做、怎么做"——这条分工贯穿整门课。模型是不可靠的决策者，你的代码是可靠的执行者和守门员。权限、幂等、审批、预算，全部长在代码这一侧。</p></div>
+
+<div class="quiz" data-answer="3">
+<p class="q">在 agent loop 里，谁真正执行了"修改日历事件"这个动作？</p>
+<ol>
+  <li>模型直接调用了日历 API</li>
+  <li>模型提供商的服务器代为调用</li>
+  <li>你的程序收到模型输出的 tool_call 后，由你的代码调用日历 API</li>
+  <li>日历服务主动读取了模型的输出</li>
+</ol>
+<div class="explain">模型只产出"想调用哪个工具、参数是什么"的结构化文本。执行权在你的代码手里——这正是你能加权限检查、审批和幂等保护的地方。（提供商的"托管工具"如网页搜索是例外，但对你自己的业务系统，执行永远在你这一侧。）</div>
+</div>
+
+<h2>3 · Workflow 还是 Agent？</h2>
+<p>两者不是对立的，而是一条谱系的两端：越往右，模型掌控的决策越多，灵活性越高，可预测性越低、成本越高。</p>
+
+<figure>
+<div class="diagram">
+<svg viewBox="0 0 740 190" width="740" role="img" aria-label="从单次调用到自主 agent 的谱系">
+  <defs><linearGradient id="spec" x1="0" x2="1"><stop offset="0" stop-color="var(--ok)"/><stop offset="1" stop-color="var(--danger)"/></linearGradient></defs>
+  <rect x="30" y="40" width="680" height="8" rx="4" fill="url(#spec)"/>
+  <g>
+    <circle cx="60" cy="44" r="9" class="fill-g"/><text class="tb" x="60" y="80" text-anchor="middle">单次调用</text><text class="ts" x="60" y="100" text-anchor="middle">分类、抽取</text>
+    <circle cx="220" cy="44" r="9" class="fill-g"/><text class="tb" x="220" y="80" text-anchor="middle">Workflow</text><text class="ts" x="220" y="100" text-anchor="middle">代码定流程</text><text class="ts" x="220" y="118" text-anchor="middle">模型做每一步</text>
+    <circle cx="400" cy="44" r="9" class="fill-b"/><text class="tb" x="400" y="80" text-anchor="middle">受限 Agent</text><text class="ts" x="400" y="100" text-anchor="middle">模型选工具和顺序</text><text class="ts" x="400" y="118" text-anchor="middle">工具集小、步数有上限</text>
+    <circle cx="580" cy="44" r="9" class="fill-r"/><text class="tb" x="580" y="80" text-anchor="middle">开放 Agent</text><text class="ts" x="580" y="100" text-anchor="middle">长任务、自己规划</text><text class="ts" x="580" y="118" text-anchor="middle">如编码 agent</text>
+  </g>
+  <text class="ts" x="30" y="160">可预测 · 便宜 · 好测</text>
+  <text class="ts" x="710" y="160" text-anchor="end">灵活 · 能处理开放问题 · 贵、难测</text>
+  <path class="line" d="M200 168 L540 168" marker-end="url(#arr)"/>
+</svg>
+</div>
+<figcaption>图 1-3 自主程度的谱系。生产系统里，大多数可靠的"agent 产品"其实是 workflow 与受限 agent 的组合。</figcaption>
+</figure>
+
+<table>
+<tr><th></th><th>Workflow</th><th>Agent</th></tr>
+<tr><td>谁决定下一步</td><td>你写的代码</td><td>模型</td></tr>
+<tr><td>适合</td><td>步骤明确、可以提前拆解的任务</td><td>步骤数事先未知、需要根据中间结果调整的任务</td></tr>
+<tr><td>可预测性</td><td>高，每条路径都能测</td><td>低，同一输入可能走出不同轨迹</td></tr>
+<tr><td>成本与延迟</td><td>可控</td><td>随步数增长；Anthropic 实测单 agent 约为普通对话 4 倍 token，多 agent 约 15 倍</td></tr>
+<tr><td>失败形态</td><td>某一步输出不合格</td><td>跑偏、绕圈、过早宣布完成、复合误差</td></tr>
+</table>
+
+<div class="callout warn"><b>先问自己：真的需要 agent 吗？</b>
+<p>Anthropic 和 OpenAI 的官方指南给出的建议高度一致：<strong>从最简单的方案开始</strong>——一次精心设计的调用加上检索和几个示例，往往就够了。只有当规则难以穷举、需要处理大量非结构化信息、或者流程必须根据中间结果调整时，才值得引入 agent 的不确定性。</p></div>
+
+<h2>4 · 五种经典编排模式</h2>
+<p>这五种模式来自《Building effective agents》，它们是 workflow 的"设计模式"，也是组装复杂 agent 系统的积木。逐个点开看结构和适用场景：</p>
+
+<div class="tabs">
+<div class="tab-panel" data-label="提示链">
+<div class="diagram"><svg viewBox="0 0 700 110" width="700" role="img" aria-label="提示链">
+  <rect class="box" x="10" y="35" width="90" height="44" rx="8"/><text class="t" x="55" y="62" text-anchor="middle">输入</text>
+  <rect class="box a" x="140" y="35" width="110" height="44" rx="8"/><text class="t" x="195" y="62" text-anchor="middle">LLM 1 · 提纲</text>
+  <rect class="box w" x="290" y="35" width="90" height="44" rx="8"/><text class="t" x="335" y="62" text-anchor="middle">代码检查</text>
+  <rect class="box a" x="420" y="35" width="110" height="44" rx="8"/><text class="t" x="475" y="62" text-anchor="middle">LLM 2 · 成文</text>
+  <rect class="box" x="570" y="35" width="90" height="44" rx="8"/><text class="t" x="615" y="62" text-anchor="middle">输出</text>
+  <path class="line" d="M100 57 H140" marker-end="url(#arr)"/><path class="line" d="M250 57 H290" marker-end="url(#arr)"/><path class="line" d="M380 57 H420" marker-end="url(#arr)"/><path class="line" d="M530 57 H570" marker-end="url(#arr)"/>
+  <text class="ts" x="335" y="100" text-anchor="middle">不合格 → 中止或重试</text>
+</svg></div>
+<p><strong>Prompt chaining</strong>：把任务拆成固定的几步，每一步的输出是下一步的输入，步骤之间可以插入代码检查（gate）。</p>
+<p><strong>适合</strong>：能清晰拆成固定子任务的场景，用延迟换准确率。例：先抽取会议纪要里的待办，再把每条待办改写成任务描述。</p>
+</div>
+<div class="tab-panel" data-label="路由">
+<div class="diagram"><svg viewBox="0 0 700 170" width="700" role="img" aria-label="路由">
+  <rect class="box" x="10" y="62" width="90" height="44" rx="8"/><text class="t" x="55" y="89" text-anchor="middle">输入</text>
+  <rect class="box a" x="140" y="62" width="120" height="44" rx="8"/><text class="t" x="200" y="89" text-anchor="middle">分类器 LLM</text>
+  <rect class="box g" x="330" y="10" width="170" height="40" rx="8"/><text class="t" x="415" y="35" text-anchor="middle">简单问题 → 小模型</text>
+  <rect class="box b" x="330" y="64" width="170" height="40" rx="8"/><text class="t" x="415" y="89" text-anchor="middle">退款 → 退款流程</text>
+  <rect class="box v" x="330" y="118" width="170" height="40" rx="8"/><text class="t" x="415" y="143" text-anchor="middle">其他 → 人工</text>
+  <path class="line" d="M100 84 H140" marker-end="url(#arr)"/>
+  <path class="line" d="M260 84 C300 84 300 30 330 30" marker-end="url(#arr)"/><path class="line" d="M260 84 H330" marker-end="url(#arr)"/><path class="line" d="M260 84 C300 84 300 138 330 138" marker-end="url(#arr)"/>
+</svg></div>
+<p><strong>Routing</strong>：先分类，再把输入交给专门的下游处理（不同提示词、不同模型、不同流程）。</p>
+<p><strong>适合</strong>：输入类别差异大、分开处理效果更好时。也是<strong>成本优化</strong>的主力：简单请求走便宜模型。</p>
+</div>
+<div class="tab-panel" data-label="并行化">
+<div class="diagram"><svg viewBox="0 0 700 170" width="700" role="img" aria-label="并行化">
+  <rect class="box" x="10" y="62" width="90" height="44" rx="8"/><text class="t" x="55" y="89" text-anchor="middle">输入</text>
+  <rect class="box a" x="180" y="10" width="140" height="40" rx="8"/><text class="t" x="250" y="35" text-anchor="middle">LLM · 视角 A</text>
+  <rect class="box a" x="180" y="64" width="140" height="40" rx="8"/><text class="t" x="250" y="89" text-anchor="middle">LLM · 视角 B</text>
+  <rect class="box a" x="180" y="118" width="140" height="40" rx="8"/><text class="t" x="250" y="143" text-anchor="middle">LLM · 视角 C</text>
+  <rect class="box w" x="400" y="62" width="120" height="44" rx="8"/><text class="t" x="460" y="89" text-anchor="middle">代码汇总</text>
+  <rect class="box" x="580" y="62" width="90" height="44" rx="8"/><text class="t" x="625" y="89" text-anchor="middle">输出</text>
+  <path class="line" d="M100 84 C140 84 140 30 180 30" marker-end="url(#arr)"/><path class="line" d="M100 84 H180" marker-end="url(#arr)"/><path class="line" d="M100 84 C140 84 140 138 180 138" marker-end="url(#arr)"/>
+  <path class="line" d="M320 30 C360 30 360 84 400 84" marker-end="url(#arr)"/><path class="line" d="M320 84 H400" marker-end="url(#arr)"/><path class="line" d="M320 138 C360 138 360 84 400 84" marker-end="url(#arr)"/>
+  <path class="line" d="M520 84 H580" marker-end="url(#arr)"/>
+</svg></div>
+<p><strong>Parallelization</strong> 有两种：<strong>分段（sectioning）</strong>——把独立子任务并行跑，如一路检查内容是否违规、一路生成回答；<strong>投票（voting）</strong>——同一任务跑多次取多数，提高置信度。</p>
+<p><strong>适合</strong>：子任务互相独立，或需要多个视角/多次尝试才可靠的判断。</p>
+</div>
+<div class="tab-panel" data-label="编排者-工作者">
+<div class="diagram"><svg viewBox="0 0 700 170" width="700" role="img" aria-label="编排者-工作者">
+  <rect class="box" x="10" y="62" width="80" height="44" rx="8"/><text class="t" x="50" y="89" text-anchor="middle">输入</text>
+  <rect class="box a" x="130" y="56" width="130" height="56" rx="8"/><text class="tb" x="195" y="82" text-anchor="middle">编排者</text><text class="ts" x="195" y="100" text-anchor="middle">动态拆分子任务</text>
+  <rect class="box b" x="320" y="10" width="120" height="40" rx="8"/><text class="t" x="380" y="35" text-anchor="middle">工作者 1</text>
+  <rect class="box b" x="320" y="64" width="120" height="40" rx="8"/><text class="t" x="380" y="89" text-anchor="middle">工作者 2</text>
+  <rect class="box b" x="320" y="118" width="120" height="40" rx="8"/><text class="t" x="380" y="143" text-anchor="middle">工作者 …</text>
+  <rect class="box a" x="500" y="62" width="110" height="44" rx="8"/><text class="t" x="555" y="89" text-anchor="middle">综合</text>
+  <path class="line" d="M90 84 H130" marker-end="url(#arr)"/>
+  <path class="line" d="M260 84 C290 84 290 30 320 30" marker-end="url(#arr)"/><path class="line" d="M260 84 H320" marker-end="url(#arr)"/><path class="line" d="M260 84 C290 84 290 138 320 138" marker-end="url(#arr)"/>
+  <path class="line" d="M440 30 C470 30 470 84 500 84" marker-end="url(#arr)"/><path class="line" d="M440 84 H500" marker-end="url(#arr)"/><path class="line" d="M440 138 C470 138 470 84 500 84" marker-end="url(#arr)"/>
+</svg></div>
+<p><strong>Orchestrator-workers</strong>：和并行化很像，区别在于子任务<strong>不是预先定好的</strong>，由编排者根据输入现场决定拆成几份、怎么拆。</p>
+<p><strong>适合</strong>：无法提前预知子任务的复杂工作，如"调研一个主题"、"改动涉及多个文件的代码"。Anthropic 的多智能体研究系统就是这个结构（第 11 章细讲）。</p>
+</div>
+<div class="tab-panel" data-label="评估-优化">
+<div class="diagram"><svg viewBox="0 0 700 150" width="700" role="img" aria-label="评估-优化">
+  <rect class="box" x="10" y="50" width="80" height="44" rx="8"/><text class="t" x="50" y="77" text-anchor="middle">输入</text>
+  <rect class="box a" x="150" y="50" width="140" height="44" rx="8"/><text class="t" x="220" y="77" text-anchor="middle">生成者 LLM</text>
+  <rect class="box v" x="380" y="50" width="140" height="44" rx="8"/><text class="t" x="450" y="77" text-anchor="middle">评估者 LLM</text>
+  <rect class="box g" x="590" y="50" width="90" height="44" rx="8"/><text class="t" x="635" y="77" text-anchor="middle">通过</text>
+  <path class="line" d="M90 72 H150" marker-end="url(#arr)"/><path class="line" d="M290 66 H380" marker-end="url(#arr)"/><path class="line" d="M520 72 H590" marker-end="url(#arr)"/>
+  <path class="line b dash" d="M450 94 C450 135 220 135 220 94" marker-end="url(#arr-b)"/><text class="ts" x="335" y="140" text-anchor="middle">不通过：附上具体意见，重写</text>
+</svg></div>
+<p><strong>Evaluator-optimizer</strong>：一个模型生成，另一个按明确标准评审并给出意见，循环直到通过或达到上限。</p>
+<p><strong>适合</strong>：有清晰评价标准、且迭代确实能改进结果时，如翻译润色、按验收标准检查代码。长任务里把评估者独立出来，更容易把它调成"挑剔"的角色（第 12 章）。</p>
+</div>
+</div>
+
+<div class="quiz" data-answer="2">
+<p class="q">需求：用户上传一份合同，系统要判断它属于"采购 / 劳务 / 保密协议 / 其他"中的哪类，再按类别套用不同的审查清单。最合适的起点是？</p>
+<ol>
+  <li>开放式 agent，让模型自己决定怎么审</li>
+  <li>路由：先分类，再交给对应类别的审查流程</li>
+  <li>编排者-工作者：动态拆分审查任务</li>
+  <li>投票：让五个模型各审一遍</li>
+</ol>
+<div class="explain">类别有限、每类的处理方式已知——这是路由的教科书场景。每个分支内部可以再是一条提示链。只有当审查步骤无法事先确定时，才需要升级到 agent。</div>
+</div>
+
+<h2>5 · 自主度：人在系统里扮演什么角色</h2>
+<p>"自主"不是一个开关，而是人和 agent 之间的分工方式。2025 年 Feng、McDonald、Zhang 的论文《Levels of Autonomy for AI Agents》按<strong>用户的角色</strong>把自主度分成五级。拖动滑块看每一级的含义：</p>
+
+<div class="widget" id="autonomy">
+<div class="w-title">自主度分级</div>
+<input type="range" min="1" max="5" value="4" step="1" aria-label="自主度等级">
+<div class="w-row" style="grid-template-columns: repeat(5, 1fr); text-align:center; font-size:13px; color:var(--muted)">
+  <span>L1 操作者</span><span>L2 协作者</span><span>L3 顾问</span><span>L4 审批者</span><span>L5 旁观者</span>
+</div>
+<div class="w-out" data-out></div>
+</div>
+
+<p>对一个代表你对外沟通的 agent（比如替你回复消息），默认停在 <strong>L4 审批者</strong>是业界的主流做法：agent 准备好一切，你只需要点"批准/修改/拒绝"。随着信任积累，可以按"动作 × 对象"逐格放权到 L5——这套机制在第 8 章细讲。</p>
+
+<div class="callout tip"><b>一个判断准则</b>
+<p>自主度应该<strong>按动作的风险</strong>分配，而不是按整个系统一刀切。"读邮件"可以全自动，"发邮件给客户"应该审批，"转账"可能永远需要人。好的系统能对不同动作设定不同的级别。</p></div>
+
+<h2>6 · 复杂度阶梯：选最简单够用的那一级</h2>
+<p>面对一个新需求，从下往上逐级尝试，只有当前一级确实不够时才往上走：</p>
+<ol class="steps">
+  <li><strong>一次调用</strong>：好的提示词 + 少量示例 + 结构化输出。能解决的问题比你想象的多。</li>
+  <li><strong>加检索</strong>：模型缺的往往是信息而不是能力，把相关资料放进上下文。</li>
+  <li><strong>Workflow</strong>：提示链、路由、并行——流程由代码掌控，每一步可单独测试。</li>
+  <li><strong>单 agent + 少量工具</strong>：步骤数未知时才让模型掌舵，配上步数上限、预算和审批。</li>
+  <li><strong>多 agent</strong>：只在"可以并行的读型任务"或上下文必须隔离时考虑，代价是数倍的 token 和更难的调试（第 11 章）。</li>
+</ol>
+
+<div class="quiz" data-answer="4">
+<p class="q">以下哪种情况最能说明"该从 workflow 升级到 agent"了？</p>
+<ol>
+  <li>提示词越来越长</li>
+  <li>想用更强的模型</li>
+  <li>需要调用外部 API</li>
+  <li>完成任务所需的步骤取决于中间结果，无法提前写死</li>
+</ol>
+<div class="explain">workflow 同样可以调用 API、用强模型、有长提示词。真正的分界线是<strong>控制流由谁决定</strong>：当下一步做什么只有看到上一步结果才知道时，才需要把控制权交给模型。</div>
+</div>
+
+<h2>7 · 常见误区</h2>
+<ul>
+  <li><strong>"用了框架才算 agent"</strong>：框架会隐藏提示词和控制流，出问题时难以排查。官方指南都建议先直接用 API 写，理解底层后再决定是否引入框架。</li>
+  <li><strong>"模型越强，越不需要工程"</strong>：模型变强改变的是"哪些脚手架可以拆掉"，而不是"不需要脚手架"。权限、审批、幂等、评测与模型强弱无关。</li>
+  <li><strong>"agent 应该什么都能做"</strong>：通用 agent 难测难控。"小而专注"的 agent（12-Factor Agents 的第 10 条）更容易做到可靠。</li>
+  <li><strong>"跑通一次 demo 就算完成"</strong>：agent 的难点在长尾。成功率 75% 的单步，连跑 3 次全成功的概率只有约 42%（第 13 章的 pass^k）。</li>
+</ul>
+
+<div class="callout case review-link"><b>真实项目复盘</b>
+<p>本章的知识点在两个真实项目里缺位时发生了什么，以及"有这块知识"时会怎么设计：</p>
+<ul><li><a href="review.html#f-D1">D1</a> · devtask 曾让模型当调度中枢，一个话题一天调用模型 311 次，后来连砍 agent 回合改成代码直接转发</li><li><a href="review.html#f-N1">N1</a> · niuma 53 天做了 108 个里程碑，功能扩张跑在验证前面</li></ul></div>
+
+<div class="takeaways"><b>本章要点</b>
+<ul>
+  <li>Agent = 模型在循环里使用工具，根据环境反馈决定下一步；模型只决策，执行在你的代码里。</li>
+  <li>Workflow 由代码定流程，agent 由模型定流程；两者是一条谱系，生产系统多是组合。</li>
+  <li>五种编排模式：提示链、路由、并行化、编排者-工作者、评估-优化。</li>
+  <li>自主度按用户角色分五级，应按动作风险分别设定；对外沟通默认 L4（审批者）。</li>
+  <li>永远从复杂度阶梯的最低一级开始。</li>
+</ul></div>
+
+<h2>参考资料</h2>
+<ul class="refs">
+  <li><a href="https://www.anthropic.com/engineering/building-effective-agents" target="_blank" rel="noopener">Building effective agents</a> <span class="src">Anthropic · 2024-12-19 · 本章定义与五种模式的出处</span></li>
+  <li><a href="https://openai.com/business/guides-and-resources/a-practical-guide-to-building-ai-agents/" target="_blank" rel="noopener">A practical guide to building agents</a> <span class="src">OpenAI · 何时该做 agent、编排与护栏</span></li>
+  <li><a href="https://lilianweng.github.io/posts/2023-06-23-agent/" target="_blank" rel="noopener">LLM Powered Autonomous Agents</a> <span class="src">Lilian Weng · 2023-06-23 · 规划 / 记忆 / 工具框架</span></li>
+  <li><a href="https://arxiv.org/abs/2210.03629" target="_blank" rel="noopener">ReAct: Synergizing Reasoning and Acting in Language Models</a> <span class="src">Yao et al. · ICLR 2023 · Thought / Action / Observation 循环</span></li>
+  <li><a href="https://arxiv.org/abs/2506.12469" target="_blank" rel="noopener">Levels of Autonomy for AI Agents</a> <span class="src">Feng, McDonald, Zhang · 2025 · 五级用户角色</span></li>
+  <li><a href="https://github.com/humanlayer/12-factor-agents" target="_blank" rel="noopener">12-Factor Agents</a> <span class="src">HumanLayer · 构建可靠 LLM 应用的 12 条原则</span></li>
+</ul>
+</article>
+
+<script>
+window.addEventListener('DOMContentLoaded', () => {
+  const levels = [
+    ['L1 操作者（operator）', '人主导，agent 按指令执行单个动作，像一个能听懂自然语言的命令行。', '例：你说"把这段话翻译成英文"，它照做。'],
+    ['L2 协作者（collaborator）', '人和 agent 共同规划、交替推进，双方都能随时接管。', '例：和编码助手结对，你写一半它补一半。'],
+    ['L3 顾问（consultant）', 'agent 主导执行，但在关键节点向人征求意见和偏好。', '例：agent 写方案，遇到不确定的取舍停下来问你。'],
+    ['L4 审批者（approver）', 'agent 完成全部准备，只在高风险动作前请求人批准。', '例：agent 起草好回复，你点"发送"才真正发出。对外沟通的默认级别。'],
+    ['L5 旁观者（observer）', 'agent 完全自主运行，人只看日志与报告，必要时叫停或撤回。', '例：自动回复"收到"，事后在日报里看到"替你做了什么"。'],
+  ];
+  const box = document.getElementById('autonomy');
+  const range = box.querySelector('input');
+  const out = box.querySelector('[data-out]');
+  const render = () => {
+    const [t, d, e] = levels[range.value - 1];
+    out.innerHTML = `<b>${t}</b><br>${d}<br><span style="color:var(--muted)">${e}</span>`;
+  };
+  range.addEventListener('input', render);
+  render();
+});
+</script>
+</body>
+</html>
